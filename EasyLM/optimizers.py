@@ -16,7 +16,6 @@ import optax
 
 from EasyLM.jax_utils import float_to_dtype
 
-from soap_jax import soap
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 
@@ -99,7 +98,6 @@ class MuonOptimizerFactory(object):
     @classmethod
     def get_optimizer(cls, config, weight_decay_mask=None):
         config = cls.get_default_config(config)
-
         if config.lr_sched == 'cosine':
             learning_rate_schedule = optax.warmup_cosine_decay_schedule(
                 init_value=config.init_lr,
@@ -222,6 +220,15 @@ class SOAPOptimizerFactory(object):
     @classmethod
     def get_optimizer(cls, config, weight_decay_mask=None):
         config = cls.get_default_config(config)
+
+
+        try:
+            from soap_jax import soap
+        except ImportError as exc:
+            raise ImportError(
+                'SOAP optimizer requested but soap_jax is not installed. '
+                'Use optimizer.type=adamw or install soap_jax to enable SOAP.'
+            ) from exc
 
         if config.lr_sched == 'cosine':
             learning_rate_schedule = optax.warmup_cosine_decay_schedule(

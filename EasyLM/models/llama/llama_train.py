@@ -7,7 +7,6 @@ from tqdm import tqdm, trange
 import numpy as np
 import mlxu
 import subprocess as sp
-import neural_tangents as nt
 
 import timeit
 import os
