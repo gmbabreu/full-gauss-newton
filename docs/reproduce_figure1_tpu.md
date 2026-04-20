@@ -19,6 +19,7 @@ export ZONE=europe-west4-a
 export TPU_NAME=fig1-v6e-8
 export ACCELERATOR_TYPE=v6e-8
 export REPO_URL=https://github.com/<you>/full-gauss-newton.git
+export REPO_BRANCH=main
 export WANDB_API_KEY=<YOUR_WANDB_KEY>
 export OUTPUT_DIR=gs://<YOUR_BUCKET>/figure1-runs
 export TRAIN_PRETOKENIZED_DIR=gs://<YOUR_BUCKET>/c4-tokenized
@@ -69,7 +70,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --command "
   set -euo pipefail
   git clone <YOUR_FORK_OR_REPO_URL> full-gauss-newton
   cd full-gauss-newton
-  export PYTHONPATH=\"$PWD:$PYTHONPATH\"
+  export PYTHONPATH=\"$PWD${PYTHONPATH:+:$PYTHONPATH}\"
   bash scripts/setup_tpu_vm.sh
 "
 ```
@@ -147,3 +148,16 @@ plt.savefig('figure1_adamw_vs_gn_4000steps.png', dpi=200)
 ```bash
 gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE} --quiet
 ```
+
+
+## Troubleshooting
+
+- `NOT_FOUND ... nodes/<TPU_NAME>`: the TPU VM was not created yet (or wrong zone/name).
+  Run `bash scripts/gcloud_tpu_figure1.sh create` first, then `setup`.
+- `PYTHONPATH: unbound variable`: use safe export form
+  `export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"` (already used by helper script).
+- `ensurepip is not available` / `python3-venv` missing: `scripts/setup_tpu_vm.sh` now tries
+  `apt-get update` + `apt-get install python3-venv` and falls back to `pip --user` if venv cannot be created.
+- `apt ... 404 Not Found`: package index is stale; run `sudo apt-get update` before install.
+- `ImportError: cannot import name 'Jaxpr' from jax.core` from `neural_tangents`: this flow no longer requires `neural_tangents`; rerun `bash scripts/setup_tpu_vm.sh` to reinstall pinned TPU JAX (`jax[tpu]==0.4.28`) and updated deps.
+- If you accidentally pasted secrets (e.g., W&B API key) into terminal logs, rotate them immediately.

@@ -9,6 +9,7 @@ set -euo pipefail
 #   export TPU_NAME=fig1-v6e-8
 #   export ACCELERATOR_TYPE=v6e-8
 #   export REPO_URL=https://github.com/<you>/full-gauss-newton.git
+#   export REPO_BRANCH=main
 #   export WANDB_API_KEY=...
 #   export OUTPUT_DIR=gs://<bucket>/figure1-runs
 #   export TRAIN_PRETOKENIZED_DIR=gs://<bucket>/c4-tokenized
@@ -25,6 +26,7 @@ TPU_NAME="${TPU_NAME:-fig1-v6e-8}"
 ACCELERATOR_TYPE="${ACCELERATOR_TYPE:-v6e-8}"
 RUNTIME_VERSION="${RUNTIME_VERSION:-tpu-ubuntu2204-base}"
 REPO_URL="${REPO_URL:-}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 REMOTE_DIR="${REMOTE_DIR:-full-gauss-newton}"
 
 ssh_cmd() {
@@ -42,9 +44,14 @@ case "${ACTION}" in
     ;;
   setup)
     : "${REPO_URL:?Set REPO_URL to your git repository URL}"
-    ssh_cmd "set -euo pipefail; \
-      if [ ! -d ${REMOTE_DIR} ]; then git clone ${REPO_URL} ${REMOTE_DIR}; fi; \
+    ssh_cmd "set -eo pipefail; \
+      if [ ! -d ${REMOTE_DIR} ]; then \
+        git clone --branch ${REPO_BRANCH} ${REPO_URL} ${REMOTE_DIR}; \
+      else \
+        cd ${REMOTE_DIR}; git fetch origin; git checkout ${REPO_BRANCH}; git pull; cd ..; \
+      fi; \
       cd ${REMOTE_DIR}; \
+      export PYTHONPATH=\"\$PWD\${PYTHONPATH:+:\$PYTHONPATH}\"; \
       bash scripts/setup_tpu_vm.sh"
     ;;
   configure)
@@ -60,10 +67,10 @@ export EVAL_PRETOKENIZED_DIR=${EVAL_PRETOKENIZED_DIR}
 ENVVARS"
     ;;
   run-adam)
-    ssh_cmd "set -euo pipefail; cd ${REMOTE_DIR}; source .venv/bin/activate; source .env.fig1; bash templates/adam-tpu-vm-figure1-4000.sh"
+    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; bash templates/adam-tpu-vm-figure1-4000.sh"
     ;;
   run-gn)
-    ssh_cmd "set -euo pipefail; cd ${REMOTE_DIR}; source .venv/bin/activate; source .env.fig1; bash templates/gn-tpu-vm-figure1-4000.sh"
+    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; bash templates/gn-tpu-vm-figure1-4000.sh"
     ;;
   run-both)
     "$0" run-adam
