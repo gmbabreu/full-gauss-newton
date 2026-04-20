@@ -19,6 +19,15 @@ from EasyLM.jax_utils import float_to_dtype
 # from soap_jax import soap  # not used; soap_jax not available on TPU
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+def _warmup_constant_schedule(init_value, peak_value, warmup_steps):
+    if warmup_steps == 0:
+        return optax.constant_schedule(peak_value)
+    return optax.join_schedules(
+        [optax.linear_schedule(init_value, peak_value, warmup_steps),
+         optax.constant_schedule(peak_value)],
+        boundaries=[warmup_steps],
+    )
+
 
 class OptimizerFactory(object):
     """ Configurable optax optimizer factory. """
