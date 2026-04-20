@@ -7,7 +7,7 @@ from tqdm import tqdm, trange
 import numpy as np
 import mlxu
 import subprocess as sp
-import neural_tangents as nt
+# import neural_tangents as nt  # not used; incompatible with jax 0.4.30 on TPU
 
 import timeit
 import os
