@@ -160,7 +160,9 @@ gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE} --quiet
   `apt-get update` + `apt-get install python3-venv` and falls back to `pip --user` if venv cannot be created.
 - `apt ... 404 Not Found`: package index is stale; run `sudo apt-get update` before install.
 - `ImportError: cannot import name 'Jaxpr' from jax.core` from `neural_tangents`: this flow no longer requires `neural_tangents`; rerun `bash scripts/setup_tpu_vm.sh` to reinstall pinned TPU JAX (`jax[tpu]==0.4.34`) and updated deps.
+- `pip` warns `orbax-checkpoint ... requires jax>=0.6.0`: rerun `bash scripts/setup_tpu_vm.sh`; it now pins a JAX-compatible `orbax-checkpoint` for TPU runs.
+- `INTERNAL: Failed to get global TPU topology`: TPU runtime may not be ready yet. Wait 1-2 minutes and retry on the TPU VM worker; if it persists, recreate the TPU VM (`bash scripts/gcloud_tpu_figure1.sh delete` then `create`).
 - `RuntimeError: Unable to initialize backend 'tpu': ... Unexpected option name ... ml_framework_name`:
-  clear inherited TPU flags and rebuild env:
-  `unset LIBTPU_INIT_ARGS; cd full-gauss-newton; bash scripts/setup_tpu_vm.sh`.
+  clear inherited TPU flags and force a clean JAX/JAXLIB reinstall:
+  `unset LIBTPU_INIT_ARGS; cd full-gauss-newton; source .venv/bin/activate; pip install -q 'jax[tpu]==0.4.34' 'jaxlib==0.4.34' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html --force-reinstall; python -c 'import jax; print("JAX:", jax.__version__); print(jax.local_devices())'`.
 - If you accidentally pasted secrets (e.g., W&B API key) into terminal logs, rotate them immediately.
