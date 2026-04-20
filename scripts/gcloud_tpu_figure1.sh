@@ -67,10 +67,10 @@ export EVAL_PRETOKENIZED_DIR=${EVAL_PRETOKENIZED_DIR}
 ENVVARS"
     ;;
   run-adam)
-    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; bash templates/adam-tpu-vm-figure1-4000.sh"
+    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; unset LIBTPU_INIT_ARGS || true; bash templates/adam-tpu-vm-figure1-4000.sh"
     ;;
   run-gn)
-    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; bash templates/gn-tpu-vm-figure1-4000.sh"
+    ssh_cmd "set -eo pipefail; cd ${REMOTE_DIR}; [ -f .venv/bin/activate ] && source .venv/bin/activate || true; source .env.fig1; unset LIBTPU_INIT_ARGS || true; bash templates/gn-tpu-vm-figure1-4000.sh"
     ;;
   run-both)
     "$0" run-adam

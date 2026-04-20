@@ -38,7 +38,7 @@ ${PYTHON_BIN} -m ensurepip --upgrade >/dev/null 2>&1 || true
 ${PIP_CMD} install --upgrade pip wheel setuptools
 
 if [[ "${USE_VENV}" == "1" ]]; then
-  ${PIP_CMD} install "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  ${PIP_CMD} install "jax[tpu]==0.4.34" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
   ${PIP_CMD} install \
     flax==0.8.3 \
     optax==0.2.2 \
@@ -54,7 +54,7 @@ if [[ "${USE_VENV}" == "1" ]]; then
     matplotlib \
     seaborn
 else
-  ${PIP_CMD} install --user "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  ${PIP_CMD} install --user "jax[tpu]==0.4.34" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
   ${PIP_CMD} install --user \
     flax==0.8.3 \
     optax==0.2.2 \
@@ -72,10 +72,11 @@ else
 fi
 
 # Guardrail: keep JAX pinned in case any dependency attempts to upgrade it.
+# 0.4.34 avoids PJRT option mismatch errors seen with older pins on newer TPU runtimes.
 if [[ "${USE_VENV}" == "1" ]]; then
-  ${PIP_CMD} install --upgrade --no-deps "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  ${PIP_CMD} install --upgrade --no-deps "jax[tpu]==0.4.34" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 else
-  ${PIP_CMD} install --user --upgrade --no-deps "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  ${PIP_CMD} install --user --upgrade --no-deps "jax[tpu]==0.4.34" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 fi
 
 if [[ "${USE_VENV}" == "1" ]]; then

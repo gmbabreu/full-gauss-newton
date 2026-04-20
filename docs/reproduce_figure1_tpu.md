@@ -159,5 +159,8 @@ gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE} --quiet
 - `ensurepip is not available` / `python3-venv` missing: `scripts/setup_tpu_vm.sh` now tries
   `apt-get update` + `apt-get install python3-venv` and falls back to `pip --user` if venv cannot be created.
 - `apt ... 404 Not Found`: package index is stale; run `sudo apt-get update` before install.
-- `ImportError: cannot import name 'Jaxpr' from jax.core` from `neural_tangents`: this flow no longer requires `neural_tangents`; rerun `bash scripts/setup_tpu_vm.sh` to reinstall pinned TPU JAX (`jax[tpu]==0.4.28`) and updated deps.
+- `ImportError: cannot import name 'Jaxpr' from jax.core` from `neural_tangents`: this flow no longer requires `neural_tangents`; rerun `bash scripts/setup_tpu_vm.sh` to reinstall pinned TPU JAX (`jax[tpu]==0.4.34`) and updated deps.
+- `RuntimeError: Unable to initialize backend 'tpu': ... Unexpected option name ... ml_framework_name`:
+  clear inherited TPU flags and rebuild env:
+  `unset LIBTPU_INIT_ARGS; cd full-gauss-newton; bash scripts/setup_tpu_vm.sh`.
 - If you accidentally pasted secrets (e.g., W&B API key) into terminal logs, rotate them immediately.
