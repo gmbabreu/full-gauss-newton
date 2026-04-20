@@ -61,7 +61,7 @@ python -m EasyLM.models.llama.llama_train \
     --train_dataset.huggingface_dataset.name='en' \
     --train_dataset.huggingface_dataset.streaming=True \
     --train_dataset.huggingface_dataset.split='train' \
-    --train_dataset_batch_size=32 \
+    --train_dataset_batch_size=8 \
     --eval_dataset.text_processor.fields='text' \
     --eval_dataset.text_processor.add_bos_token=False \
     --eval_dataset.huggingface_dataset.pretokenized_dataset_dir='' \
