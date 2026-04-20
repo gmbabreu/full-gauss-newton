@@ -41,7 +41,7 @@ if [[ "${USE_VENV}" == "1" ]]; then
   ${PIP_CMD} install "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
   ${PIP_CMD} install \
     flax==0.8.3 \
-    git+https://github.com/deepmind/optax.git \
+    optax==0.2.2 \
     transformers==4.41.0 \
     sentencepiece \
     datasets \
@@ -57,7 +57,7 @@ else
   ${PIP_CMD} install --user "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
   ${PIP_CMD} install --user \
     flax==0.8.3 \
-    git+https://github.com/deepmind/optax.git \
+    optax==0.2.2 \
     transformers==4.41.0 \
     sentencepiece \
     datasets \
@@ -69,6 +69,13 @@ else
     tqdm \
     matplotlib \
     seaborn
+fi
+
+# Guardrail: keep JAX pinned in case any dependency attempts to upgrade it.
+if [[ "${USE_VENV}" == "1" ]]; then
+  ${PIP_CMD} install --upgrade --no-deps "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+else
+  ${PIP_CMD} install --user --upgrade --no-deps "jax[tpu]==0.4.28" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 fi
 
 if [[ "${USE_VENV}" == "1" ]]; then
