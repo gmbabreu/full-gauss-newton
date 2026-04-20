@@ -49,6 +49,14 @@ Example SLURM templates are provided in `EasyLM/templates/`.
 
 Modify paths, model configuration, and hyperparameters as needed for your environment and hardware setup.
 
+### Figure 1 Reproduction on Cloud TPU (AdamW vs Full GN, 4000 steps)
+See `docs/reproduce_figure1_tpu.md` plus:
+- `scripts/gcloud_tpu_figure1.sh` (local orchestrator via gcloud)
+- `scripts/setup_tpu_vm.sh` (dependency setup on TPU VM)
+- `templates/adam-tpu-vm-figure1-4000.sh`
+- `templates/gn-tpu-vm-figure1-4000.sh`
+
+
 --- 
 
 ## Dependencies 
