@@ -12,7 +12,7 @@ PROJECT="fast-second-order"
 ZONE="europe-west4-a"
 TPU_TYPE="v6e-8"
 TPU_VERSION="v2-alpha-tpuv6e"
-REPO="https://github.com/natalieabreu/full-gauss-newton.git"
+REPO="https://github.com/gmbabreu/full-gauss-newton.git"
 
 WANDB_API_KEY="${WANDB_API_KEY:-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}"
 WANDB_ENTITY="${WANDB_ENTITY:-ga2740-new-york-university}"
