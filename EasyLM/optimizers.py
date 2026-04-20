@@ -118,7 +118,7 @@ class MuonOptimizerFactory(object):
                 end_value=config.end_lr,
             )
         elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
-            learning_rate_schedule = optax.warmup_constant_schedule(
+            learning_rate_schedule = _warmup_constant_schedule(
                 init_value=config.init_lr,
                 peak_value=config.lr,
                 warmup_steps=config.lr_warmup_steps,
@@ -241,7 +241,7 @@ class SOAPOptimizerFactory(object):
                 end_value=config.end_lr,
             )
         elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
-            learning_rate_schedule = optax.warmup_constant_schedule(
+            learning_rate_schedule = _warmup_constant_schedule(
                 init_value=config.init_lr,
                 peak_value=config.lr,
                 warmup_steps=config.lr_warmup_steps,
@@ -426,7 +426,7 @@ class AdamWOptimizerFactory(object):
                 end_value=config.end_lr,
             )
         elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
-            learning_rate_schedule = optax.warmup_constant_schedule(
+            learning_rate_schedule = _warmup_constant_schedule(
                 init_value=config.init_lr,
                 peak_value=config.lr,
                 warmup_steps=config.lr_warmup_steps,

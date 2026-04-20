@@ -25,6 +25,15 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 import optax
 
+def _warmup_constant_schedule(init_value, peak_value, warmup_steps):
+    if warmup_steps == 0:
+        return optax.constant_schedule(peak_value)
+    return optax.join_schedules(
+        [optax.linear_schedule(init_value, peak_value, warmup_steps),
+         optax.constant_schedule(peak_value)],
+        boundaries=[warmup_steps],
+    )
+
 from EasyLM.data import DatasetFactory
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -260,7 +269,7 @@ def main(argv):
             else:
                 init_value = lr*0.1
             
-            global_sched = optax.warmup_constant_schedule(
+            global_sched = _warmup_constant_schedule(
                 init_value=init_value,
                 peak_value=lr,
                 warmup_steps=warmup,
