@@ -9,6 +9,29 @@ training-step vs validation-loss curves for:
 The provided templates run until **4000 steps** (instead of early stopping at
 validation loss 3.25).
 
+## Fastest way (from your local machine)
+
+After setting environment variables once, you can drive the full flow with one helper script:
+
+```bash
+export PROJECT=fast-second-order
+export ZONE=europe-west4-a
+export TPU_NAME=fig1-v6e-8
+export ACCELERATOR_TYPE=v6e-8
+export REPO_URL=https://github.com/<you>/full-gauss-newton.git
+export WANDB_API_KEY=<YOUR_WANDB_KEY>
+export OUTPUT_DIR=gs://<YOUR_BUCKET>/figure1-runs
+export TRAIN_PRETOKENIZED_DIR=gs://<YOUR_BUCKET>/c4-tokenized
+export EVAL_PRETOKENIZED_DIR=gs://<YOUR_BUCKET>/c4-tokenized-val
+
+bash scripts/gcloud_tpu_figure1.sh create
+bash scripts/gcloud_tpu_figure1.sh setup
+bash scripts/gcloud_tpu_figure1.sh configure
+bash scripts/gcloud_tpu_figure1.sh run-both
+```
+
+This will create the TPU VM, install dependencies, write `.env.fig1`, and run AdamW then full GN.
+
 ## 1) Pick TPU type / zone from available free quota
 
 From your available quota, suggested first choice is:
@@ -47,7 +70,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --command "
   git clone <YOUR_FORK_OR_REPO_URL> full-gauss-newton
   cd full-gauss-newton
   export PYTHONPATH=\"$PWD:$PYTHONPATH\"
-  ./scripts/tpu_vm_setup.sh
+  bash scripts/setup_tpu_vm.sh
 "
 ```
 
