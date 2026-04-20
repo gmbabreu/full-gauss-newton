@@ -40,9 +40,11 @@ cd ~
 
 echo '--- Installing JAX + deps ---'
 pip install -q 'jax[tpu]==0.4.30' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install -q flax==0.8.0 optax==0.2.2 orbax-checkpoint==0.6.4 transformers==4.40.0 neural-tangents==0.6.5 wandb==0.17.4 datasets einops gcsfs google-cloud-storage sentencepiece tqdm scipy requests
+pip install -q flax==0.8.0 orbax-checkpoint==0.6.4 transformers==4.40.0 wandb==0.17.4 datasets einops gcsfs google-cloud-storage sentencepiece tqdm scipy requests
 pip install -q 'setuptools<67'
 pip install -q 'mlxu>=0.1.13'
+pip install -q git+https://github.com/google-deepmind/optax.git
+pip install -q git+https://github.com/google/neural-tangents.git
 
 echo '--- Cloning repo ---'
 if [ ! -d full-gauss-newton ]; then git clone $REPO; fi
