@@ -16,7 +16,7 @@ import optax
 
 from EasyLM.jax_utils import float_to_dtype
 
-from soap_jax import soap
+# from soap_jax import soap  # not used; soap_jax not available on TPU
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 

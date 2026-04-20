@@ -86,10 +86,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 )
 
 def get_gpu_memory():
-    command = "nvidia-smi --query-gpu=memory.free --format=csv"
-    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
-    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
-    return memory_free_values
+    return [0]  # nvidia-smi unavailable on TPU
 
 def is_embedding_param(param_name, param_value):
     if 'embedding' in param_name:
