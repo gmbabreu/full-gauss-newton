@@ -387,6 +387,23 @@ def main(argv):
     def create_trainstate_from_params(params):
         return CustomTrainState.create(params=params, tx=tayl_solver, apply_fn=None)
 
+    subspace_solver = optax.adamw(
+        learning_rate=lr_sched,
+        b1=FLAGS.inner_b1,
+        b2=FLAGS.inner_b2,
+        mu_dtype=jnp.float32,
+        weight_decay=FLAGS.optimizer_wd,
+    )
+    if FLAGS.inner_clip_gradient:
+        subspace_solver = optax.chain(
+            optax.clip_by_global_norm(FLAGS.inner_clip_gradient),
+            subspace_solver,
+        )
+
+    def create_subspace_trainstate_from_params(params):
+        # params is a 1D vector of subspace coordinates.
+        return CustomTrainState.create(params=params, tx=subspace_solver, apply_fn=None)
+
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
@@ -810,7 +827,7 @@ def main(argv):
         if FLAGS.subspace_gauss_newton:
             subspace_idx = build_subspace_idx(start_step)
             last_refresh_id = -1
-            inner_state = create_trainstate_from_params(jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype))
+            inner_state = create_subspace_trainstate_from_params(jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype))
         else:
             subspace_idx = None
             inner_state = create_trainstate_from_params(train_state.params)
@@ -828,14 +845,19 @@ def main(argv):
                 if refresh_id != last_refresh_id:
                     subspace_idx = build_subspace_idx(step)
                     last_refresh_id = refresh_id
-                    reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype)
-                    inner_state = inner_state.replace(params=reset_params)
-                    inner_state = inner_state.replace(opt_state=tayl_solver.init(inner_state.params))
+                    inner_state = create_subspace_trainstate_from_params(
+                        jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype)
+                    )
 
             if FLAGS.reset_start:
-                reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype) if FLAGS.subspace_gauss_newton else train_state.params
-                inner_state = inner_state.replace(params=reset_params)
-                inner_state = inner_state.replace(opt_state=tayl_solver.init(inner_state.params))
+                if FLAGS.subspace_gauss_newton:
+                    reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype)
+                    inner_state = inner_state.replace(params=reset_params)
+                    inner_state = inner_state.replace(opt_state=subspace_solver.init(reset_params))
+                else:
+                    reset_params = train_state.params
+                    inner_state = inner_state.replace(params=reset_params)
+                    inner_state = inner_state.replace(opt_state=tayl_solver.init(inner_state.params))
 
             for i in range(FLAGS.inner_loop_iter):
                 batch_, dataset_metrics_ = next(dataset)
