@@ -15,7 +15,6 @@ import copy
 
 import jax
 import jax.numpy as jnp
-from jax import linearize, linear_transpose
 from jax.flatten_util import ravel_pytree
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
@@ -111,6 +110,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     subspace_gauss_newton=False,
     subspace_dim=0,
     subspace_refresh_interval=0,
+    subspace_coordinate_basis=True,
     redo_gn=0,
     reset_start=False,
 
@@ -126,10 +126,8 @@ def get_gpu_memory():
     except Exception:
         return [0]
 
-def is_embedding_param(param_name, param_value):
-    if 'embedding' in param_name:
-        return True
-    return False
+def is_embedding_param(param_path):
+    return any('embedding' in str(path_part) for path_part in param_path)
 
 def count_params(params):
     non_embedding_count = 0
@@ -138,11 +136,11 @@ def count_params(params):
     for param_name, param_value in jax.tree_util.tree_leaves_with_path(params):
         # print(param_name[-1].key, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
         total_count += jnp.prod(jnp.array(param_value.size))
-        if not is_embedding_param(param_name[-1].key, param_value):
+        if not is_embedding_param(param_name):
             non_embedding_count += jnp.prod(jnp.array(param_value.size))
-            print(param_name[-5:], is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+            print(param_name[-5:], is_embedding_param(param_name), jnp.prod(jnp.array(param_value.size)))
         else:
-            print(param_name, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+            print(param_name, is_embedding_param(param_name), jnp.prod(jnp.array(param_value.size)))
     # print(non_embedding_count)
     return total_count, non_embedding_count
 
@@ -462,12 +460,9 @@ def main(argv):
                 g0 = ∂L/∂p at p0 = ∂L/∂f @ ∂f/∂p at p0 ;  
             H0 v = (∂²L/∂p² at p0) @ v = (g0^T ∂²L/∂f² g0) (dθ) = (J(p0)^T ∂²L/∂f² J(p0) (dθ))
             '''
-            # Linearize f at params0
-            logits0, jvp_fn = linearize(f_batch, params0)          # y0,   v = J(p0) dθ
-
             # dθ and forward-mode JVP: v = J0 (params - params0)
             dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
-            v = jvp_fn(dparams)
+            logits0, v = jax.jvp(f_batch, (params0,), (dparams,))
 
             # g0 = ∂L/∂y at y0 ;  Hv = (∂²L/∂y² at y0) @ v
             grad_Ly = jax.grad(scalar_loss_on_logits)              # y -> grad wrt logits
@@ -475,13 +470,11 @@ def main(argv):
             _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))            # Hessian-vector (logits space) = (∂²L/∂f² at p0) J(p0) dθ
 
             # Single pullback: J0^T (g0 + H0 v)
-            jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
-            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            _, vjp_fn = jax.vjp(f_batch, params0)
+            (grad_params,) = vjp_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
 
-            # quadratic loss on linear model
-            loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
-
-
+            # Report base loss at linearization point (gradient update follows GN operator).
+            loss = scalar_loss_on_logits(logits0)
             return (loss, 0), grad_params
 
         (loss, accuracy), grads = value_and_gradient(params0, train_state.params)
@@ -517,30 +510,30 @@ def main(argv):
             )
             return out.logits
 
-        def scalar_loss_on_logits(logits):
+        def scalar_loss_on_logits(logits, params_for_wd):
             loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits, batch['target_tokens'], params0, params0, batch['loss_masks'], weight_decay=wd
+                logits, batch['target_tokens'], params_for_wd, params0, batch['loss_masks'], weight_decay=wd
             )
             return loss
 
         def value_and_gradient(params0, params):
-            logits0, jvp_fn = linearize(f_batch, params0)
             dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
-            v = jvp_fn(dparams)
+            logits0, v = jax.jvp(f_batch, (params0,), (dparams,))
 
-            grad_Ly = jax.grad(scalar_loss_on_logits)
+            grad_Ly = lambda logits: jax.grad(scalar_loss_on_logits, argnums=0)(logits, params0)
             g0 = grad_Ly(logits0)
             _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))
 
-            jt_fn = linear_transpose(jvp_fn, params0)
-            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            _, vjp_fn = jax.vjp(f_batch, params0)
+            (grad_params,) = vjp_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
 
-            loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
+            loss = scalar_loss_on_logits(logits0, params)
             return (loss, 0), grad_params
 
         u = train_state.params
         flat_params0, unravel_params = ravel_pytree(params0)
-        delta_flat = jnp.zeros_like(flat_params0).at[subspace_idx].set(u.astype(flat_params0.dtype))
+        u_cast = jnp.asarray(u, dtype=flat_params0.dtype)
+        delta_flat = jnp.zeros_like(flat_params0).at[subspace_idx].set(u_cast)
         params = unravel_params(flat_params0 + delta_flat)
         (loss, accuracy), grad_theta = value_and_gradient(params0, params)
         grad_flat, _ = ravel_pytree(grad_theta)
@@ -744,6 +737,8 @@ def main(argv):
                 raise ValueError("Set subspace_dim > 0 when using subspace_gauss_newton.")
             if FLAGS.subspace_refresh_interval < 0:
                 raise ValueError("subspace_refresh_interval must be >= 0.")
+            if not FLAGS.subspace_coordinate_basis:
+                raise NotImplementedError("Only coordinate subspace basis is currently implemented.")
 
         if FLAGS.wandb_run_id:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
@@ -797,6 +792,7 @@ def main(argv):
         flat_dim = flat_params0.shape[0]
 
         def build_subspace_idx(step):
+            # Coordinate subspace: choose a subset of flattened parameter coordinates.
             if FLAGS.subspace_refresh_interval <= 0:
                 refresh_id = 0
             else:
@@ -807,7 +803,8 @@ def main(argv):
 
         def apply_P_idx(u, idx, reference_params):
             flat_ref, unravel_ref = ravel_pytree(reference_params)
-            delta_flat = jnp.zeros_like(flat_ref).at[idx].set(u.astype(flat_ref.dtype))
+            u_cast = jnp.asarray(u, dtype=flat_ref.dtype)
+            delta_flat = jnp.zeros_like(flat_ref).at[idx].set(u_cast)
             return unravel_ref(delta_flat)
 
         if FLAGS.subspace_gauss_newton:
@@ -832,17 +829,13 @@ def main(argv):
                     subspace_idx = build_subspace_idx(step)
                     last_refresh_id = refresh_id
                     reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype)
-                    inner_state = inner_state.replace(
-                        params=reset_params,
-                        opt_state=tayl_solver.init(reset_params)
-                    )
+                    inner_state = inner_state.replace(params=reset_params)
+                    inner_state = inner_state.replace(opt_state=tayl_solver.init(inner_state.params))
 
             if FLAGS.reset_start:
                 reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype) if FLAGS.subspace_gauss_newton else train_state.params
-                inner_state = inner_state.replace(
-                    params=reset_params,
-                    opt_state=tayl_solver.init(reset_params)
-                )
+                inner_state = inner_state.replace(params=reset_params)
+                inner_state = inner_state.replace(opt_state=tayl_solver.init(inner_state.params))
 
             for i in range(FLAGS.inner_loop_iter):
                 batch_, dataset_metrics_ = next(dataset)
@@ -917,7 +910,7 @@ def main(argv):
                 #     tag = f"{_step_size:.4f}"    
                 #     wandb.log({
                 #         f"step_size_{tag}_loss": _loss,
-                #         "global_step": global_step,
+                #         "global_step": step,
                 #     })
                 updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                 train_state = train_state.replace(
@@ -987,13 +980,11 @@ def main(argv):
 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
                 if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
                     save_checkpoint(train_state, ema=ema, milestone=True)
                 else:
                     save_checkpoint(train_state, milestone=True)
             elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
                 if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
                     save_checkpoint(train_state, ema=ema)
                 else:
                     save_checkpoint(train_state)
