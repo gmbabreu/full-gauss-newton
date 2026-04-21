@@ -110,6 +110,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     gauss_newton=False,
     subspace_gauss_newton=False,
     subspace_dim=0,
+    subspace_refresh_interval=0,
     redo_gn=0,
     reset_start=False,
 
@@ -503,7 +504,7 @@ def main(argv):
         )
         return train_state, rng_generator(), metrics
 
-    def train_step_gauss_newton_subspace(train_state, params0, rng, batch, wd):
+    def train_step_gauss_newton_subspace(train_state, params0, subspace_idx, rng, batch, wd):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
@@ -538,9 +539,12 @@ def main(argv):
             return (loss, 0), grad_params
 
         u = train_state.params
-        params = jax.tree_util.tree_map(lambda p0, dp: p0 + dp, params0, apply_P(u))
+        flat_params0, unravel_params = ravel_pytree(params0)
+        delta_flat = jnp.zeros_like(flat_params0).at[subspace_idx].set(u.astype(flat_params0.dtype))
+        params = unravel_params(flat_params0 + delta_flat)
         (loss, accuracy), grad_theta = value_and_gradient(params0, params)
-        grad_u = apply_PT(grad_theta)
+        grad_flat, _ = ravel_pytree(grad_theta)
+        grad_u = grad_flat[subspace_idx]
 
         try:
             perplexity = jnp.exp(loss)
@@ -628,7 +632,7 @@ def main(argv):
     if FLAGS.gauss_newton and FLAGS.subspace_gauss_newton:
         sharded_train_step = pjit(
             train_step_gauss_newton_subspace,
-            in_shardings=(PS(), train_state_partition.params, PS(), batch_partition, PS()),
+            in_shardings=(PS(), train_state_partition.params, PS(), PS(), batch_partition, PS()),
             out_shardings=(PS(), PS(), PS()),
         )
     elif FLAGS.gauss_newton:
@@ -738,6 +742,8 @@ def main(argv):
                 raise ValueError("subspace_gauss_newton=True requires gauss_newton=True.")
             if FLAGS.subspace_dim <= 0:
                 raise ValueError("Set subspace_dim > 0 when using subspace_gauss_newton.")
+            if FLAGS.subspace_refresh_interval < 0:
+                raise ValueError("subspace_refresh_interval must be >= 0.")
 
         if FLAGS.wandb_run_id:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
@@ -789,27 +795,27 @@ def main(argv):
 
         flat_params0, unravel_params = ravel_pytree(train_state.params)
         flat_dim = flat_params0.shape[0]
+
+        def build_subspace_idx(step):
+            if FLAGS.subspace_refresh_interval <= 0:
+                refresh_id = 0
+            else:
+                refresh_id = step // FLAGS.subspace_refresh_interval
+            key = jax.random.PRNGKey(FLAGS.seed + 17)
+            key = jax.random.fold_in(key, refresh_id)
+            return jax.random.choice(key, flat_dim, shape=(FLAGS.subspace_dim,), replace=False)
+
+        def apply_P_idx(u, idx, reference_params):
+            flat_ref, unravel_ref = ravel_pytree(reference_params)
+            delta_flat = jnp.zeros_like(flat_ref).at[idx].set(u.astype(flat_ref.dtype))
+            return unravel_ref(delta_flat)
+
         if FLAGS.subspace_gauss_newton:
-            subspace_key = jax.random.PRNGKey(FLAGS.seed + 17)
-            subspace_idx = jax.random.choice(subspace_key, flat_dim, shape=(FLAGS.subspace_dim,), replace=False)
-
-            def apply_P(u):
-                delta_flat = jnp.zeros((flat_dim,), dtype=flat_params0.dtype)
-                delta_flat = delta_flat.at[subspace_idx].set(u.astype(flat_params0.dtype))
-                return unravel_params(delta_flat)
-
-            def apply_PT(grad_theta):
-                grad_flat, _ = ravel_pytree(grad_theta)
-                return grad_flat[subspace_idx]
-
+            subspace_idx = build_subspace_idx(start_step)
+            last_refresh_id = -1
             inner_state = create_trainstate_from_params(jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype))
         else:
-            def apply_P(u):
-                return u
-
-            def apply_PT(grad_theta):
-                return grad_theta
-
+            subspace_idx = None
             inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
@@ -819,6 +825,17 @@ def main(argv):
 
         for step in step_counter:
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
+
+            if FLAGS.subspace_gauss_newton:
+                refresh_id = 0 if FLAGS.subspace_refresh_interval <= 0 else step // FLAGS.subspace_refresh_interval
+                if refresh_id != last_refresh_id:
+                    subspace_idx = build_subspace_idx(step)
+                    last_refresh_id = refresh_id
+                    reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype)
+                    inner_state = inner_state.replace(
+                        params=reset_params,
+                        opt_state=tayl_solver.init(reset_params)
+                    )
 
             if FLAGS.reset_start:
                 reset_params = jnp.zeros((FLAGS.subspace_dim,), dtype=flat_params0.dtype) if FLAGS.subspace_gauss_newton else train_state.params
@@ -833,9 +850,14 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
-                inner_state, sharded_rng, metrics = sharded_train_step(
-                    inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
-                )
+                if FLAGS.subspace_gauss_newton:
+                    inner_state, sharded_rng, metrics = sharded_train_step(
+                        inner_state, train_state.params, subspace_idx, sharded_rng, batch, FLAGS.inner_loop_wd
+                    )
+                else:
+                    inner_state, sharded_rng, metrics = sharded_train_step(
+                        inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                    )
 
                 if FLAGS.log_inner_steps:
                     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
@@ -869,7 +891,7 @@ def main(argv):
                     break
                 # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
                 if FLAGS.subspace_gauss_newton:
-                    dir = apply_P(inner_state.params)
+                    dir = apply_P_idx(inner_state.params, subspace_idx, train_state.params)
                 else:
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
                 losses = []
@@ -909,7 +931,11 @@ def main(argv):
                     alpha = FLAGS.weight_average_decay
                     ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
             else:
-                updated_params = jax.tree_util.tree_map(lambda x, y: x + y, train_state.params, apply_P(inner_state.params)) if FLAGS.subspace_gauss_newton else inner_state.params
+                updated_params = jax.tree_util.tree_map(
+                    lambda x, y: x + y,
+                    train_state.params,
+                    apply_P_idx(inner_state.params, subspace_idx, train_state.params)
+                ) if FLAGS.subspace_gauss_newton else inner_state.params
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
