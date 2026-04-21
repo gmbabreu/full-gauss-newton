@@ -141,7 +141,7 @@ class HuggingfaceDataset(object):
         config.path = 'allenai/c4'
         config.name = 'en'
         config.split = 'train'
-        config.streaming = False
+        config.streaming = True
         config.seq_length = 1024
         config.batch_size = 8
         config.always_start_with_bos = False
@@ -324,7 +324,7 @@ class OptHuggingfaceDataset(object):
         config.path = 'allenai/c4'
         config.name = 'en'
         config.split = 'train'
-        config.streaming = False
+        config.streaming = True
         config.tokenizer_processes = 4  # Number of parallel processes
         config.tokenizer_parallel_chunk_size = 32
         config.tokenizer_parallel_batch_size = 1024
@@ -537,7 +537,7 @@ class OptHuggingfaceDataset(object):
 #         config.path = 'allenai/c4'
 #         config.name = 'en'
 #         config.split = 'train'
-#         config.streaming = False
+#         config.streaming = True
 #         config.tokenizer_processes = 4  # Number of parallel processes
 #         config.tokenizer_parallel_chunk_size = 32
 #         config.tokenizer_parallel_batch_size = 1024
