@@ -945,7 +945,7 @@ def main(argv):
                     #     log_metrics.update(metrics)
                     #     wandb.log(log_metrics)
 
-            merged_params = jax.tree_map(copy_array, train_state.params)  # For shape
+            merged_params = jax.tree.map(copy_array, train_state.params)  # For shape
             for i,layer in enumerate(layers): # combine the new parameters for each layer
                 new_layer_params = layer_states[i].layer_params
                 merged_params = merge_layer_params_partial(merged_params, layer, new_layer_params)

@@ -375,7 +375,7 @@ def main(argv):
 
         if FLAGS.save_model_freq > 0:
             if FLAGS.weight_average:
-                ema = jax.tree_map(copy_array, train_state.params)
+                ema = jax.tree.map(copy_array, train_state.params)
                 save_checkpoint(train_state, ema=ema)
             else:
                 save_checkpoint(train_state)
@@ -391,11 +391,11 @@ def main(argv):
         
         if FLAGS.weight_average:
             print('Using weight average')
-            ema = jax.tree_map(copy_array, train_state.params)
+            ema = jax.tree.map(copy_array, train_state.params)
 
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
 
-            batch = jax.tree_map(
+            batch = jax.tree.map(
                 lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                 batch
             )
