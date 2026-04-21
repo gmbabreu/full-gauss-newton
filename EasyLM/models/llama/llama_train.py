@@ -85,10 +85,13 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 )
 
 def get_gpu_memory():
-    command = "nvidia-smi --query-gpu=memory.free --format=csv"
-    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
-    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
-    return memory_free_values
+    try:
+        command = "nvidia-smi --query-gpu=memory.free --format=csv"
+        memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
+        memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+        return memory_free_values
+    except Exception:
+        return [0]
 
 def is_embedding_param(param_name, param_value):
     if 'embedding' in param_name:
@@ -138,12 +141,12 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-    if FLAGS.load_dataset_state != '' and FLAGS.load_dataset_state.startswith('gs://'):
+    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
         FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != '':
+    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
         print('loaded dataset state', flush=True)
 
