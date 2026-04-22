@@ -743,8 +743,8 @@ def main(argv):
                     inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
                 )
 
-                if i % 100 == 0:
-                    print(f"  inner step {i}/{FLAGS.inner_loop_iter}", flush=True)
+                if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
+                    print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                 if FLAGS.log_inner_steps:
                     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                     log_metrics['inner_loss'] = metrics['loss']
