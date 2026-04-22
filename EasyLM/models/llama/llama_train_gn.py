@@ -750,7 +750,7 @@ def main(argv):
                     log_metrics['inner_param_norm'] = metrics['param_norm']
                     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                     log_metrics['inner_learning_rate'] = metrics['learning_rate']
-                    wandb.log(log_metrics, step=step*FLAGS.inner_loop_iter + i)
+                    wandb.log(log_metrics)
 
                 if FLAGS.weight_average and not FLAGS.linesearch: # for linesearch, do ema in outer loop
                     alpha = FLAGS.weight_average_decay
@@ -845,7 +845,7 @@ def main(argv):
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
-                        wandb.log(log_metrics, step=step*FLAGS.inner_loop_iter + i)
+                        wandb.log(log_metrics)
                         tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                         
                         break
@@ -856,7 +856,7 @@ def main(argv):
                     # metrics = jax.device_get(metrics)
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                wandb.log(log_metrics, step=step*FLAGS.inner_loop_iter + i)
+                wandb.log(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             
             
@@ -890,7 +890,7 @@ def main(argv):
                 eval_metric_list.append(eval_metrics)
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            wandb.log(log_metrics, step=step*FLAGS.inner_loop_iter + i)
+            wandb.log(log_metrics)
             tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
