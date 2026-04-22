@@ -107,7 +107,7 @@ def pretokenize_dataset(
     tokenizer_name,
     text_processor_config,
     output_dir,
-    num_proc=4,
+    num_proc=1,
     batch_size=32,
     save_after_batches=1000
 ):
@@ -133,7 +133,7 @@ def pretokenize_dataset(
 
     # Load dataset
     print(f"Loading dataset: {dataset_path}, name: {dataset_name}, split: {split}")
-    dataset = load_dataset(dataset_path, name=dataset_name, split=split, streaming=False)
+    dataset = load_dataset(dataset_path, name=dataset_name, split=split, streaming=True)
 
     # Define the processing function
     def process_example(example):
@@ -144,9 +144,9 @@ def pretokenize_dataset(
     tokenized_dataset = dataset.map(
         process_example,
         batched=False,
-        num_proc=num_proc,
+        
         remove_columns=dataset.column_names,
-        desc="Tokenizing dataset",
+        
     )
 
     # Define the new features for the tokenized dataset
@@ -157,13 +157,13 @@ def pretokenize_dataset(
         # 'aux': ...
     })
 
-    # Convert to DatasetDict if necessary
-    if isinstance(tokenized_dataset, Dataset):
-        tokenized_dataset = DatasetDict({'train': tokenized_dataset})
-
-    # Save the tokenized dataset to disk
+    # Convert IterableDataset to regular Dataset and save
+    print("Converting streamed data to regular dataset...")
+    tokenized_dataset = Dataset.from_list(list(tokenized_dataset))
+    tokenized_dataset = DatasetDict({"train": tokenized_dataset})
     print(f"Saving tokenized dataset to {output_dir}...")
     tokenized_dataset.save_to_disk(output_dir)
+    print("Pre-tokenization and saving completed successfully.")
     print("Pre-tokenization and saving completed successfully.")
 
 if __name__ == "__main__":
