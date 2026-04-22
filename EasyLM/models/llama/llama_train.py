@@ -416,7 +416,8 @@ def main(argv):
             
 
             if step % FLAGS.log_freq == 0:
-                log_metrics = {"step": step}
+                optimizer_step = step // FLAGS.optimizer.accumulate_gradient_steps
+                log_metrics = {"step": optimizer_step}
                 log_metrics.update(metrics)
                 log_metrics.update(dataset_metrics)
                 
@@ -442,7 +443,7 @@ def main(argv):
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
-                        wandb.log(log_metrics)
+                        wandb.log(log_metrics, step=optimizer_step)
                         tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                         
                         break
@@ -453,7 +454,7 @@ def main(argv):
                     # metrics = jax.device_get(metrics)
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                wandb.log(log_metrics)
+                wandb.log(log_metrics, step=optimizer_step)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             
             
@@ -487,7 +488,7 @@ def main(argv):
                 eval_metric_list.append(eval_metrics)
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            wandb.log(log_metrics)
+            wandb.log(log_metrics, step=optimizer_step)
             tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
