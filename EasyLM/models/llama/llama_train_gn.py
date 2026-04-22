@@ -843,8 +843,7 @@ def main(argv):
                         )
                         eval_metric_list.append(eval_metrics)
                     log_metrics = {"global_step": step}
-            log_metrics.update(average_metrics(eval_metric_list))
-                    
+                    log_metrics.update(average_metrics(eval_metric_list))
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
@@ -891,7 +890,7 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
-            log_metrics = {"global_step": step}
+            log_metrics = {"global_step": start_step}
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
             wandb.log(log_metrics)
