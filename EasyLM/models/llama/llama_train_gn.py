@@ -743,6 +743,8 @@ def main(argv):
                     inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
                 )
 
+                if i % 100 == 0:
+                    print(f"  inner step {i}/{FLAGS.inner_loop_iter}", flush=True)
                 if FLAGS.log_inner_steps:
                     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                     log_metrics['inner_loss'] = metrics['loss']
@@ -840,7 +842,8 @@ def main(argv):
                             eval_params, sharded_rng, eval_batch
                         )
                         eval_metric_list.append(eval_metrics)
-                    log_metrics.update(average_metrics(eval_metric_list))
+                    log_metrics = {"global_step": step}
+            log_metrics.update(average_metrics(eval_metric_list))
                     
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
@@ -888,6 +891,7 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
+            log_metrics = {"global_step": step}
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
             wandb.log(log_metrics)
