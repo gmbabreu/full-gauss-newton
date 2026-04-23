@@ -841,8 +841,6 @@ def main(argv):
                         sharded_rng, eval_metrics = sharded_eval_step(
                             eval_params, sharded_rng, eval_batch
                         )
-                        eval_metric_list.append(eval_metrics)
-                    log_metrics = {"global_step": step}
                     log_metrics.update(average_metrics(eval_metric_list))
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
