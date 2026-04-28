@@ -49,6 +49,7 @@ from EasyLM.layerwise_utils import (LayerState, get_layer_params, merge_layer_pa
                                     print_layer_param_keys, get_layer_param_keys)
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
+    tmp_dir='/tmp',
     seed=42,
     mesh_dim='1,-1,1',
     dtype='fp32',
@@ -115,10 +116,13 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 )
 
 def get_gpu_memory():
-    command = "nvidia-smi --query-gpu=memory.free --format=csv"
-    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
-    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
-    return memory_free_values
+    try:
+        command = "nvidia-smi --query-gpu=memory.free --format=csv"
+        memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
+        memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+        return memory_free_values
+    except Exception:
+        return [0]
 
 def is_embedding_param(param_name, param_value):
     if 'embedding' in param_name:
@@ -174,7 +178,7 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != '':
+    if FLAGS.load_dataset_state != '' and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
         print('loaded dataset state', flush=True)
 
@@ -716,7 +720,6 @@ def main(argv):
         donate_argnums=(1,),
     )
 
-    parallel_loss_fn = jax.jit(loss_fn)
 
     def save_checkpoint(train_state, ema=None, milestone=False):
         step = int(jax.device_get(train_state.step))
@@ -753,6 +756,7 @@ def main(argv):
         return cross_entropy_loss_and_accuracy(
             logits, batch['target_tokens'], batch['loss_masks']
         )
+    parallel_loss_fn = jax.jit(loss_fn)
 
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
     print(f"Mesh axes names: {mesh.axis_names}")
@@ -891,14 +895,14 @@ def main(argv):
         if FLAGS.gauss_newton:
             sharded_train_step_layer = [pjit(
                 train_step_gauss_newton,
-                in_shardings=(layer_state_partition_i, PS(), PS(), batch_partition, PS()),
+                in_shardings=(layer_state_partition_i, train_state_partition.params, PS(), batch_partition, PS()),
                 out_shardings=(layer_state_partition_i, PS(), PS()),
             )
             for layer_state_partition_i in per_layer_partitions]
         else:
             sharded_train_step_layer = [pjit(
                 train_step_layer_jvp,
-                in_shardings=(layer_state_partition_i, PS(), PS(), batch_partition, PS()),  
+                in_shardings=(layer_state_partition_i, train_state_partition.params, PS(), batch_partition, PS()),
                 out_shardings=(layer_state_partition_i, PS(), PS()),
             )
             for layer_state_partition_i in per_layer_partitions]
@@ -989,14 +993,9 @@ def main(argv):
                 print('Step size:', step_size)
                 wandb.log({
                     'step_size': step_size,
-                    'step': step,
-                    })
-                for (_step_size, _loss) in losses:
-                    tag = f"{_step_size:.4f}"    
-                    wandb.log({
-                        f"step_size_{tag}_loss": _loss,
-                        "step": step,
-                    })
+                    'global_step': step,
+                    }, step=step)
+
                 updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                 train_state = train_state.replace(
                     step=train_state.step+1,
@@ -1021,7 +1020,7 @@ def main(argv):
  
 
             if step % FLAGS.log_freq == 0:
-                log_metrics = {"step": step}
+                log_metrics = {"global_step": step}
                 log_metrics.update(metrics)
                 # log_metrics.update(dataset_metrics)
                 
@@ -1047,7 +1046,7 @@ def main(argv):
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
-                        wandb.log(log_metrics)
+                        wandb.log(log_metrics, step=step)
                         tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                         
                         break
@@ -1058,7 +1057,7 @@ def main(argv):
                     # metrics = jax.device_get(metrics)
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                wandb.log(log_metrics)
+                wandb.log(log_metrics, step=step)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             
             
@@ -1092,7 +1091,7 @@ def main(argv):
                 eval_metric_list.append(eval_metrics)
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            wandb.log(log_metrics)
+            wandb.log(log_metrics, step=step)
             tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
