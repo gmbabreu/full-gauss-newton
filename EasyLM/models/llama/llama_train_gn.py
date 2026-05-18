@@ -1,6 +1,8 @@
 import pprint
 from functools import partial
+
 from google.cloud import storage
+
 from tqdm import tqdm, trange
 import numpy as np
 import mlxu
