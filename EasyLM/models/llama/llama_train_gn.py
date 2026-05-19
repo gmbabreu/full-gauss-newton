@@ -105,6 +105,10 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_ema_checkpoint='',
     linesearch=False,
     ls_range=5,
+    normalize_step=False,
+    single_batch_inner=False,
+    ls_lambdas='',
+    fixed_step_size=0.0,
 
     gauss_newton=False,
     redo_gn=0,
@@ -786,7 +790,11 @@ def main(argv):
                     dir_norm_val = global_norm(dir)
                     dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
                 losses = []
-                for step_size in [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]:
+                if FLAGS.normalize_step and FLAGS.ls_lambdas:
+                    ls_candidates = [float(x) for x in FLAGS.ls_lambdas.split(",")]
+                else:
+                    ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
+                for step_size in ls_candidates:
                     # Compute loss using pre-fetched batches
                     updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                     accumulated_loss = 0.0
@@ -801,10 +809,11 @@ def main(argv):
                 step_size = jax.device_get(step_size)
                 print('Step size:', step_size)
                 dir_norm = float(jax.device_get(global_norm(dir)))
+                effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
                 wandb.log({  # step added below
                     'step_size': step_size,
                     'global_step': step,
-                    'scaled_step_norm': step_size * dir_norm,
+                    'scaled_step_norm': effective_step_size * dir_norm,
                     'dir_norm': dir_norm,
                     }, step=step)
                 for (_step_size, _loss) in losses:
