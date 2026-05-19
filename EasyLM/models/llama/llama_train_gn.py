@@ -733,8 +733,13 @@ def main(argv):
                     opt_state=tayl_solver.init(train_state.params)
                 )
 
+            if FLAGS.single_batch_inner:
+                single_batch_, single_dataset_metrics_ = next(dataset)
             for i in range(FLAGS.inner_loop_iter):
-                batch_, dataset_metrics_ = next(dataset)
+                if FLAGS.single_batch_inner:
+                    batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
+                else:
+                    batch_, dataset_metrics_ = next(dataset)
                 batch = jax.tree.map(
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
@@ -777,6 +782,9 @@ def main(argv):
                     break
                 # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
+                if FLAGS.normalize_step:
+                    dir_norm_val = global_norm(dir)
+                    dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
                 losses = []
                 for step_size in [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]:
                     # Compute loss using pre-fetched batches
@@ -792,16 +800,19 @@ def main(argv):
                 step_size, loss = min(losses, key=lambda x: x[1])
                 step_size = jax.device_get(step_size)
                 print('Step size:', step_size)
+                dir_norm = float(jax.device_get(global_norm(dir)))
                 wandb.log({  # step added below
                     'step_size': step_size,
                     'global_step': step,
+                    'scaled_step_norm': step_size * dir_norm,
+                    'dir_norm': dir_norm,
                     }, step=step)
-                # for (_step_size, _loss) in losses:
-                #     tag = f"{_step_size:.4f}"    
-                #     wandb.log({  # step added below
-                #         f"step_size_{tag}_loss": _loss,
-                #         "global_step": global_step,
-                #     })
+                for (_step_size, _loss) in losses:
+                    tag = f"{_step_size:.4f}"
+                    wandb.log({
+                        f"ls_loss_{tag}": float(jax.device_get(_loss)),
+                        "global_step": step,
+                    }, step=step)
                 updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                 train_state = train_state.replace(
                     step=train_state.step+1,
