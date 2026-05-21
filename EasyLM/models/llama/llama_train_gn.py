@@ -824,7 +824,7 @@ def main(argv):
                         step_size *= FLAGS.armijo_beta
                     step_size = best_step_size
                 else:
-                        ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
+                    ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
                     for step_size in ls_candidates:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
