@@ -805,9 +805,9 @@ def main(argv):
 
                 losses = []
                 if FLAGS.armijo_linesearch:
-                    # Armijo backtracking linesearch
                     step_size = FLAGS.armijo_init_step
                     prev_loss = float("inf")
+                    best_step_size = step_size
                     while step_size > 1e-6:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
@@ -818,17 +818,12 @@ def main(argv):
                         average_loss = float(jax.device_get(accumulated_loss / len(pre_fetched_batches)))
                         losses.append((step_size, average_loss))
                         if average_loss > prev_loss:
-                            # Loss got worse, use previous step size
-                            step_size_prev = losses[-2][0] if len(losses) > 1 else step_size
-                            step_size = step_size_prev
                             break
                         prev_loss = average_loss
+                        best_step_size = step_size
                         step_size *= FLAGS.armijo_beta
-                    step_size = losses[-1][0] if losses else FLAGS.armijo_init_step
+                    step_size = best_step_size
                 else:
-                    if FLAGS.normalize_step and FLAGS.ls_lambdas:
-                        ls_candidates = [float(x) for x in FLAGS.ls_lambdas.split(",")]
-                    else:
                         ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
                     for step_size in ls_candidates:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
