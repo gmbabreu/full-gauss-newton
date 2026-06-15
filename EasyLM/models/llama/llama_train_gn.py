@@ -109,6 +109,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     single_batch_inner=False,
     ls_lambdas='',
     fixed_step_size=0.0,
+    separate_ls_batch=False,
     armijo_linesearch=False,
     armijo_alpha=0.5,
     armijo_beta=0.5,
@@ -786,6 +787,18 @@ def main(argv):
                         exit = True
                         break
                 
+                if FLAGS.separate_ls_batch:
+                    ls_batches = []
+                    for _ in range(FLAGS.inner_loop_iter):
+                        try:
+                            batch, _ = next(dataset)
+                            ls_batches.append(batch)
+                        except StopIteration:
+                            print("Dataset exhausted during ls batch fetch")
+                            exit = True
+                            break
+                else:
+                    ls_batches = pre_fetched_batches
                 if exit:
                     break
                 # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
@@ -796,11 +809,11 @@ def main(argv):
 
                 # Compute baseline loss at current params
                 baseline_loss = 0.0
-                for batch in pre_fetched_batches:
+                for batch in ls_batches:
                     sharded_rng, subrng = jax.random.split(sharded_rng)
                     bl, _ = parallel_loss_fn(train_state.params, batch, subrng)
                     baseline_loss += bl
-                baseline_loss = baseline_loss / len(pre_fetched_batches)
+                baseline_loss = baseline_loss / len(ls_batches)
                 baseline_loss = float(jax.device_get(baseline_loss))
 
                 losses = []
@@ -811,11 +824,11 @@ def main(argv):
                     while step_size > 1e-6:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
-                        for batch in pre_fetched_batches:
+                        for batch in ls_batches:
                             sharded_rng, subrng = jax.random.split(sharded_rng)
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
-                        average_loss = float(jax.device_get(accumulated_loss / len(pre_fetched_batches)))
+                        average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
                         losses.append((step_size, average_loss))
                         if average_loss > prev_loss:
                             break
@@ -828,11 +841,11 @@ def main(argv):
                     for step_size in ls_candidates:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
-                        for batch in pre_fetched_batches:
+                        for batch in ls_batches:
                             sharded_rng, subrng = jax.random.split(sharded_rng)
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
-                        average_loss = accumulated_loss / len(pre_fetched_batches)
+                        average_loss = accumulated_loss / len(ls_batches)
                         losses.append((step_size, average_loss))
                     step_size, loss = min(losses, key=lambda x: x[1])
                     step_size = jax.device_get(step_size)
