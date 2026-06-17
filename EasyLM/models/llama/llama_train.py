@@ -396,6 +396,7 @@ def main(argv):
             print('Using weight average')
             ema = jax.tree.map(copy_array, train_state.params)
 
+        old_params = jax.device_get(train_state.params)
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
 
             batch = jax.tree.map(
@@ -403,6 +404,8 @@ def main(argv):
                 batch
             )
 
+            if (step + 1) % FLAGS.optimizer.accumulate_gradient_steps == 0:
+                old_params = jax.device_get(train_state.params)
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
@@ -419,6 +422,10 @@ def main(argv):
                 optimizer_step = step // FLAGS.optimizer.accumulate_gradient_steps
                 log_metrics = {"step": optimizer_step}
                 log_metrics.update(metrics)
+                old_params_host = jax.device_get(old_params)
+                new_params_host = jax.device_get(train_state.params)
+                update_norm = float(global_norm(jax.tree_util.tree_map(lambda x, y: x - y, new_params_host, old_params_host)))
+                log_metrics["update_norm"] = update_norm
                 log_metrics.update(dataset_metrics)
                 
 

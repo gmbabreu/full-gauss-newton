@@ -105,6 +105,15 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_ema_checkpoint='',
     linesearch=False,
     ls_range=5,
+    normalize_step=False,
+    single_batch_inner=False,
+    ls_lambdas='',
+    fixed_step_size=0.0,
+    separate_ls_batch=False,
+    armijo_linesearch=False,
+    armijo_alpha=0.5,
+    armijo_beta=0.5,
+    armijo_init_step=1.0,
 
     gauss_newton=False,
     redo_gn=0,
@@ -733,8 +742,13 @@ def main(argv):
                     opt_state=tayl_solver.init(train_state.params)
                 )
 
+            if FLAGS.single_batch_inner:
+                single_batch_, single_dataset_metrics_ = next(dataset)
             for i in range(FLAGS.inner_loop_iter):
-                batch_, dataset_metrics_ = next(dataset)
+                if FLAGS.single_batch_inner:
+                    batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
+                else:
+                    batch_, dataset_metrics_ = next(dataset)
                 batch = jax.tree.map(
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
@@ -773,41 +787,92 @@ def main(argv):
                         exit = True
                         break
                 
+                if FLAGS.separate_ls_batch:
+                    ls_batches = []
+                    for _ in range(FLAGS.inner_loop_iter):
+                        try:
+                            batch, _ = next(dataset)
+                            ls_batches.append(batch)
+                        except StopIteration:
+                            print("Dataset exhausted during ls batch fetch")
+                            exit = True
+                            break
+                else:
+                    ls_batches = pre_fetched_batches
                 if exit:
                     break
                 # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
+                if FLAGS.normalize_step:
+                    dir_norm_val = global_norm(dir)
+                    dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
+
+                # Compute baseline loss at current params
+                baseline_loss = 0.0
+                for batch in ls_batches:
+                    sharded_rng, subrng = jax.random.split(sharded_rng)
+                    bl, _ = parallel_loss_fn(train_state.params, batch, subrng)
+                    baseline_loss += bl
+                baseline_loss = baseline_loss / len(ls_batches)
+                baseline_loss = float(jax.device_get(baseline_loss))
+
                 losses = []
-                for step_size in [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]:
-                    # Compute loss using pre-fetched batches
-                    updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
-                    accumulated_loss = 0.0
-                    for batch in pre_fetched_batches:
-                        sharded_rng, subrng = jax.random.split(sharded_rng)
-                        loss, _ = parallel_loss_fn(updated_params, batch, subrng)
-                        accumulated_loss += loss
-                    
-                    average_loss = accumulated_loss / len(pre_fetched_batches)
-                    losses.append((step_size, average_loss))
-                step_size, loss = min(losses, key=lambda x: x[1])
-                step_size = jax.device_get(step_size)
-                print('Step size:', step_size)
-                wandb.log({  # step added below
-                    'step_size': step_size,
-                    'global_step': step,
+                if FLAGS.armijo_linesearch:
+                    step_size = FLAGS.armijo_init_step
+                    prev_loss = float("inf")
+                    best_step_size = step_size
+                    while step_size > 1e-6:
+                        updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                        accumulated_loss = 0.0
+                        for batch in ls_batches:
+                            sharded_rng, subrng = jax.random.split(sharded_rng)
+                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            accumulated_loss += loss
+                        average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
+                        losses.append((step_size, average_loss))
+                        if average_loss > prev_loss:
+                            break
+                        prev_loss = average_loss
+                        best_step_size = step_size
+                        step_size *= FLAGS.armijo_beta
+                    step_size = best_step_size
+                else:
+                    ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
+                    for step_size in ls_candidates:
+                        updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                        accumulated_loss = 0.0
+                        for batch in ls_batches:
+                            sharded_rng, subrng = jax.random.split(sharded_rng)
+                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            accumulated_loss += loss
+                        average_loss = accumulated_loss / len(ls_batches)
+                        losses.append((step_size, average_loss))
+                    step_size, loss = min(losses, key=lambda x: x[1])
+                    step_size = jax.device_get(step_size)
+
+                effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                print("Step size:", effective_step_size)
+                dir_norm = float(jax.device_get(global_norm(dir)))
+                wandb.log({
+                    "step_size": effective_step_size,
+                    "global_step": step,
+                    "scaled_step_norm": effective_step_size * dir_norm,
+                    "dir_norm": dir_norm,
+                    "baseline_loss": baseline_loss,
                     }, step=step)
-                # for (_step_size, _loss) in losses:
-                #     tag = f"{_step_size:.4f}"    
-                #     wandb.log({  # step added below
-                #         f"step_size_{tag}_loss": _loss,
-                #         "global_step": global_step,
-                #     })
-                updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                for (_step_size, _loss) in losses:
+                    tag = f"{_step_size:.4f}"
+                    loss_improvement = baseline_loss - float(jax.device_get(_loss))
+                    wandb.log({
+                        f"ls_loss_improvement_{tag}": loss_improvement,
+                        "global_step": step,
+                    }, step=step)
+                updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
                     params=updated_params,
-                    warmstart_params=inner_state.params, # store the new params for the next iteration
+                    warmstart_params=inner_state.params,
                 )
                 
                 if FLAGS.weight_average:
