@@ -815,7 +815,8 @@ def main(argv):
                     baseline_loss += bl
                 baseline_loss = baseline_loss / len(ls_batches)
                 baseline_loss = float(jax.device_get(baseline_loss))
-
+                print(f"\nBaseline loss: {baseline_loss:.6f}")
+                
                 losses = []
                 if FLAGS.armijo_linesearch:
                     step_size = FLAGS.armijo_init_step
@@ -829,6 +830,9 @@ def main(argv):
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
                         average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
+
+                        print(f"step={step_size:.6f}  loss={average_loss:.6f}")
+                        
                         losses.append((step_size, average_loss))
                         if average_loss > prev_loss:
                             break
@@ -836,6 +840,7 @@ def main(argv):
                         best_step_size = step_size
                         step_size *= FLAGS.armijo_beta
                     step_size = best_step_size
+                    print(f"Chosen step size: {step_size:.6f}\n")
                 else:
                     ls_candidates = [1/jnp.sqrt(2)**i for i in range(FLAGS.ls_range)]
                     for step_size in ls_candidates:
