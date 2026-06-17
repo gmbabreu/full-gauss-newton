@@ -825,24 +825,50 @@ def main(argv):
                 losses = []
                 if FLAGS.armijo_linesearch:
                     step_size = FLAGS.armijo_init_step
-                    prev_loss = float("inf")
+                
+                    # ADDED: track best seen value (replaces prev_loss logic)
+                    best_loss = float("inf")
                     best_step_size = step_size
+                
+                    # ADDED: patience-based stopping
+                    patience = 2
+                    bad = 0
+                
                     while step_size > 1e-6:
-                        updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                
+                        updated_params = jax.tree_util.tree_map(
+                            lambda x, y: x + step_size * y,
+                            train_state.params,
+                            dir
+                        )
+                
                         accumulated_loss = 0.0
+                
                         for batch, subrng in zip(ls_batches, ls_rngs):
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
+                
                         average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
-
+                
                         print(f"step={step_size:.6f}  loss={average_loss:.6f}")
-                        
+                
                         losses.append((step_size, average_loss))
-                        if average_loss > prev_loss:
+                
+                        # =========================
+                        # ADDED: improved stopping logic (replace prev_loss check)
+                        # =========================
+                        if average_loss < best_loss:
+                            best_loss = average_loss
+                            best_step_size = step_size
+                            bad = 0
+                        else:
+                            bad += 1
+                
+                        if bad >= patience:
                             break
-                        prev_loss = average_loss
-                        best_step_size = step_size
+                
                         step_size *= FLAGS.armijo_beta
+                
                     step_size = best_step_size
                     print(f"Chosen step size: {step_size:.6f}\n")
                 else:
