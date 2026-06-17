@@ -801,6 +801,12 @@ def main(argv):
                     ls_batches = pre_fetched_batches
                 if exit:
                     break
+
+                ls_rngs = []
+                for _ in ls_batches:
+                    sharded_rng, subrng = jax.random.split(sharded_rng)
+                    ls_rngs.append(subrng)
+                
                 # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
                 if FLAGS.normalize_step:
@@ -809,8 +815,7 @@ def main(argv):
 
                 # Compute baseline loss at current params
                 baseline_loss = 0.0
-                for batch in ls_batches:
-                    sharded_rng, subrng = jax.random.split(sharded_rng)
+                for batch, subrng in zip(ls_batches, ls_rngs):
                     bl, _ = parallel_loss_fn(train_state.params, batch, subrng)
                     baseline_loss += bl
                 baseline_loss = baseline_loss / len(ls_batches)
@@ -825,8 +830,7 @@ def main(argv):
                     while step_size > 1e-6:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
-                        for batch in ls_batches:
-                            sharded_rng, subrng = jax.random.split(sharded_rng)
+                        for batch, subrng in zip(ls_batches, ls_rngs):
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
                         average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
@@ -846,8 +850,7 @@ def main(argv):
                     for step_size in ls_candidates:
                         updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
                         accumulated_loss = 0.0
-                        for batch in ls_batches:
-                            sharded_rng, subrng = jax.random.split(sharded_rng)
+                        for batch, subrng in zip(ls_batches, ls_rngs):
                             loss, _ = parallel_loss_fn(updated_params, batch, subrng)
                             accumulated_loss += loss
                         average_loss = accumulated_loss / len(ls_batches)
