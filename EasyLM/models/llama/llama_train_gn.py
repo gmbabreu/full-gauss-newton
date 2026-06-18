@@ -831,7 +831,7 @@ def main(argv):
                     best_step_size = step_size
                 
                     # ADDED: patience-based stopping
-                    patience = 2
+                    patience = 1
                     bad = 0
                 
                     while step_size > 1e-6:
