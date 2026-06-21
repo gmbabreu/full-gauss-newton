@@ -922,6 +922,7 @@ def main(argv):
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"global_step": step}
                 log_metrics.update(metrics)
+                log_metrics['inner_gradient_norm_final'] = metrics['gradient_norm']'''
                 # log_metrics.update(dataset_metrics)
                 
 
