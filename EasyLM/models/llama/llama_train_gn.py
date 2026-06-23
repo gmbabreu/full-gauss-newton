@@ -11,6 +11,7 @@ import subprocess as sp
 import timeit
 import os
 import wandb
+from libtpu.sdk import monitoring as tpu_monitoring
 import copy
 
 import jax
@@ -151,6 +152,25 @@ def count_params(params):
     # print(non_embedding_count)
     return total_count, non_embedding_count
 
+
+
+def get_tpu_metrics():
+    """Snapshot a few TPU utilization/memory metrics via the libtpu monitoring SDK.
+    Returns an empty dict if unavailable (e.g. not running on TPU, or metrics
+    server not yet up) so this never crashes a training run."""
+    metric_names = ["duty_cycle_pct", "tensorcore_util", "hbm_capacity_usage", "hbm_capacity_total"]
+    out = {}
+    for name in metric_names:
+        try:
+            result = tpu_monitoring.get_metric(name)
+            data = result.data()
+            # data() returns a list of str values per chip; cast + average across chips
+            values = [float(v) for v in data]
+            if values:
+                out[f"tpu_{name}"] = sum(values) / len(values)
+        except Exception as e:
+            pass
+    return out
 
 
 def main(argv):
@@ -921,8 +941,9 @@ def main(argv):
        
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"global_step": step}
+                log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
-                log_metrics['inner_gradient_norm_final'] = metrics['gradient_norm']'''
+                log_metrics['inner_gradient_norm_final'] = metrics['gradient_norm']
                 # log_metrics.update(dataset_metrics)
                 
 
