@@ -943,7 +943,6 @@ def main(argv):
                 log_metrics = {"global_step": step}
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
-                log_metrics['inner_gradient_norm_final'] = metrics['gradient_norm']
                 # log_metrics.update(dataset_metrics)
                 
 
