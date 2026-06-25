@@ -502,14 +502,15 @@ def main(argv):
             # Single pullback: J0^T (g0 + H0 v)
             jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
             (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            (b_params,) = jt_fn(g0)  # b = J0^T g0, for relative residual
 
             # quadratic loss on linear model
             loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
 
 
-            return (loss, 0), grad_params
+            return (loss, 0), (grad_params, b_params)
 
-        (loss, accuracy), grads = value_and_gradient(params0, train_state.params)
+        (loss, accuracy), (grads, b_params) = value_and_gradient(params0, train_state.params)
 
         try:
             perplexity = jnp.exp(loss)
@@ -524,6 +525,7 @@ def main(argv):
             accuracy=accuracy,
             learning_rate=lr_sched(train_state.step),
             gradient_norm=global_norm(grads),
+            relative_residual=global_norm(grads) / (global_norm(b_params) + 1e-12),
             param_norm=global_norm(train_state.params),
             gpu_memory=get_gpu_memory()[0],
         )
