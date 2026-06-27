@@ -110,7 +110,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     single_batch_inner=False,
     ls_lambdas='',
     fixed_step_size=0.0,
-    separate_ls_batch=False,
+    ls_eval_batches=0,  # 0 means: default to inner_loop_iter
     armijo_linesearch=False,
     armijo_alpha=0.5,
     armijo_beta=0.5,
@@ -797,30 +797,20 @@ def main(argv):
             # train_state = train_state.replace(params=jax.device_get(inner_state.params), step=step)
 
             if FLAGS.linesearch:
-                    
+
                 exit = False
+                num_ls_batches = FLAGS.ls_eval_batches if FLAGS.ls_eval_batches > 0 else FLAGS.inner_loop_iter
                 pre_fetched_batches = []
-                for _ in range(FLAGS.inner_loop_iter): # new data
+                for _ in range(num_ls_batches): # new data
                     try:
                         batch, _ = next(dataset)
                         pre_fetched_batches.append(batch)
                     except StopIteration:
-                        print('Dataset exhausted')
+                        print("Dataset exhausted")
                         exit = True
                         break
-                
-                if FLAGS.separate_ls_batch:
-                    ls_batches = []
-                    for _ in range(FLAGS.inner_loop_iter):
-                        try:
-                            batch, _ = next(dataset)
-                            ls_batches.append(batch)
-                        except StopIteration:
-                            print("Dataset exhausted during ls batch fetch")
-                            exit = True
-                            break
-                else:
-                    ls_batches = pre_fetched_batches
+
+                ls_batches = pre_fetched_batches
                 if exit:
                     break
 
