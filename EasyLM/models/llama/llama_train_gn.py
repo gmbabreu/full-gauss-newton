@@ -800,17 +800,16 @@ def main(argv):
 
                 exit = False
                 num_ls_batches = FLAGS.ls_eval_batches if FLAGS.ls_eval_batches > 0 else FLAGS.inner_loop_iter
-                pre_fetched_batches = []
+                ls_batches = []
                 for _ in range(num_ls_batches): # new data
                     try:
                         batch, _ = next(dataset)
-                        pre_fetched_batches.append(batch)
+                        ls_batches.append(batch)
                     except StopIteration:
                         print("Dataset exhausted")
                         exit = True
                         break
 
-                ls_batches = pre_fetched_batches
                 if exit:
                     break
 
