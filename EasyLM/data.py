@@ -335,6 +335,9 @@ class OptHuggingfaceDataset(object):
         config.tokenizer_processes = 4  # Number of parallel processes
         config.tokenizer_parallel_chunk_size = 32
         config.tokenizer_parallel_batch_size = 1024
+        config.shuffle_data = True
+        config.shuffle_seed = 42
+        config.shuffle_buffer_size = 100_000
 
         return mlxu.update_config_dict(config, updates)
 
