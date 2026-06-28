@@ -534,7 +534,7 @@ def main(argv):
 
     def loss_fn(params, batch, rng):
         rng_generator = JaxRNG(rng)
-
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         logits = model.apply(
             params, batch['input_tokens'], deterministic=False,
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
