@@ -147,6 +147,9 @@ class HuggingfaceDataset(object):
         config.always_start_with_bos = False
         config.batch_token_dtype = 'i4'
         config.tokens_count_at_start = 0        
+        config.shuffle_data = True
+        config.shuffle_seed = 42
+        config.shuffle_buffer_size = 100_000
 
         return mlxu.update_config_dict(config, updates)
 
@@ -160,6 +163,10 @@ class HuggingfaceDataset(object):
         self._dataset = load_dataset(
             self.config.path, name, split=split, streaming=self.config.streaming
         )
+        if self.config.streaming and self.config.shuffle_data:
+            self._dataset = self._dataset.shuffle(
+                seed=self.config.shuffle_seed, buffer_size=self.config.shuffle_buffer_size
+            )
         self.metadata = {
             'dataset_example_index': 0,
             'dataset_total_tokens': self.config.tokens_count_at_start,
