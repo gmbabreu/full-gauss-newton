@@ -532,6 +532,25 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
+    def compute_b_norm(params0, rng, batch, wd):
+        rng_generator = JaxRNG(rng)
+        batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
+        def f_batch(p):
+            return model.apply(
+                p, batch["input_tokens"], deterministic=False,
+                rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+            ).logits
+        def scalar_loss_on_logits(logits):
+            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                logits, batch["target_tokens"], params0, params0, batch["loss_masks"], weight_decay=wd
+            )
+            return loss
+        logits0, jvp_fn = linearize(f_batch, params0)
+        grad_Ly = jax.grad(scalar_loss_on_logits)
+        g0 = grad_Ly(logits0)
+        jt_fn = linear_transpose(jvp_fn, params0)
+        (b_params,) = jt_fn(g0)
+        return global_norm(b_params)
     def loss_fn(params, batch, rng):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -613,6 +632,11 @@ def main(argv):
             # donate_argnums=(0, 1),
         )
 
+    sharded_compute_b_norm = pjit(
+        compute_b_norm,
+        in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
+        out_shardings=PS(),
+    )
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
@@ -913,6 +937,7 @@ def main(argv):
                         "global_step": step,
                     }, step=step)
                 updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
+                params0_for_logging = train_state.params
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
@@ -924,6 +949,7 @@ def main(argv):
                     alpha = FLAGS.weight_average_decay
                     ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
             else:
+                params0_for_logging = train_state.params
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
@@ -935,6 +961,11 @@ def main(argv):
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
                 # log_metrics.update(dataset_metrics)
+                if FLAGS.gauss_newton and FLAGS.linesearch and ls_batches:
+                    b_norm = float(jax.device_get(sharded_compute_b_norm(
+                        params0_for_logging, sharded_rng, ls_batches[0], FLAGS.inner_loop_wd
+                    )))
+                    log_metrics["relative_residual"] = log_metrics.get("gradient_norm", 0.0) / (b_norm + 1e-12)
                 
 
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
