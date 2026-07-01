@@ -461,7 +461,7 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
-    def train_step_gauss_newton(train_state, params0, rng, batch, wd):
+    def train_step_gauss_newton(train_state, params0, rng, batch, wd, is_last_step):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
@@ -480,7 +480,7 @@ def main(argv):
             )
             return loss
 
-        def value_and_gradient(params0, params):
+        def value_and_gradient(params0, params, is_last_step):
             '''
             ∇θ [ L(y0) + g0·v + 1/2 v^T G0 v ]
             = g0 + H0 v
@@ -502,15 +502,19 @@ def main(argv):
             # Single pullback: J0^T (g0 + H0 v)
             jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
             (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
-            (b_params,) = jt_fn(g0)  # b = J0^T g0, for relative residual
+            b_norm = jax.lax.cond(
+                is_last_step,
+                lambda: global_norm(jt_fn(g0)[0]),
+                lambda: jnp.float32(0.0),
+            )
 
             # quadratic loss on linear model
             loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
 
 
-            return (loss, 0), (grad_params, b_params)
+            return (loss, 0), (grad_params, b_norm)
 
-        (loss, accuracy), (grads, b_params) = value_and_gradient(params0, train_state.params)
+        (loss, accuracy), (grads, b_norm) = value_and_gradient(params0, train_state.params, is_last_step)
 
         try:
             perplexity = jnp.exp(loss)
@@ -525,32 +529,14 @@ def main(argv):
             accuracy=accuracy,
             learning_rate=lr_sched(train_state.step),
             gradient_norm=global_norm(grads),
-            relative_residual=global_norm(grads) / (global_norm(b_params) + 1e-12),
+            b_norm=b_norm,
+            relative_residual=global_norm(grads) / (b_norm + 1e-12),
             param_norm=global_norm(train_state.params),
             gpu_memory=get_gpu_memory()[0],
         )
         return train_state, rng_generator(), metrics
 
 
-    def compute_b_norm(params0, rng, batch, wd):
-        rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
-        def f_batch(p):
-            return model.apply(
-                p, batch["input_tokens"], deterministic=False,
-                rngs=rng_generator(LLaMAConfigurator.rng_keys()),
-            ).logits
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits, batch["target_tokens"], params0, params0, batch["loss_masks"], weight_decay=wd
-            )
-            return loss
-        logits0, jvp_fn = linearize(f_batch, params0)
-        grad_Ly = jax.grad(scalar_loss_on_logits)
-        g0 = grad_Ly(logits0)
-        jt_fn = linear_transpose(jvp_fn, params0)
-        (b_params,) = jt_fn(g0)
-        return global_norm(b_params)
     def loss_fn(params, batch, rng):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -619,7 +605,7 @@ def main(argv):
     if FLAGS.gauss_newton:
         sharded_train_step = pjit(
             train_step_gauss_newton,
-            in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
+            in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS(), PS()),
             out_shardings=(train_state_partition, PS(), PS()),
             # donate_argnums=(0, 1),
         )
@@ -632,11 +618,6 @@ def main(argv):
             # donate_argnums=(0, 1),
         )
 
-    sharded_compute_b_norm = pjit(
-        compute_b_norm,
-        in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
-        out_shardings=PS(),
-    )
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
@@ -799,8 +780,9 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
+                is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
                 inner_state, sharded_rng, metrics = sharded_train_step(
-                    inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                    inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                 )
 
                 if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
@@ -937,7 +919,6 @@ def main(argv):
                         "global_step": step,
                     }, step=step)
                 updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
-                params0_for_logging = train_state.params
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
@@ -949,7 +930,6 @@ def main(argv):
                     alpha = FLAGS.weight_average_decay
                     ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
             else:
-                params0_for_logging = train_state.params
                 train_state = train_state.replace(
                     step=train_state.step+1,
                     opt_state=inner_state.opt_state,
@@ -961,11 +941,6 @@ def main(argv):
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
                 # log_metrics.update(dataset_metrics)
-                if FLAGS.gauss_newton and FLAGS.linesearch and ls_batches:
-                    b_norm = float(jax.device_get(sharded_compute_b_norm(
-                        params0_for_logging, sharded_rng, ls_batches[0], FLAGS.inner_loop_wd
-                    )))
-                    log_metrics["relative_residual"] = log_metrics.get("gradient_norm", 0.0) / (b_norm + 1e-12)
                 
 
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
