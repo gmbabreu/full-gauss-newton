@@ -524,7 +524,7 @@ def main(argv):
         train_state = train_state.apply_gradients(grads=grads)
 
         metrics = dict(
-            loss=loss,
+            linear_model_loss=loss,
             perplexity=perplexity,
             accuracy=accuracy,
             learning_rate=lr_sched(train_state.step),
@@ -789,7 +789,7 @@ def main(argv):
                     print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                 if FLAGS.log_inner_steps:
                     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
-                    log_metrics['inner_loss'] = metrics['loss']
+                    log_metrics['inner_loss'] = metrics['linear_model_loss']
                     log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
                     log_metrics['inner_param_norm'] = metrics['param_norm']
                     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
@@ -837,7 +837,7 @@ def main(argv):
                     baseline_loss += bl
                 baseline_loss = baseline_loss / len(ls_batches)
                 baseline_loss = float(jax.device_get(baseline_loss))
-                print(f"\nBaseline loss: {baseline_loss:.6f}")
+                print(f"\nTrue model loss: {baseline_loss:.6f}")
                 
                 losses = []
                 if FLAGS.armijo_linesearch:
@@ -909,7 +909,7 @@ def main(argv):
                     "global_step": step,
                     "scaled_step_norm": effective_step_size * dir_norm,
                     "dir_norm": dir_norm,
-                    "baseline_loss": baseline_loss,
+                    "loss": baseline_loss,
                     }, step=step)
                 for (_step_size, _loss) in losses:
                     tag = f"{_step_size:.4f}"
