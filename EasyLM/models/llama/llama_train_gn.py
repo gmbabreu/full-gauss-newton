@@ -941,6 +941,11 @@ def main(argv):
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
                 # log_metrics.update(dataset_metrics)
+                # Token consumption logging (distinct tokens only)
+                batches_per_step = 1 if FLAGS.single_batch_inner else FLAGS.inner_loop_iter
+                tokens_per_step = FLAGS.train_dataset_batch_size * seq_length * batches_per_step
+                log_metrics["tokens_per_step"] = tokens_per_step
+                log_metrics["total_tokens"] = tokens_per_step * (step + 1)
                 
 
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))

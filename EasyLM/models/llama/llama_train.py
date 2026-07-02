@@ -422,6 +422,10 @@ def main(argv):
                 optimizer_step = step // FLAGS.optimizer.accumulate_gradient_steps
                 log_metrics = {"step": optimizer_step}
                 log_metrics.update(metrics)
+                # Token consumption logging
+                tokens_per_step = FLAGS.train_dataset_batch_size * seq_length * FLAGS.optimizer.accumulate_gradient_steps
+                log_metrics["tokens_per_step"] = tokens_per_step
+                log_metrics["total_tokens"] = tokens_per_step * (optimizer_step + 1)
                 old_params_host = jax.device_get(old_params)
                 new_params_host = jax.device_get(train_state.params)
                 update_norm = float(global_norm(jax.tree_util.tree_map(lambda x, y: x - y, new_params_host, old_params_host)))
