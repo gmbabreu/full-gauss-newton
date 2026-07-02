@@ -944,7 +944,6 @@ def main(argv):
                 # Token consumption logging (distinct tokens only)
                 batches_per_step = 1 if FLAGS.single_batch_inner else FLAGS.inner_loop_iter
                 tokens_per_step = FLAGS.train_dataset_batch_size * seq_length * batches_per_step
-                log_metrics["tokens_per_step"] = tokens_per_step
                 log_metrics["total_tokens"] = tokens_per_step * (step + 1)
                 
 
