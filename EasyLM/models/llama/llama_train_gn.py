@@ -703,6 +703,20 @@ def main(argv):
 
         flags_config_dict['param_count'] = param_count
         flags_config_dict['param_count_nonembed'] = param_count_nonembed
+        # Memory breakdown diagnostic
+        param_mem_gb = param_count * 4 / 1e9  # fp32 = 4 bytes
+        optimizer_mem_gb = param_count * 4 * 2 / 1e9  # muon: ~2x params for momentum
+        hbm_info = jax.devices()[0].memory_stats()
+        total_hbm_gb = hbm_info.get("bytes_limit", 0) / 1e9
+        used_hbm_gb = hbm_info.get("bytes_in_use", 0) / 1e9
+        print(f"\n=== Memory Breakdown ===")
+        print(f"  Parameters:          {param_mem_gb:.2f} GB ({param_count/1e6:.1f}M params @ fp32)")
+        print(f"  Optimizer state est: {optimizer_mem_gb:.2f} GB")
+        print(f"  Static total est:    {param_mem_gb + optimizer_mem_gb:.2f} GB")
+        print(f"  HBM used at init:    {used_hbm_gb:.2f} GB / {total_hbm_gb:.2f} GB total")
+        print(f"  HBM for activations: ~{total_hbm_gb - used_hbm_gb:.2f} GB remaining for activations")
+        print(f"  Per-chip batch size: {FLAGS.train_dataset_batch_size // jax.device_count()}")
+        print(f"========================\n")
 
         if FLAGS.wandb_run_id:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
