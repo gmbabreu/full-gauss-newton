@@ -265,14 +265,24 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
     valid = valid.astype(jnp.float32)
     valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
     logits = logits.astype(jnp.float32) # for numerical stability
-    token_log_prob = jnp.squeeze(
-        jnp.take_along_axis(
-            jax.nn.log_softmax(logits, axis=-1),
-            jnp.expand_dims(tokens, -1),
-            axis=-1,
-        ),
-        -1,
-    )
+    # Chunked softmax: avoids materializing full [batch, seq, vocab] tensor
+    vocab_size = logits.shape[-1]
+    chunk_size = 4096
+    global_max = jnp.max(logits[..., :chunk_size], axis=-1)
+    for start in range(chunk_size, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        global_max = jnp.maximum(global_max, jnp.max(logits[..., start:end], axis=-1))
+    log_sum_exp = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
+    token_log_prob = jnp.zeros(tokens.shape, dtype=jnp.float32)
+    for start in range(0, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        chunk = logits[..., start:end] - global_max[..., None]
+        log_sum_exp = log_sum_exp + jnp.sum(jnp.exp(chunk), axis=-1)
+        in_chunk = (tokens >= start) & (tokens < end)
+        safe_idx = jnp.clip(tokens - start, 0, end - start - 1)
+        chunk_lp = jnp.take_along_axis(chunk, jnp.expand_dims(safe_idx, -1), axis=-1).squeeze(-1)
+        token_log_prob = token_log_prob + jnp.where(in_chunk, chunk_lp, 0.0)
+    token_log_prob = token_log_prob - jnp.log(log_sum_exp)
     token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
     loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
     correct = jnp.where(
@@ -291,14 +301,24 @@ def cross_entropy_loss_and_accuracy_with_weight_decay(logits, tokens, new_params
     valid = valid.astype(jnp.float32)
     valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
     logits = logits.astype(jnp.float32) # for numerical stability
-    token_log_prob = jnp.squeeze(
-        jnp.take_along_axis(
-            jax.nn.log_softmax(logits, axis=-1),
-            jnp.expand_dims(tokens, -1),
-            axis=-1,
-        ),
-        -1,
-    )
+    # Chunked softmax: avoids materializing full [batch, seq, vocab] tensor
+    vocab_size = logits.shape[-1]
+    chunk_size = 4096
+    global_max = jnp.max(logits[..., :chunk_size], axis=-1)
+    for start in range(chunk_size, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        global_max = jnp.maximum(global_max, jnp.max(logits[..., start:end], axis=-1))
+    log_sum_exp = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
+    token_log_prob = jnp.zeros(tokens.shape, dtype=jnp.float32)
+    for start in range(0, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        chunk = logits[..., start:end] - global_max[..., None]
+        log_sum_exp = log_sum_exp + jnp.sum(jnp.exp(chunk), axis=-1)
+        in_chunk = (tokens >= start) & (tokens < end)
+        safe_idx = jnp.clip(tokens - start, 0, end - start - 1)
+        chunk_lp = jnp.take_along_axis(chunk, jnp.expand_dims(safe_idx, -1), axis=-1).squeeze(-1)
+        token_log_prob = token_log_prob + jnp.where(in_chunk, chunk_lp, 0.0)
+    token_log_prob = token_log_prob - jnp.log(log_sum_exp)
     token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
     loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
 
