@@ -487,24 +487,19 @@ def main(argv):
                 g0 = ∂L/∂p at p0 = ∂L/∂f @ ∂f/∂p at p0 ;  
             H0 v = (∂²L/∂p² at p0) @ v = (g0^T ∂²L/∂f² g0) (dθ) = (J(p0)^T ∂²L/∂f² J(p0) (dθ))
             '''
-            # Linearize f at params0
-            logits0, jvp_fn = linearize(f_batch, params0)          # y0,   v = J(p0) dθ
-
-            # dθ and forward-mode JVP: v = J0 (params - params0)
+            # dparams and forward-mode JVP via jax.jvp (replaces linearize)
             dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
-            v = jvp_fn(dparams)
-
-            # g0 = ∂L/∂y at y0 ;  Hv = (∂²L/∂y² at y0) @ v
-            grad_Ly = jax.grad(scalar_loss_on_logits)              # y -> grad wrt logits
-            g0 = grad_Ly(logits0) # ∂L/∂f at p0
-            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))            # Hessian-vector (logits space) = (∂²L/∂f² at p0) J(p0) dθ
-
-            # Single pullback: J0^T (g0 + H0 v)
-            jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
-            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            logits0, v = jax.jvp(f_batch, (params0,), (dparams,))
+            # g0 = dL/dy at y0 ; Hv = (d2L/dy2 at y0) @ v
+            grad_Ly = jax.grad(scalar_loss_on_logits)
+            g0 = grad_Ly(logits0)
+            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))
+            # J0^T via vjp (replaces linear_transpose)
+            _, vjp_fn = jax.vjp(f_batch, params0)
+            (grad_params,) = vjp_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
             b_norm = jax.lax.cond(
                 is_last_step,
-                lambda: global_norm(jt_fn(g0)[0]),
+                lambda: global_norm(vjp_fn(g0)[0]),
                 lambda: jnp.float32(0.0),
             )
 
