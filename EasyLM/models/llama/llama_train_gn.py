@@ -112,6 +112,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     fixed_step_size=0.0,
     ls_eval_batches=0,  # 0 means: default to inner_loop_iter
     armijo_linesearch=False,
+    adaptive_inner_loop=False,
     armijo_alpha=0.5,
     armijo_beta=0.5,
     armijo_init_step=1.0,
