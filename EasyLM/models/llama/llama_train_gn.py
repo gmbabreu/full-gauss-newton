@@ -123,7 +123,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     target_loss=0.0,
 
-    patience=4
+    patience=3
 )
 
 def get_gpu_memory():
@@ -867,7 +867,7 @@ def main(argv):
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
 
-            ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 64, 128, 256, 512, 1024]
+            ADAPTIVE_CHECKPOINTS_ALL = [1, 5, 50, 250, 500, 1000, 1500]
             if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
                 # ---------------- Adaptive checkpointed inner-loop search ----------------
                 checkpoint_cap = min(FLAGS.inner_loop_iter, 1024)
@@ -955,6 +955,7 @@ def main(argv):
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
+                        "loss": ckpt_best_loss,
                     }, step=step)
                 if FLAGS.weight_average:
                     alpha = FLAGS.weight_average_decay
