@@ -953,7 +953,7 @@ def main(argv):
                 if step % FLAGS.log_freq == 0:
                     wandb.log({
                         "chosen_inner_checkpoint": best_checkpoint,
-                        "chosen_step_size": best_step_size,
+                        "step_size": best_step_size,
                         "global_step": step,
                     }, step=step)
                 if FLAGS.weight_average:
