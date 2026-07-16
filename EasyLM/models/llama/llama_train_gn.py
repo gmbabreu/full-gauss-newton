@@ -924,7 +924,7 @@ def main(argv):
                         dir_norm_val = global_norm(dir)
                         dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
 
-                    init_step = float(1.0 / jnp.sqrt(float(checkpoint)))
+                    init_step = float(2.0 / jnp.sqrt(float(checkpoint)))
                     step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs, init_step=init_step)
                     step_size = float(jax.device_get(step_size))
                     ckpt_best_loss = min(l for _, l in losses)
