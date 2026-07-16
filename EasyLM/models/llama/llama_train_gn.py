@@ -789,101 +789,176 @@ def main(argv):
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
         
-        # ------------------------------------------------------------------
-        # Shared helpers, factored out of the original inline linesearch code
-        # so the adaptive and non-adaptive paths use identical math.
-        # ------------------------------------------------------------------
-        def run_linesearch(base_params, dir, ls_batches, ls_rngs, init_step=None):
-            losses = []
-            if FLAGS.armijo_linesearch:
-                step_size = init_step if init_step is not None else FLAGS.armijo_init_step
-                best_loss = float("inf")
-                best_step_size = step_size
-                patience = FLAGS.patience
-                bad = 0
-                while step_size > 1e-6:
-                    updated_params = jax.tree_util.tree_map(
-                        lambda x, y: x + step_size * y, base_params, dir
-                    )
-                    accumulated_loss = 0.0
-                    for batch, subrng in zip(ls_batches, ls_rngs):
-                        loss, _ = parallel_loss_fn(updated_params, batch, subrng)
-                        accumulated_loss += loss
-                    average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
-                    print(f"step={step_size:.6f}  loss={average_loss:.6f}")
-                    losses.append((step_size, average_loss))
-                    if average_loss < best_loss:
-                        best_loss = average_loss
-                        best_step_size = step_size
-                        bad = 0
-                    else:
-                        bad += 1
-                    if bad >= patience:
+            # ------------------------------------------------------------------
+            # Shared helpers, factored out of the original inline linesearch code
+            # so the adaptive and non-adaptive paths use identical math.
+            # ------------------------------------------------------------------
+            def run_linesearch(base_params, dir, ls_batches, ls_rngs, init_step=None):
+                losses = []
+                if FLAGS.armijo_linesearch:
+                    step_size = init_step if init_step is not None else FLAGS.armijo_init_step
+                    best_loss = float("inf")
+                    best_step_size = step_size
+                    patience = 1
+                    bad = 0
+                    while step_size > 1e-6:
+                        updated_params = jax.tree_util.tree_map(
+                            lambda x, y: x + step_size * y, base_params, dir
+                        )
+                        accumulated_loss = 0.0
+                        for batch, subrng in zip(ls_batches, ls_rngs):
+                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            accumulated_loss += loss
+                        average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
+                        print(f"step={step_size:.6f}  loss={average_loss:.6f}")
+                        losses.append((step_size, average_loss))
+                        if average_loss < best_loss:
+                            best_loss = average_loss
+                            best_step_size = step_size
+                            bad = 0
+                        else:
+                            bad += 1
+                        if bad >= patience:
+                            break
+                        step_size *= FLAGS.armijo_beta
+                    step_size = best_step_size
+                    print(f"Chosen step size: {step_size:.6f}\n")
+                else:
+                    ls_candidates = [1 / jnp.sqrt(2) ** i for i in range(FLAGS.ls_range)]
+                    for step_size in ls_candidates:
+                        updated_params = jax.tree_util.tree_map(
+                            lambda x, y: x + step_size * y, base_params, dir
+                        )
+                        accumulated_loss = 0.0
+                        for batch, subrng in zip(ls_batches, ls_rngs):
+                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            accumulated_loss += loss
+                        average_loss = accumulated_loss / len(ls_batches)
+                        losses.append((step_size, average_loss))
+                    step_size, _ = min(losses, key=lambda x: x[1])
+                    step_size = jax.device_get(step_size)
+                return step_size, losses
+
+            def pull_ls_batches_and_baseline(sharded_rng, base_params, dataset):
+                exit_flag = False
+                num_ls_batches = FLAGS.ls_eval_batches if FLAGS.ls_eval_batches > 0 else FLAGS.inner_loop_iter
+                ls_batches = []
+                for _ in range(num_ls_batches):
+                    try:
+                        batch, _ = next(dataset)
+                        ls_batches.append(batch)
+                    except StopIteration:
+                        print("Dataset exhausted")
+                        exit_flag = True
                         break
-                    step_size *= FLAGS.armijo_beta
-                step_size = best_step_size
-                print(f"Chosen step size: {step_size:.6f}\n")
-            else:
-                ls_candidates = [1 / jnp.sqrt(2) ** i for i in range(FLAGS.ls_range)]
-                for step_size in ls_candidates:
-                    updated_params = jax.tree_util.tree_map(
-                        lambda x, y: x + step_size * y, base_params, dir
+                if exit_flag:
+                    return None, None, sharded_rng, None, True
+                ls_rngs = []
+                for _ in ls_batches:
+                    sharded_rng, subrng = jax.random.split(sharded_rng)
+                    ls_rngs.append(subrng)
+                baseline_loss = 0.0
+                for batch, subrng in zip(ls_batches, ls_rngs):
+                    bl, _ = parallel_loss_fn(base_params, batch, subrng)
+                    baseline_loss += bl
+                baseline_loss = float(jax.device_get(baseline_loss / len(ls_batches)))
+                return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
+
+            if FLAGS.single_batch_inner:
+                single_batch_, single_dataset_metrics_ = next(dataset)
+
+            ADAPTIVE_CHECKPOINTS_ALL = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+            if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
+                # ---------------- Adaptive checkpointed inner-loop search ----------------
+                checkpoint_cap = min(FLAGS.inner_loop_iter, 1024)
+                checkpoints = [c for c in ADAPTIVE_CHECKPOINTS_ALL if c <= checkpoint_cap]
+                if not checkpoints or checkpoints[-1] != checkpoint_cap:
+                    checkpoints.append(checkpoint_cap)
+
+                best_inner_state = None   # full snapshot (params + opt_state) at best checkpoint
+                best_step_size = None
+                best_checkpoint = None
+                prev_best_loss = float('inf')
+                exit_training = False
+
+                i = 0
+                for checkpoint in checkpoints:
+                    while i < checkpoint:
+                        if FLAGS.single_batch_inner:
+                            batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
+                        else:
+                            batch_, dataset_metrics_ = next(dataset)
+                        batch = jax.tree.map(
+                            lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
+                            batch_
+                        )
+                        # is_last_step deliberately always False here -- see explanation
+                        inner_state, sharded_rng, metrics = sharded_train_step(
+                            inner_state, train_state.params, sharded_rng, batch,
+                            FLAGS.inner_loop_wd, jnp.bool_(False)
+                        )
+                        i += 1
+                        if i == 1 or i % 100 == 0 or i == checkpoint:
+                            print(f"  inner step {i}/{checkpoint} (adaptive) done", flush=True)
+                        # if FLAGS.log_inner_steps:
+                        #     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
+                        #     log_metrics['inner_loss'] = metrics['linear_model_loss']
+                        #     log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
+                        #     log_metrics['inner_param_norm'] = metrics['param_norm']
+                        #     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
+                        #     log_metrics['inner_learning_rate'] = metrics['learning_rate']
+                        #     wandb.log(log_metrics)
+
+                    ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
+                        sharded_rng, train_state.params, dataset
                     )
-                    accumulated_loss = 0.0
-                    for batch, subrng in zip(ls_batches, ls_rngs):
-                        loss, _ = parallel_loss_fn(updated_params, batch, subrng)
-                        accumulated_loss += loss
-                    average_loss = accumulated_loss / len(ls_batches)
-                    losses.append((step_size, average_loss))
-                step_size, _ = min(losses, key=lambda x: x[1])
-                step_size = jax.device_get(step_size)
-            return step_size, losses
+                    if exit_flag:
+                        exit_training = True
+                        break
 
-        def pull_ls_batches_and_baseline(sharded_rng, base_params, dataset):
-            exit_flag = False
-            num_ls_batches = FLAGS.ls_eval_batches if FLAGS.ls_eval_batches > 0 else FLAGS.inner_loop_iter
-            ls_batches = []
-            for _ in range(num_ls_batches):
-                try:
-                    batch, _ = next(dataset)
-                    ls_batches.append(batch)
-                except StopIteration:
-                    print("Dataset exhausted")
-                    exit_flag = True
-                    break
-            if exit_flag:
-                return None, None, sharded_rng, None, True
-            ls_rngs = []
-            for _ in ls_batches:
-                sharded_rng, subrng = jax.random.split(sharded_rng)
-                ls_rngs.append(subrng)
-            baseline_loss = 0.0
-            for batch, subrng in zip(ls_batches, ls_rngs):
-                bl, _ = parallel_loss_fn(base_params, batch, subrng)
-                baseline_loss += bl
-            baseline_loss = float(jax.device_get(baseline_loss / len(ls_batches)))
-            return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
+                    dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
+                    if FLAGS.normalize_step:
+                        dir_norm_val = global_norm(dir)
+                        dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
 
-        if FLAGS.single_batch_inner:
-            single_batch_, single_dataset_metrics_ = next(dataset)
+                    init_step = float(1.0 / jnp.sqrt(float(checkpoint)))
+                    step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs, init_step=init_step)
+                    step_size = float(jax.device_get(step_size))
+                    ckpt_best_loss = min(l for _, l in losses)
+                    print(f"checkpoint={checkpoint} loss={ckpt_best_loss:.6f} step_size={step_size:.6f}", flush=True)
 
-        if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
-            # ---------------- Adaptive checkpointed inner-loop search ----------------
-            ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
-            checkpoint_cap = min(FLAGS.inner_loop_iter, 1024)
-            checkpoints = [c for c in ADAPTIVE_CHECKPOINTS_ALL if c <= checkpoint_cap]
-            if not checkpoints or checkpoints[-1] != checkpoint_cap:
-                checkpoints.append(checkpoint_cap)
+                    if ckpt_best_loss >= prev_best_loss:
+                        break  # no improvement -- keep the previous checkpoint's snapshot
+                    prev_best_loss = ckpt_best_loss
+                    best_inner_state = inner_state       # full pytree: params + opt_state
+                    best_step_size = step_size
+                    best_checkpoint = checkpoint
 
-            best_inner_state = None   # full snapshot (params + opt_state) at best checkpoint
-            best_step_size = None
-            best_checkpoint = None
-            prev_best_loss = float('inf')
-            exit_training = False
+                if exit_training:
+                    break  # dataset exhausted; end training, same as the non-adaptive path
 
-            i = 0
-            for checkpoint in checkpoints:
-                while i < checkpoint:
+                dir = jax.tree_util.tree_map(lambda x, y: x - y, best_inner_state.params, train_state.params)
+                updated_params = jax.tree_util.tree_map(lambda x, y: x + best_step_size * y, train_state.params, dir)
+                train_state = train_state.replace(
+                    step=train_state.step + 1,
+                    opt_state=best_inner_state.opt_state,
+                    params=updated_params,
+                    warmstart_params=best_inner_state.params,
+                )
+                print(f"Chosen checkpoint: {best_checkpoint}, step_size: {best_step_size:.6f}", flush=True)
+                if step % FLAGS.log_freq == 0:
+                    wandb.log({
+                        "chosen_inner_checkpoint": best_checkpoint,
+                        "chosen_step_size": best_step_size,
+                        "global_step": step,
+                    }, step=step)
+                if FLAGS.weight_average:
+                    alpha = FLAGS.weight_average_decay
+                    ema = jax.tree_util.tree_map(lambda x, y: alpha * x + (1 - alpha) * y, ema, updated_params)
+
+            else:
+                # ---------------- Existing (non-adaptive) behavior, unchanged math ----------------
+                for i in range(FLAGS.inner_loop_iter):
                     if FLAGS.single_batch_inner:
                         batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
                     else:
@@ -892,149 +967,73 @@ def main(argv):
                         lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                         batch_
                     )
-                    # is_last_step deliberately always False here -- see explanation
+                    is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
                     inner_state, sharded_rng, metrics = sharded_train_step(
-                        inner_state, train_state.params, sharded_rng, batch,
-                        FLAGS.inner_loop_wd, jnp.bool_(False)
+                        inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                     )
-                    i += 1
-                    if i == 1 or i % 100 == 0 or i == checkpoint:
-                        print(f"  inner step {i}/{checkpoint} (adaptive) done", flush=True)
-                        
-                    # if FLAGS.log_inner_steps:
-                    #     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
-                    #     log_metrics['inner_loss'] = metrics['linear_model_loss']
-                    #     log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
-                    #     log_metrics['inner_param_norm'] = metrics['param_norm']
-                    #     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
-                    #     log_metrics['inner_learning_rate'] = metrics['learning_rate']
-                    #     wandb.log(log_metrics)
+                    if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
+                        print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
+                    if FLAGS.log_inner_steps:
+                        log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
+                        log_metrics['inner_loss'] = metrics['linear_model_loss']
+                        log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
+                        log_metrics['inner_param_norm'] = metrics['param_norm']
+                        log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
+                        log_metrics['inner_learning_rate'] = metrics['learning_rate']
+                        wandb.log(log_metrics)
+                    if FLAGS.weight_average and not FLAGS.linesearch:
+                        alpha = FLAGS.weight_average_decay
+                        ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
 
-                ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
-                    sharded_rng, train_state.params, dataset
-                )
-                if exit_flag:
-                    exit_training = True
-                    break
+                if FLAGS.linesearch:
+                    ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
+                        sharded_rng, train_state.params, dataset
+                    )
+                    if exit_flag:
+                        break
+                    print(f"\nTrue model loss: {baseline_loss:.6f}")
 
-                dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
-                if FLAGS.normalize_step:
-                    dir_norm_val = global_norm(dir)
-                    dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
+                    dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
+                    if FLAGS.normalize_step:
+                        dir_norm_val = global_norm(dir)
+                        dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
 
-                init_step = float(1.0 / jnp.sqrt(float(checkpoint)))
-                step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs, init_step=init_step)
-                step_size = float(jax.device_get(step_size))
-                ckpt_best_loss = min(l for _, l in losses)
-                print(f"checkpoint={checkpoint} loss={ckpt_best_loss:.6f} step_size={step_size:.6f}", flush=True)
+                    step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
 
-                if ckpt_best_loss >= prev_best_loss:
-                    break  # no improvement -- keep the previous checkpoint's snapshot
-                prev_best_loss = ckpt_best_loss
-                best_inner_state = inner_state       # full pytree: params + opt_state
-                best_step_size = step_size
-                best_checkpoint = checkpoint
-
-            if exit_training:
-                break  # dataset exhausted; end training, same as the non-adaptive path
-
-            dir = jax.tree_util.tree_map(lambda x, y: x - y, best_inner_state.params, train_state.params)
-            updated_params = jax.tree_util.tree_map(lambda x, y: x + best_step_size * y, train_state.params, dir)
-            train_state = train_state.replace(
-                step=train_state.step + 1,
-                opt_state=best_inner_state.opt_state,
-                params=updated_params,
-                warmstart_params=best_inner_state.params,
-            )
-            print(f"Chosen checkpoint: {best_checkpoint}, step_size: {best_step_size:.6f}", flush=True)
-            if step % FLAGS.log_freq == 0:
-                wandb.log({
-                    "chosen_inner_checkpoint": best_checkpoint,
-                    "chosen_step_size": best_step_size,
-                    "global_step": step,
-                }, step=step)
-            if FLAGS.weight_average:
-                alpha = FLAGS.weight_average_decay
-                ema = jax.tree_util.tree_map(lambda x, y: alpha * x + (1 - alpha) * y, ema, updated_params)
-
-        else:
-            # ---------------- Existing (non-adaptive) behavior, unchanged math ----------------
-            for i in range(FLAGS.inner_loop_iter):
-                if FLAGS.single_batch_inner:
-                    batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
-                else:
-                    batch_, dataset_metrics_ = next(dataset)
-                batch = jax.tree.map(
-                    lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
-                    batch_
-                )
-                is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
-                inner_state, sharded_rng, metrics = sharded_train_step(
-                    inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
-                )
-                if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
-                    print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
-                if FLAGS.log_inner_steps:
-                    log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
-                    log_metrics['inner_loss'] = metrics['linear_model_loss']
-                    log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
-                    log_metrics['inner_param_norm'] = metrics['param_norm']
-                    log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
-                    log_metrics['inner_learning_rate'] = metrics['learning_rate']
-                    wandb.log(log_metrics)
-                if FLAGS.weight_average and not FLAGS.linesearch:
-                    alpha = FLAGS.weight_average_decay
-                    ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
-
-            if FLAGS.linesearch:
-                ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
-                    sharded_rng, train_state.params, dataset
-                )
-                if exit_flag:
-                    break
-                print(f"\nTrue model loss: {baseline_loss:.6f}")
-
-                dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
-                if FLAGS.normalize_step:
-                    dir_norm_val = global_norm(dir)
-                    dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
-
-                step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
-
-                effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
-                print("Step size:", effective_step_size)
-                dir_norm = float(jax.device_get(global_norm(dir)))
-                wandb.log({
-                    "step_size": effective_step_size,
-                    "global_step": step,
-                    "scaled_step_norm": effective_step_size * dir_norm,
-                    "dir_norm": dir_norm,
-                    "loss": baseline_loss,
-                    }, step=step)
-                for (_step_size, _loss) in losses:
-                    tag = f"{_step_size:.4f}"
-                    loss_improvement = baseline_loss - float(jax.device_get(_loss))
+                    effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                    print("Step size:", effective_step_size)
+                    dir_norm = float(jax.device_get(global_norm(dir)))
                     wandb.log({
-                        f"ls_loss_improvement_{tag}": loss_improvement,
+                        "step_size": effective_step_size,
                         "global_step": step,
-                    }, step=step)
+                        "scaled_step_norm": effective_step_size * dir_norm,
+                        "dir_norm": dir_norm,
+                        "loss": baseline_loss,
+                        }, step=step)
+                    for (_step_size, _loss) in losses:
+                        tag = f"{_step_size:.4f}"
+                        loss_improvement = baseline_loss - float(jax.device_get(_loss))
+                        wandb.log({
+                            f"ls_loss_improvement_{tag}": loss_improvement,
+                            "global_step": step,
+                        }, step=step)
 
-                updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
-                train_state = train_state.replace(
-                    step=train_state.step+1,
-                    opt_state=inner_state.opt_state,
-                    params=updated_params,
-                    warmstart_params=inner_state.params,
-                )
-                if FLAGS.weight_average:
-                    alpha = FLAGS.weight_average_decay
-                    ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
-            else:
-                train_state = train_state.replace(
-                    step=train_state.step+1,
-                    opt_state=inner_state.opt_state,
-                    params=inner_state.params
-                )
+                    updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
+                    train_state = train_state.replace(
+                        step=train_state.step+1,
+                        opt_state=inner_state.opt_state,
+                        params=updated_params,
+                        warmstart_params=inner_state.params,
+                    )
+                    if FLAGS.weight_average:
+                        alpha = FLAGS.weight_average_decay
+                        ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
+                else:
+                    train_state = train_state.replace(
+                        step=train_state.step+1,
+                        opt_state=inner_state.opt_state,
+                        params=inner_state.params
+                    )
        
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"global_step": step}
