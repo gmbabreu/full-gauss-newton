@@ -123,7 +123,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     target_loss=0.0,
 
-    patience=4
+    patience=3
 )
 
 def get_gpu_memory():
