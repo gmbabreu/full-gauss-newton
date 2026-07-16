@@ -123,7 +123,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     target_loss=0.0,
 
-    patience=3
+    patience=4
 )
 
 def get_gpu_memory():
@@ -882,6 +882,7 @@ def main(argv):
                 exit_training = False
 
                 i = 0
+                checkpoint_metrics = {}
                 for checkpoint in checkpoints:
                     while i < checkpoint:
                         if FLAGS.single_batch_inner:
@@ -895,11 +896,13 @@ def main(argv):
                         # is_last_step deliberately always False here -- see explanation
                         inner_state, sharded_rng, metrics = sharded_train_step(
                             inner_state, train_state.params, sharded_rng, batch,
-                            FLAGS.inner_loop_wd, jnp.bool_(False)
+                            FLAGS.inner_loop_wd, jnp.bool_((i + 1) == checkpoint)
                         )
                         i += 1
                         if i == 1 or i % 100 == 0 or i == checkpoint:
                             print(f"  inner step {i}/{checkpoint} (adaptive) done", flush=True)
+
+                    checkpoint_metrics[checkpoint] = metrics
                         # if FLAGS.log_inner_steps:
                         #     log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                         #     log_metrics['inner_loss'] = metrics['linear_model_loss']
@@ -946,6 +949,7 @@ def main(argv):
                     warmstart_params=best_inner_state.params,
                 )
                 print(f"Chosen checkpoint: {best_checkpoint}, step_size: {best_step_size:.6f}", flush=True)
+                metrics = checkpoint_metrics[best_checkpoint]  # so b_norm/relative_residual reflect the chosen checkpoint
                 if step % FLAGS.log_freq == 0:
                     wandb.log({
                         "chosen_inner_checkpoint": best_checkpoint,
