@@ -799,7 +799,7 @@ def main(argv):
                     step_size = init_step if init_step is not None else FLAGS.armijo_init_step
                     best_loss = float("inf")
                     best_step_size = step_size
-                    patience = 1
+                    patience = FLAGS.patience
                     bad = 0
                     while step_size > 1e-6:
                         updated_params = jax.tree_util.tree_map(
@@ -867,7 +867,7 @@ def main(argv):
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
 
-            ADAPTIVE_CHECKPOINTS_ALL = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+            ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 64, 128, 256, 512, 1024]
             if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
                 # ---------------- Adaptive checkpointed inner-loop search ----------------
                 checkpoint_cap = min(FLAGS.inner_loop_iter, 1024)
