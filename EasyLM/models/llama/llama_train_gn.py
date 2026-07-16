@@ -479,22 +479,7 @@ def main(argv):
                 logits, batch['target_tokens'], train_state.params, params0, batch['loss_masks'], weight_decay=wd
             )
             return loss
-        def ce_gn_terms(logits0, v, tokens, valid):
-            B, S, V = logits0.shape
-            valid = valid.astype(jnp.float32)
-            valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1, keepdims=True), 1e-10)
-            w = valid / (B * valid_text_length)
-            p = jax.nn.softmax(logits0, axis=-1)
-            dot = jnp.sum(p * v, axis=-1, keepdims=True)
-            wp = w[..., None] * p
-            return w, p, wp, dot
 
-        def scatter_sub_w(x, tokens, w):
-            B, S = tokens.shape
-            b_idx = jnp.arange(B)[:, None]
-            s_idx = jnp.arange(S)[None, :]
-            return x.at[b_idx, s_idx, tokens].add(-w)
-        
         def value_and_gradient(params0, params, is_last_step):
             '''
             ∇θ [ L(y0) + g0·v + 1/2 v^T G0 v ]
@@ -509,22 +494,23 @@ def main(argv):
             dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
             v = jvp_fn(dparams)
 
-            tokens_, valid_ = batch['target_tokens'], batch['loss_masks']
-            w, p, wp, dot = ce_gn_terms(logits0, v, tokens_, valid_)
+            # g0 = ∂L/∂y at y0 ;  Hv = (∂²L/∂y² at y0) @ v
+            grad_Ly = jax.grad(scalar_loss_on_logits)              # y -> grad wrt logits
+            g0 = grad_Ly(logits0) # ∂L/∂f at p0
+            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))            # Hessian-vector (logits space) = (∂²L/∂f² at p0) J(p0) dθ
 
-            gHv = scatter_sub_w(wp * (1.0 + v - dot), tokens_, w)
-            jt_fn = linear_transpose(jvp_fn, params0)
-            (grad_params,) = jt_fn(gHv)
+            # Single pullback: J0^T (g0 + H0 v)
+            jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
+            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            b_norm = jax.lax.cond(
+                is_last_step,
+                lambda: global_norm(jt_fn(g0)[0]),
+                lambda: jnp.float32(0.0),
+            )
 
-            def compute_b_norm():
-                g0 = scatter_sub_w(wp, tokens_, w)
-                return global_norm(jt_fn(g0)[0])
-            b_norm = jax.lax.cond(is_last_step, compute_b_norm, lambda: jnp.float32(0.0))
+            # quadratic loss on linear model
+            loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
 
-            v_at_token = jnp.take_along_axis(v, tokens_[..., None], axis=-1).squeeze(-1)
-            sum_g0_v = jnp.sum(wp * v) - jnp.sum(w * v_at_token)
-            sum_v_Hv = jnp.sum(wp * v * (v - dot))
-            loss = scalar_loss_on_logits(logits0) + sum_g0_v + 0.5 * sum_v_Hv
 
             return (loss, 0), (grad_params, b_norm)
 
