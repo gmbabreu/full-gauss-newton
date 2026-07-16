@@ -930,7 +930,7 @@ def main(argv):
                     if ckpt_best_loss >= prev_best_loss:
                         break  # no improvement -- keep the previous checkpoint's snapshot
                     prev_best_loss = ckpt_best_loss
-                    best_inner_state = inner_state       # full pytree: params + opt_state
+                    best_inner_state = jax.device_get(inner_state)       # full pytree: params + opt_state
                     best_step_size = step_size
                     best_checkpoint = checkpoint
 
