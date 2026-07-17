@@ -867,7 +867,7 @@ def main(argv):
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
 
-            ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 64, 128, 256, 512, 1024]
+            ADAPTIVE_CHECKPOINTS_ALL = [1, 5, 50, 250, 500, 1000, 1500]
             if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
                 # ---------------- Adaptive checkpointed inner-loop search ----------------
                 checkpoint_cap = min(FLAGS.inner_loop_iter, 1024)
