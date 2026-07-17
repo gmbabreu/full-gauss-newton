@@ -883,6 +883,12 @@ def main(argv):
 
                 i = 0
                 checkpoint_metrics = {}
+                ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
+                    sharded_rng, train_state.params, dataset
+                )
+                if exit_flag:
+                    exit_training = True
+                    checkpoints = []
                 for checkpoint in checkpoints:
                     while i < checkpoint:
                         if FLAGS.single_batch_inner:
@@ -911,13 +917,6 @@ def main(argv):
                         #     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         #     log_metrics['inner_learning_rate'] = metrics['learning_rate']
                         #     wandb.log(log_metrics)
-
-                    ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
-                        sharded_rng, train_state.params, dataset
-                    )
-                    if exit_flag:
-                        exit_training = True
-                        break
 
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
                     if FLAGS.normalize_step:
@@ -955,7 +954,7 @@ def main(argv):
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
-                        "loss": ckpt_best_loss,
+                        "loss": baseline_loss,
                     }, step=step)
                 if FLAGS.weight_average:
                     alpha = FLAGS.weight_average_decay
