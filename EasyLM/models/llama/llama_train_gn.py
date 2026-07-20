@@ -59,7 +59,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_milestone_freq=0,
     eval_freq=0,
     eval_steps=0,
-    gradient_accumulation_steps=1,
+    gradient_accumulation_steps=1,   # Dead flag
     inner_loop_iter=100,
     tokenizer='openlm-research/open_llama_3b_v2',
     train_dataset_batch_size=8,
@@ -84,7 +84,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_b2=0.999,
     inner_clip_gradient=0.0,
     optimizer_wd=0.0,
-    parameter_wd=0.0,
+    parameter_wd=0.0,  # Dead flag
 
     wandb_run_id='',
     start_tokens=0,
