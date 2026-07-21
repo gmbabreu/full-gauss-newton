@@ -322,6 +322,13 @@ def cross_entropy_loss_and_accuracy_with_weight_decay(logits, tokens, new_params
  
     return loss, (accuracy, base_loss)
 
+def tree_dot(a, b):
+    """ Return the global dot product <a, b> of two pytrees with the same structure. """
+    products = jax.tree_util.tree_map(lambda x, y: jnp.sum(x * y), a, b)
+    flattened, _ = jax.flatten_util.ravel_pytree(products)
+    return jnp.sum(flattened)
+
+
 def global_norm(tree):
     """ Return the global L2 norm of a pytree. """
     squared = jax.tree_util.tree_map(lambda x: jnp.sum(jnp.square(x)), tree)

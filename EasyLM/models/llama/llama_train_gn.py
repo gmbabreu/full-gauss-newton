@@ -30,7 +30,7 @@ from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
-    cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
+    cross_entropy_loss_and_accuracy, global_norm, tree_dot, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
     with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState
 )
@@ -406,6 +406,10 @@ def main(argv):
                 return create_param_selector(params)
             
             optimizer = optax.multi_transform(transform_dict, param_selector)
+        elif optimizer_type == 'cg':
+            # CG doesn't use an optax optimizer at all -- inert placeholder
+            # so tayl_solver.init(...) still produces a validly-shaped opt_state.
+            optimizer = optax.set_to_zero()
         return optimizer
 
     # optimizer, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
@@ -573,6 +577,80 @@ def main(argv):
         )
         return rng_generator(), metrics
 
+    def cg_init(params0, rng, batch, wd):
+        rng_generator = JaxRNG(rng)
+        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        def f_batch(p):
+            out = model.apply(p, batch_['input_tokens'], deterministic=False,
+                               rngs=rng_generator(LLaMAConfigurator.rng_keys()))
+            return out.logits
+        def scalar_loss_on_logits(logits):
+            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                logits, batch_['target_tokens'], params0, params0, batch_['loss_masks'], weight_decay=wd
+            )
+            return loss
+
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, params0)
+        logits0, jvp_fn = linearize(f_batch, params0)
+        grad_Ly = jax.grad(scalar_loss_on_logits)
+        g0 = grad_Ly(logits0)
+        jt_fn = linear_transpose(jvp_fn, params0)
+        (b_param,) = jt_fn(g0)
+
+        r0 = jax.tree_util.tree_map(lambda b: -b, b_param)
+        rz0 = tree_dot(r0, r0)
+        return (zeros, r0, r0, rz0, b_param), rng_generator()
+
+    def train_step_cg(cg_state, params0, rng, batch, wd):
+        rng_generator = JaxRNG(rng)
+        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        def f_batch(p):
+            out = model.apply(p, batch_['input_tokens'], deterministic=False,
+                               rngs=rng_generator(LLaMAConfigurator.rng_keys()))
+            return out.logits
+        def scalar_loss_on_logits(logits):
+            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                logits, batch_['target_tokens'], params0, params0, batch_['loss_masks'], weight_decay=wd
+            )
+            return loss
+        def value_and_gradient(params0, params):
+            logits0, jvp_fn = linearize(f_batch, params0)
+            dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
+            v = jvp_fn(dparams)
+            grad_Ly = jax.grad(scalar_loss_on_logits)
+            g0 = grad_Ly(logits0)
+            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))
+            jt_fn = linear_transpose(jvp_fn, params0)
+            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
+            return grad_params
+
+        x, r, p, rz_old, b_param = cg_state
+        offset_params = jax.tree_util.tree_map(lambda p0, pi: p0 + pi, params0, p)
+        grad_at_p = value_and_gradient(params0, offset_params)
+        Gp = jax.tree_util.tree_map(lambda g, bb: g - bb, grad_at_p, b_param)
+
+        pGp = tree_dot(p, Gp)
+        alpha = rz_old / (pGp + 1e-12)
+        x_new = jax.tree_util.tree_map(lambda xi, pi: xi + alpha * pi, x, p)
+        r_new = jax.tree_util.tree_map(lambda ri, gi: ri - alpha * gi, r, Gp)
+        rz_new = tree_dot(r_new, r_new)
+        beta = rz_new / (rz_old + 1e-12)
+        p_new = jax.tree_util.tree_map(lambda ri, pi: ri + beta * pi, r_new, p)
+
+        rel_residual = jnp.sqrt(rz_new) / (global_norm(b_param) + 1e-12)
+        metrics = {
+            'linear_model_loss': jnp.float32(0.0),
+            'gradient_norm': jnp.sqrt(rz_new),
+            'param_norm': global_norm(offset_params),
+            'gpu_memory': get_gpu_memory()[0],
+            'learning_rate': jnp.float32(0.0),
+            'b_norm': global_norm(b_param),
+            'relative_residual': rel_residual,
+            'accuracy': jnp.int32(0),
+            'perplexity': jnp.float32(0.0),
+        }
+        return (x_new, r_new, p_new, rz_new, b_param), rng_generator(), metrics
+
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
         LLaMAConfigurator.get_partition_rules(), train_state_shapes
@@ -621,6 +699,23 @@ def main(argv):
             # donate_argnums=(0, 1),
         )
 
+    cg_state_partition = (
+        train_state_partition.params,
+        train_state_partition.params,
+        train_state_partition.params,
+        PS(),
+        train_state_partition.params,
+    )
+    sharded_cg_init = pjit(
+        cg_init,
+        in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
+        out_shardings=(cg_state_partition, PS()),
+    )
+    sharded_train_step_cg = pjit(
+        train_step_cg,
+        in_shardings=(cg_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
+        out_shardings=(cg_state_partition, PS(), PS()),
+    )
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
@@ -899,11 +994,25 @@ def main(argv):
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
                         )
-                        # is_last_step deliberately always False here -- see explanation
-                        inner_state, sharded_rng, metrics = sharded_train_step(
-                            inner_state, train_state.params, sharded_rng, batch,
-                            FLAGS.inner_loop_wd, jnp.bool_((i + 1) == checkpoint)
-                        )
+                        if FLAGS.optimizer_type == 'cg':
+                            if i == 0:
+                                cg_state, sharded_rng = sharded_cg_init(
+                                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                                )
+                            cg_state, sharded_rng, metrics = sharded_train_step_cg(
+                                cg_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                            )
+                            inner_state = inner_state.replace(
+                                params=jax.tree_util.tree_map(
+                                    lambda p0, xi: p0 + xi, train_state.params, cg_state[0]
+                                )
+                            )
+                        else:
+                            # is_last_step deliberately always False here -- see explanation
+                            inner_state, sharded_rng, metrics = sharded_train_step(
+                                inner_state, train_state.params, sharded_rng, batch,
+                                FLAGS.inner_loop_wd, jnp.bool_((i + 1) == checkpoint)
+                            )
                         i += 1
                         if i == 1 or i % 100 == 0 or i == checkpoint:
                             print(f"  inner step {i}/{checkpoint} (adaptive) done", flush=True)
