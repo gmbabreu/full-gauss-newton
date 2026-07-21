@@ -683,14 +683,14 @@ def main(argv):
         donate_argnums=(0, ),
     )
 
-    if FLAGS.gauss_newton:
+    if FLAGS.gauss_newton and FLAGS.optimizer_type != 'cg':
         sharded_train_step = pjit(
             train_step_gauss_newton,
             in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS(), PS()),
             out_shardings=(train_state_partition, PS(), PS()),
             # donate_argnums=(0, 1),
         )
-    else:
+    elif not FLAGS.gauss_newton:
 
         sharded_train_step = pjit(
             train_step_jvp,
@@ -699,23 +699,24 @@ def main(argv):
             # donate_argnums=(0, 1),
         )
 
-    cg_state_partition = (
-        train_state_partition.params,
-        train_state_partition.params,
-        train_state_partition.params,
-        PS(),
-        train_state_partition.params,
-    )
-    sharded_cg_init = pjit(
-        cg_init,
-        in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
-        out_shardings=(cg_state_partition, PS()),
-    )
-    sharded_train_step_cg = pjit(
-        train_step_cg,
-        in_shardings=(cg_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
-        out_shardings=(cg_state_partition, PS(), PS()),
-    )
+    if FLAGS.optimizer_type == 'cg':
+        cg_state_partition = (
+            train_state_partition.params,
+            train_state_partition.params,
+            train_state_partition.params,
+            PS(),
+            train_state_partition.params,
+        )
+        sharded_cg_init = pjit(
+            cg_init,
+            in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
+            out_shardings=(cg_state_partition, PS()),
+        )
+        sharded_train_step_cg = pjit(
+            train_step_cg,
+            in_shardings=(cg_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
+            out_shardings=(cg_state_partition, PS(), PS()),
+        )
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
