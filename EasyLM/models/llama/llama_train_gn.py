@@ -584,108 +584,108 @@ def main(argv):
         
 
         def train_step_cg(params0, rng, batch, wd):
-        rng_generator = JaxRNG(rng)
-        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-
-        def f_batch(p):
-            out = model.apply(
-                p,
-                batch_['input_tokens'],
-                deterministic=False,
-                rngs=rng_generator(LLaMAConfigurator.rng_keys())
+            rng_generator = JaxRNG(rng)
+            batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+    
+            def f_batch(p):
+                out = model.apply(
+                    p,
+                    batch_['input_tokens'],
+                    deterministic=False,
+                    rngs=rng_generator(LLaMAConfigurator.rng_keys())
+                )
+                return out.logits
+    
+            def scalar_loss_on_logits(logits):
+                loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                    logits,
+                    batch_['target_tokens'],
+                    params0,
+                    params0,
+                    batch_['loss_masks'],
+                    weight_decay=wd
+                )
+                return loss
+    
+            # Linearize the model once around params0.
+            logits0, jvp_fn = linearize(f_batch, params0)
+    
+            # Gradient of the loss with respect to logits.
+            grad_Ly = jax.grad(scalar_loss_on_logits)
+    
+            # g0 = gradient of the loss at the base point.
+            g0 = grad_Ly(logits0)
+    
+            # J^T: transpose of the linearized model Jacobian.
+            jt_fn = linear_transpose(jvp_fn, params0)
+    
+            # b = J^T g0.
+            (b_param,) = jt_fn(g0)
+    
+            # We want to solve: G x = -b, where G = J^T H J.
+            rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
+    
+            def Gv(v):
+                """
+                Compute G v = J^T H J v.
+                """
+    
+                # Jv
+                logits_v = jvp_fn(v)
+    
+                # H(Jv)
+                _, Hv = jax.jvp(
+                    grad_Ly,
+                    (logits0,),
+                    (logits_v,)
+                )
+    
+                # J^T H Jv
+                (Gv_param,) = jt_fn(Hv)
+    
+                return Gv_param
+    
+            # Solve using built-in solver:  G x = -b
+            x, _ = cg(
+                Gv,
+                rhs,
+                x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
+                tol=FLAGS.cg_tol,
+                atol=FLAGS.cg_atol,
+                maxiter=FLAGS.cg_maxiter,
             )
-            return out.logits
-
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits,
-                batch_['target_tokens'],
+    
+            # The result x is the GN/CG parameter update.
+            new_params = jax.tree_util.tree_map(
+                lambda p0, xi: p0 + xi,
                 params0,
-                params0,
-                batch_['loss_masks'],
-                weight_decay=wd
+                x
             )
-            return loss
-
-        # Linearize the model once around params0.
-        logits0, jvp_fn = linearize(f_batch, params0)
-
-        # Gradient of the loss with respect to logits.
-        grad_Ly = jax.grad(scalar_loss_on_logits)
-
-        # g0 = gradient of the loss at the base point.
-        g0 = grad_Ly(logits0)
-
-        # J^T: transpose of the linearized model Jacobian.
-        jt_fn = linear_transpose(jvp_fn, params0)
-
-        # b = J^T g0.
-        (b_param,) = jt_fn(g0)
-
-        # We want to solve: G x = -b, where G = J^T H J.
-        rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
-
-        def Gv(v):
-            """
-            Compute G v = J^T H J v.
-            """
-
-            # Jv
-            logits_v = jvp_fn(v)
-
-            # H(Jv)
-            _, Hv = jax.jvp(
-                grad_Ly,
-                (logits0,),
-                (logits_v,)
+    
+            # Compute residual for logging: r = Gx + b
+            Gx = Gv(x)
+            residual = jax.tree_util.tree_map(
+                lambda gx, b: gx + b,
+                Gx,
+                b_param
             )
-
-            # J^T H Jv
-            (Gv_param,) = jt_fn(Hv)
-
-            return Gv_param
-
-        # Solve using built-in solver:  G x = -b
-        x, _ = cg(
-            Gv,
-            rhs,
-            x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
-            tol=FLAGS.cg_tol,
-            atol=FLAGS.cg_atol,
-            maxiter=FLAGS.cg_maxiter,
-        )
-
-        # The result x is the GN/CG parameter update.
-        new_params = jax.tree_util.tree_map(
-            lambda p0, xi: p0 + xi,
-            params0,
-            x
-        )
-
-        # Compute residual for logging: r = Gx + b
-        Gx = Gv(x)
-        residual = jax.tree_util.tree_map(
-            lambda gx, b: gx + b,
-            Gx,
-            b_param
-        )
-
-        residual_norm = global_norm(residual)
-        b_norm = global_norm(b_param)
-
-        metrics = {
-            'linear_model_loss': jnp.float32(0.0),
-            'gradient_norm': residual_norm,
-            'param_norm': global_norm(new_params),
-            'gpu_memory': get_gpu_memory()[0],
-            'learning_rate': jnp.float32(0.0),
-            'b_norm': b_norm,
-            'relative_residual': residual_norm / (b_norm + 1e-12),
-            'accuracy': jnp.int32(0),
-            'perplexity': jnp.float32(0.0),
-        }
-
-        return new_params, rng_generator(), metrics
+    
+            residual_norm = global_norm(residual)
+            b_norm = global_norm(b_param)
+    
+            metrics = {
+                'linear_model_loss': jnp.float32(0.0),
+                'gradient_norm': residual_norm,
+                'param_norm': global_norm(new_params),
+                'gpu_memory': get_gpu_memory()[0],
+                'learning_rate': jnp.float32(0.0),
+                'b_norm': b_norm,
+                'relative_residual': residual_norm / (b_norm + 1e-12),
+                'accuracy': jnp.int32(0),
+                'perplexity': jnp.float32(0.0),
+            }
+    
+            return new_params, rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
