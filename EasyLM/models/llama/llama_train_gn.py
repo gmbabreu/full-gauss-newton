@@ -22,6 +22,7 @@ from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
 from transformers import AutoTokenizer
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.scipy.sparse.linalg import cg
 
 import optax
 
@@ -123,7 +124,11 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     target_loss=0.0,
 
-    patience=1
+    patience=1,
+
+    FLAGS.cg_tol=1e-5,   # Relative Residual Tolerance for CG
+    FLAGS.cg_atol=0.0    # Absolute residual tolerance for CG
+    FLAGS.cg_maxiter=100 # Maximum number of CG iterations
 )
 
 def get_gpu_memory():
@@ -576,80 +581,111 @@ def main(argv):
             eval_perplexity=perplexity,
         )
         return rng_generator(), metrics
+        
 
-    def cg_init(params0, rng, batch, wd):
+        def train_step_cg(params0, rng, batch, wd):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
         def f_batch(p):
-            out = model.apply(p, batch_['input_tokens'], deterministic=False,
-                               rngs=rng_generator(LLaMAConfigurator.rng_keys()))
+            out = model.apply(
+                p,
+                batch_['input_tokens'],
+                deterministic=False,
+                rngs=rng_generator(LLaMAConfigurator.rng_keys())
+            )
             return out.logits
+
         def scalar_loss_on_logits(logits):
             loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits, batch_['target_tokens'], params0, params0, batch_['loss_masks'], weight_decay=wd
+                logits,
+                batch_['target_tokens'],
+                params0,
+                params0,
+                batch_['loss_masks'],
+                weight_decay=wd
             )
             return loss
 
-        zeros = jax.tree_util.tree_map(jnp.zeros_like, params0)
+        # Linearize the model once around params0.
         logits0, jvp_fn = linearize(f_batch, params0)
+
+        # Gradient of the loss with respect to logits.
         grad_Ly = jax.grad(scalar_loss_on_logits)
+
+        # g0 = gradient of the loss at the base point.
         g0 = grad_Ly(logits0)
+
+        # J^T: transpose of the linearized model Jacobian.
         jt_fn = linear_transpose(jvp_fn, params0)
+
+        # b = J^T g0.
         (b_param,) = jt_fn(g0)
 
-        r0 = jax.tree_util.tree_map(lambda b: -b, b_param)
-        rz0 = tree_dot(r0, r0)
-        return (zeros, r0, r0, rz0, b_param), rng_generator()
+        # We want to solve: G x = -b, where G = J^T H J.
+        rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
 
-    def train_step_cg(cg_state, params0, rng, batch, wd):
-        rng_generator = JaxRNG(rng)
-        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        def f_batch(p):
-            out = model.apply(p, batch_['input_tokens'], deterministic=False,
-                               rngs=rng_generator(LLaMAConfigurator.rng_keys()))
-            return out.logits
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits, batch_['target_tokens'], params0, params0, batch_['loss_masks'], weight_decay=wd
+        def Gv(v):
+            """
+            Compute G v = J^T H J v.
+            """
+
+            # Jv
+            logits_v = jvp_fn(v)
+
+            # H(Jv)
+            _, Hv = jax.jvp(
+                grad_Ly,
+                (logits0,),
+                (logits_v,)
             )
-            return loss
-        def value_and_gradient(params0, params):
-            logits0, jvp_fn = linearize(f_batch, params0)
-            dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
-            v = jvp_fn(dparams)
-            grad_Ly = jax.grad(scalar_loss_on_logits)
-            g0 = grad_Ly(logits0)
-            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))
-            jt_fn = linear_transpose(jvp_fn, params0)
-            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
-            return grad_params
 
-        x, r, p, rz_old, b_param = cg_state
-        offset_params = jax.tree_util.tree_map(lambda p0, pi: p0 + pi, params0, p)
-        grad_at_p = value_and_gradient(params0, offset_params)
-        Gp = jax.tree_util.tree_map(lambda g, bb: g - bb, grad_at_p, b_param)
+            # J^T H Jv
+            (Gv_param,) = jt_fn(Hv)
 
-        pGp = tree_dot(p, Gp)
-        alpha = rz_old / (pGp + 1e-12)
-        x_new = jax.tree_util.tree_map(lambda xi, pi: xi + alpha * pi, x, p)
-        r_new = jax.tree_util.tree_map(lambda ri, gi: ri - alpha * gi, r, Gp)
-        rz_new = tree_dot(r_new, r_new)
-        beta = rz_new / (rz_old + 1e-12)
-        p_new = jax.tree_util.tree_map(lambda ri, pi: ri + beta * pi, r_new, p)
+            return Gv_param
 
-        rel_residual = jnp.sqrt(rz_new) / (global_norm(b_param) + 1e-12)
+        # Solve using built-in solver:  G x = -b
+        x, _ = cg(
+            Gv,
+            rhs,
+            x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
+            tol=FLAGS.cg_tol,
+            atol=FLAGS.cg_atol,
+            maxiter=FLAGS.cg_maxiter,
+        )
+
+        # The result x is the GN/CG parameter update.
+        new_params = jax.tree_util.tree_map(
+            lambda p0, xi: p0 + xi,
+            params0,
+            x
+        )
+
+        # Compute residual for logging: r = Gx + b
+        Gx = Gv(x)
+        residual = jax.tree_util.tree_map(
+            lambda gx, b: gx + b,
+            Gx,
+            b_param
+        )
+
+        residual_norm = global_norm(residual)
+        b_norm = global_norm(b_param)
+
         metrics = {
             'linear_model_loss': jnp.float32(0.0),
-            'gradient_norm': jnp.sqrt(rz_new),
-            'param_norm': global_norm(offset_params),
+            'gradient_norm': residual_norm,
+            'param_norm': global_norm(new_params),
             'gpu_memory': get_gpu_memory()[0],
             'learning_rate': jnp.float32(0.0),
-            'b_norm': global_norm(b_param),
-            'relative_residual': rel_residual,
+            'b_norm': b_norm,
+            'relative_residual': residual_norm / (b_norm + 1e-12),
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
         }
-        return (x_new, r_new, p_new, rz_new, b_param), rng_generator(), metrics
+
+        return new_params, rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -700,22 +736,19 @@ def main(argv):
         )
 
     if FLAGS.optimizer_type == 'cg':
-        cg_state_partition = (
-            train_state_partition.params,
-            train_state_partition.params,
-            train_state_partition.params,
-            PS(),
-            train_state_partition.params,
-        )
-        sharded_cg_init = pjit(
-            cg_init,
-            in_shardings=(train_state_partition.params, PS(), batch_partition, PS()),
-            out_shardings=(cg_state_partition, PS()),
-        )
         sharded_train_step_cg = pjit(
             train_step_cg,
-            in_shardings=(cg_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
-            out_shardings=(cg_state_partition, PS(), PS()),
+            in_shardings=(
+                train_state_partition.params,
+                PS(),
+                batch_partition,
+                PS(),
+            ),
+            out_shardings=(
+                train_state_partition.params,
+                PS(),
+                PS(),
+            ),
         )
     sharded_eval_step = pjit(
         eval_step,
@@ -996,18 +1029,17 @@ def main(argv):
                             batch_
                         )
                         if FLAGS.optimizer_type == 'cg':
-                            if i == 0:
-                                cg_state, sharded_rng = sharded_cg_init(
-                                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
-                                )
-                            cg_state, sharded_rng, metrics = sharded_train_step_cg(
-                                cg_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                            new_params, sharded_rng, metrics = sharded_train_step_cg(
+                                train_state.params,
+                                sharded_rng,
+                                batch,
+                                FLAGS.inner_loop_wd
                             )
+
                             inner_state = inner_state.replace(
-                                params=jax.tree_util.tree_map(
-                                    lambda p0, xi: p0 + xi, train_state.params, cg_state[0]
-                                )
+                                params=new_params
                             )
+
                         else:
                             # is_last_step deliberately always False here -- see explanation
                             inner_state, sharded_rng, metrics = sharded_train_step(
