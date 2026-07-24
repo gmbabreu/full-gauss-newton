@@ -128,7 +128,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
-    cg_maxiter=100 # Maximum number of CG iterations
+    cg_maxiter=100, # Maximum number of CG iterations
+    cg_damping=0.0, # Tikhonov/LM damping added to G (as G + damping*I) for numerical stability
 )
 
 def get_gpu_memory():
