@@ -997,7 +997,51 @@ def main(argv):
                 single_batch_, single_dataset_metrics_ = next(dataset)
 
             ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536,1792, 2048, 2560]
-            if FLAGS.adaptive_inner_loop and FLAGS.linesearch:
+            if FLAGS.optimizer_type == 'cg':
+                if FLAGS.single_batch_inner:
+                    batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
+                else:
+                    batch_, dataset_metrics_ = next(dataset)
+                batch = jax.tree.map(
+                    lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
+                    batch_
+                )
+                candidate_params, sharded_rng, cg_metrics = sharded_train_step_cg(
+                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                )
+                ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
+                    sharded_rng, train_state.params, dataset
+                )
+                if exit_flag:
+                    break
+                print(f"\nTrue model loss: {baseline_loss:.6f}")
+
+                dir = jax.tree_util.tree_map(lambda x, y: x - y, candidate_params, train_state.params)
+                if FLAGS.normalize_step:
+                    dir_norm_val = global_norm(dir)
+                    dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
+
+                step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
+                effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                print("Step size:", effective_step_size)
+
+                updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size * y, train_state.params, dir)
+                train_state = train_state.replace(step=train_state.step + 1, params=updated_params)
+
+                metrics = dict(cg_metrics)
+                metrics['param_norm'] = global_norm(updated_params)
+
+                if step % FLAGS.log_freq == 0:
+                    dir_norm = float(jax.device_get(global_norm(dir)))
+                    wandb.log({
+                        "step_size": effective_step_size,
+                        "global_step": step,
+                        "scaled_step_norm": effective_step_size * dir_norm,
+                        "dir_norm": dir_norm,
+                        "loss": baseline_loss,
+                    }, step=step)
+
+            elif FLAGS.adaptive_inner_loop and FLAGS.linesearch:
                 # ---------------- Adaptive checkpointed inner-loop search ----------------
                 checkpoint_cap = min(FLAGS.inner_loop_iter, 2560)
                 checkpoints = [c for c in ADAPTIVE_CHECKPOINTS_ALL if c <= checkpoint_cap]
@@ -1028,24 +1072,11 @@ def main(argv):
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
                         )
-                        if FLAGS.optimizer_type == 'cg':
-                            new_params, sharded_rng, metrics = sharded_train_step_cg(
-                                train_state.params,
-                                sharded_rng,
-                                batch,
-                                FLAGS.inner_loop_wd
-                            )
-
-                            inner_state = inner_state.replace(
-                                params=new_params
-                            )
-
-                        else:
-                            # is_last_step deliberately always False here -- see explanation
-                            inner_state, sharded_rng, metrics = sharded_train_step(
-                                inner_state, train_state.params, sharded_rng, batch,
-                                FLAGS.inner_loop_wd, jnp.bool_((i + 1) == checkpoint)
-                            )
+                        # is_last_step deliberately always False here -- see explanation
+                        inner_state, sharded_rng, metrics = sharded_train_step(
+                            inner_state, train_state.params, sharded_rng, batch,
+                            FLAGS.inner_loop_wd, jnp.bool_((i + 1) == checkpoint)
+                        )
                         i += 1
                         if i == 1 or i % 100 == 0 or i == checkpoint:
                             print(f"  inner step {i}/{checkpoint} (adaptive) done", flush=True)
