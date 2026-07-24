@@ -643,6 +643,11 @@ def main(argv):
             # J^T H Jv
             (Gv_param,) = jt_fn(Hv)
 
+            # Damping for numerical stability (Tikhonov/Levenberg-Marquardt style)
+            Gv_param = jax.tree_util.tree_map(
+                lambda g, vi: g + FLAGS.cg_damping * vi, Gv_param, v
+            )
+
             return Gv_param
 
         # Solve using built-in solver:  G x = -b
