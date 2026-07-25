@@ -39,7 +39,38 @@ sweep_launcher.py (+)                  # Sweep launcher for hyperparameter tunin
 | `llama_train_gn_layerwise.py` | Runs layer-wise GN and layer-wise GN-prox-linear methods. |
 
 ---
-
+### llama_train_gn Structure
+```text
+                 ┌─────────────────────┐
+                 │     params0, batch   │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │    build_gn_model   │
+                 │                     │
+                 │ b = Jᵀg             │
+                 │ G(v) = JᵀHJv        │
+                 │ q(Δ)                │
+                 └──────────┬──────────┘
+                            │
+                         GNModel
+                            │
+                 ┌──────────┴──────────┐
+                 ▼                     ▼
+          ┌─────────────┐       ┌─────────────┐
+          │    Muon     │       │     CG      │
+          │ inner solve │       │ inner solve │
+          └──────┬──────┘       └──────┬──────┘
+                 │                     │
+                 └──────────┬──────────┘
+                            ▼
+                      candidate_params
+                            │
+                            ▼
+                         line search
+```
+---
 ## Installation
 
 Clone the repository and install the required dependencies:
