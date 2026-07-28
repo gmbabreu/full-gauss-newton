@@ -33,8 +33,10 @@ from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, tree_dot, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
-    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState
-)
+    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState)
+
+from EasyLM.models.llama.gn_train_step import build_gn_operators, solve_inner_muon, solve_inner_cg
+
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
 )
@@ -475,79 +477,49 @@ def main(argv):
 
 
     def train_step_gauss_newton(train_state, params0, rng, batch, wd, is_last_step):
-        rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        """
+        Thin wrapper around the shared, validated Gauss-Newton machinery in
+        gn_train_step.py: one Muon-style step on the local quadratic model
+        (build_gn_operators + solve_inner_muon with inner_loop_iter=1),
+        reusing the EXACT SAME math as gn_train_step's standalone
+        solve_inner_muon -- this is the de-duplication that was the whole
+        point of the refactor: previously this function independently
+        redefined f_batch/scalar_loss_on_logits/linearize/linear_transpose,
+        duplicating what train_step_cg also defined separately.
 
-        def f_batch(p):
-            out = model.apply(
-                p,
-                batch['input_tokens'],
-                deterministic=False,              
-                rngs=rng_generator(LLaMAConfigurator.rng_keys()),
-            )
-            return out.logits                    # [B, ..., vocab]
+        The call signature and return shape are UNCHANGED from before, so
+        the pjit wrapper, the outer training loop, and the adaptive
+        checkpoint logic need no changes at all.
+        """
+        gn_ops, rng_generator = build_gn_operators(
+            params0, rng, batch, wd, model, LLaMAConfigurator,
+            cross_entropy_loss_and_accuracy_with_weight_decay,
+            with_sharding_constraint, PS, JaxRNG,
+        )
+        offset0 = jax.tree_util.tree_map(lambda p, p0: p - p0, train_state.params, params0)
+        offset, opt_state, muon_metrics = solve_inner_muon(
+            gn_ops, params0, offset0, train_state.opt_state, tayl_solver, inner_loop_iter=1,
+        )
+        new_params = jax.tree_util.tree_map(lambda p0, o: p0 + o, params0, offset)
+        new_train_state = train_state.replace(params=new_params, opt_state=opt_state)
 
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits, batch['target_tokens'], train_state.params, params0, batch['loss_masks'], weight_decay=wd
-            )
-            return loss
-
-        def value_and_gradient(params0, params, is_last_step):
-            '''
-            ∇θ [ L(y0) + g0·v + 1/2 v^T G0 v ]
-            = g0 + H0 v
-                g0 = ∂L/∂p at p0 = ∂L/∂f @ ∂f/∂p at p0 ;  
-            H0 v = (∂²L/∂p² at p0) @ v = (g0^T ∂²L/∂f² g0) (dθ) = (J(p0)^T ∂²L/∂f² J(p0) (dθ))
-            '''
-            # Linearize f at params0
-            logits0, jvp_fn = linearize(f_batch, params0)          # y0,   v = J(p0) dθ
-
-            # dθ and forward-mode JVP: v = J0 (params - params0)
-            dparams = jax.tree_util.tree_map(lambda x, y: x - y, params, params0)
-            v = jvp_fn(dparams)
-
-            # g0 = ∂L/∂y at y0 ;  Hv = (∂²L/∂y² at y0) @ v
-            grad_Ly = jax.grad(scalar_loss_on_logits)              # y -> grad wrt logits
-            g0 = grad_Ly(logits0) # ∂L/∂f at p0
-            _, Hv = jax.jvp(grad_Ly, (logits0,), (v,))            # Hessian-vector (logits space) = (∂²L/∂f² at p0) J(p0) dθ
-
-            # Single pullback: J0^T (g0 + H0 v)
-            jt_fn = linear_transpose(jvp_fn, params0) # primals just for shape/dtype
-            (grad_params,) = jt_fn(jax.tree_util.tree_map(lambda a, b: a + b, g0, Hv))
-            b_norm = jax.lax.cond(
-                is_last_step,
-                lambda: global_norm(jt_fn(g0)[0]),
-                lambda: jnp.float32(0.0),
-            )
-
-            # quadratic loss on linear model
-            loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
-
-
-            return (loss, 0), (grad_params, b_norm)
-
-        (loss, accuracy), (grads, b_norm) = value_and_gradient(params0, train_state.params, is_last_step)
-
-        try:
-            perplexity = jnp.exp(loss)
-        except OverflowError:
-            perplexity = jnp.float32("inf")
-
-        train_state = train_state.apply_gradients(grads=grads)
-
+        b_norm = jax.lax.cond(
+            is_last_step,
+            lambda: muon_metrics['b_norm'],
+            lambda: jnp.float32(0.0),
+        )
         metrics = dict(
-            linear_model_loss=loss,
-            perplexity=perplexity,
-            accuracy=accuracy,
-            learning_rate=lr_sched(train_state.step),
-            gradient_norm=global_norm(grads),
+            linear_model_loss=gn_ops.quadratic_loss(offset),
+            perplexity=jnp.float32(0.0),
+            accuracy=jnp.int32(0),
+            learning_rate=lr_sched(new_train_state.step),
+            gradient_norm=muon_metrics['gradient_norm'],
             b_norm=b_norm,
-            relative_residual=global_norm(grads) / (b_norm + 1e-12),
-            param_norm=global_norm(train_state.params),
+            relative_residual=muon_metrics['gradient_norm'] / (b_norm + 1e-12),
+            param_norm=global_norm(new_params),
             gpu_memory=get_gpu_memory()[0],
         )
-        return train_state, rng_generator(), metrics
+        return new_train_state, rng_generator(), metrics
 
 
     def loss_fn(params, batch, rng):
@@ -585,113 +557,36 @@ def main(argv):
         
 
     def train_step_cg(params0, rng, batch, wd):
-        rng_generator = JaxRNG(rng)
-        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-
-        def f_batch(p):
-            out = model.apply(
-                p,
-                batch_['input_tokens'],
-                deterministic=False,
-                rngs=rng_generator(LLaMAConfigurator.rng_keys())
-            )
-            return out.logits
-
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits,
-                batch_['target_tokens'],
-                params0,
-                params0,
-                batch_['loss_masks'],
-                weight_decay=wd
-            )
-            return loss
-
-        # Linearize the model once around params0.
-        logits0, jvp_fn = linearize(f_batch, params0)
-
-        # Gradient of the loss with respect to logits.
-        grad_Ly = jax.grad(scalar_loss_on_logits)
-
-        # g0 = gradient of the loss at the base point.
-        g0 = grad_Ly(logits0)
-
-        # J^T: transpose of the linearized model Jacobian.
-        jt_fn = linear_transpose(jvp_fn, params0)
-
-        # b = J^T g0.
-        (b_param,) = jt_fn(g0)
-
-        # We want to solve: G x = -b, where G = J^T H J.
-        rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
-
-        def Gv(v):
-            """
-            Compute G v = J^T H J v.
-            """
-
-            # Jv
-            logits_v = jvp_fn(v)
-
-            # H(Jv)
-            _, Hv = jax.jvp(
-                grad_Ly,
-                (logits0,),
-                (logits_v,)
-            )
-
-            # J^T H Jv
-            (Gv_param,) = jt_fn(Hv)
-
-            # Damping for numerical stability (Tikhonov/Levenberg-Marquardt style)
-            Gv_param = jax.tree_util.tree_map(
-                lambda g, vi: g + FLAGS.cg_damping * vi, Gv_param, v
-            )
-
-            return Gv_param
-
-        # Solve using built-in solver:  G x = -b
-        x, _ = cg(
-            Gv,
-            rhs,
-            x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
-            tol=FLAGS.cg_tol,
-            atol=FLAGS.cg_atol,
-            maxiter=FLAGS.cg_maxiter,
+        """
+        Thin wrapper around the shared, validated Gauss-Newton machinery in
+        gn_train_step.py: build_gn_operators + solve_inner_cg (one full CG
+        solve, fresh each call -- matching the existing checkpoint
+        semantics for CG). Same de-duplication rationale as
+        train_step_gauss_newton above; call signature/return shape
+        unchanged.
+        """
+        gn_ops, rng_generator = build_gn_operators(
+            params0, rng, batch, wd, model, LLaMAConfigurator,
+            cross_entropy_loss_and_accuracy_with_weight_decay,
+            with_sharding_constraint, PS, JaxRNG,
         )
-
-        # The result x is the GN/CG parameter update.
-        new_params = jax.tree_util.tree_map(
-            lambda p0, xi: p0 + xi,
-            params0,
-            x
+        offset, cg_metrics = solve_inner_cg(
+            gn_ops, params0, FLAGS.cg_tol, FLAGS.cg_atol, FLAGS.cg_maxiter, FLAGS.cg_damping,
         )
-
-        # Compute residual for logging: r = Gx + b
-        Gx = Gv(x)
-        residual = jax.tree_util.tree_map(
-            lambda gx, b: gx + b,
-            Gx,
-            b_param
+        new_params = jax.tree_util.tree_map(lambda p0, o: p0 + o, params0, offset)
+        metrics = dict(
+            linear_model_loss=jnp.float32(0.0),
+            gradient_norm=cg_metrics['gradient_norm'],
+            param_norm=global_norm(new_params),
+            gpu_memory=get_gpu_memory()[0],
+            learning_rate=jnp.float32(0.0),
+            b_norm=cg_metrics['b_norm'],
+            relative_residual=cg_metrics['relative_residual'],
+            accuracy=jnp.int32(0),
+            perplexity=jnp.float32(0.0),
         )
-
-        residual_norm = global_norm(residual)
-        b_norm = global_norm(b_param)
-
-        metrics = {
-            'linear_model_loss': jnp.float32(0.0),
-            'gradient_norm': residual_norm,
-            'param_norm': global_norm(new_params),
-            'gpu_memory': get_gpu_memory()[0],
-            'learning_rate': jnp.float32(0.0),
-            'b_norm': b_norm,
-            'relative_residual': residual_norm / (b_norm + 1e-12),
-            'accuracy': jnp.int32(0),
-            'perplexity': jnp.float32(0.0),
-        }
-
         return new_params, rng_generator(), metrics
+
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
