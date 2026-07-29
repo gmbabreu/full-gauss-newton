@@ -184,11 +184,14 @@ def solve_inner_muon(gn_ops, params0, offset0, opt_state0, tayl_solver, inner_lo
 
 
 # ============================================================
-# CG inner solver: one full solve to cg_maxiter, fresh each call.
+# CG inner solver: one full solve to cg_maxiter, optionally warm-started.
 # ============================================================
-def solve_inner_cg(gn_ops, params0, cg_tol, cg_atol, cg_maxiter, cg_damping):
+def solve_inner_cg(gn_ops, params0, cg_tol, cg_atol, cg_maxiter, cg_damping, x0=None):
     """
-    Solves (G + cg_damping*I) @ offset = -b_params via jax.scipy.sparse.linalg.cg
+    Solves (G + cg_damping*I) @ offset = -b_params via jax.scipy.sparse.linalg.cg.
+
+    If x0 is provided, CG warm-starts from that previous offset; otherwise it
+    preserves the historical behavior and starts from a zero offset.
 
     cg_damping exists because plain (undamped) CG was empirically found to
     diverge at higher cg_maxiter on the real model.
@@ -199,9 +202,12 @@ def solve_inner_cg(gn_ops, params0, cg_tol, cg_atol, cg_maxiter, cg_damping):
         Gv = gn_ops.apply(v)
         return jax.tree_util.tree_map(lambda g, vi: g + cg_damping * vi, Gv, v)
 
+    if x0 is None:
+        x0 = jax.tree_util.tree_map(jnp.zeros_like, params0)
+
     offset, _ = jax.scipy.sparse.linalg.cg(
         Gv_damped, rhs,
-        x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
+        x0=x0,
         tol=cg_tol, atol=cg_atol, maxiter=cg_maxiter,
     )
     # Residual r = G.offset + b (should be ~0 if CG converged); used for
@@ -231,6 +237,7 @@ def solve_inner_problem(gn_ops, solver_type, params0, **solver_kwargs):
         offset, metrics = solve_inner_cg(
             gn_ops, params0, solver_kwargs['cg_tol'], solver_kwargs['cg_atol'],
             solver_kwargs['cg_maxiter'], solver_kwargs['cg_damping'],
+            solver_kwargs.get('x0', None),
         )
         return offset, None, metrics  # CG has no optimizer state to return
     else:

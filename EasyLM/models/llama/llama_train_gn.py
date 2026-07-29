@@ -132,6 +132,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_damping=0.0, # Tikhonov/LM damping added to G (as G + damping*I) for numerical stability
+    cg_warm_start=False, # Reuse the previous accepted CG update as x0 for the next CG solve
 )
 
 def get_gpu_memory():
@@ -556,14 +557,14 @@ def main(argv):
         return rng_generator(), metrics
         
 
-    def train_step_cg(params0, rng, batch, wd):
+    def train_step_cg(params0, rng, batch, wd, cg_x0):
         """
         Thin wrapper around the shared, validated Gauss-Newton machinery in
         gn_train_step.py: build_gn_operators + solve_inner_cg (one full CG
-        solve, fresh each call -- matching the existing checkpoint
-        semantics for CG). Same de-duplication rationale as
-        train_step_gauss_newton above; call signature/return shape
-        unchanged.
+        solve. By default the caller passes a zero offset, matching the
+        historical fresh-each-call semantics; with --cg_warm_start=True the
+        caller passes the previous accepted update as x0. Same de-duplication rationale as
+        train_step_gauss_newton above.
         """
         gn_ops, rng_generator = build_gn_operators(
             params0, rng, batch, wd, model, LLaMAConfigurator,
@@ -571,7 +572,7 @@ def main(argv):
             with_sharding_constraint, PS, JaxRNG,
         )
         offset, cg_metrics = solve_inner_cg(
-            gn_ops, params0, FLAGS.cg_tol, FLAGS.cg_atol, FLAGS.cg_maxiter, FLAGS.cg_damping,
+            gn_ops, params0, FLAGS.cg_tol, FLAGS.cg_atol, FLAGS.cg_maxiter, FLAGS.cg_damping, cg_x0,
         )
         new_params = jax.tree_util.tree_map(lambda p0, o: p0 + o, params0, offset)
         metrics = dict(
@@ -585,7 +586,7 @@ def main(argv):
             accuracy=jnp.int32(0),
             perplexity=jnp.float32(0.0),
         )
-        return new_params, rng_generator(), metrics
+        return new_params, offset, rng_generator(), metrics
 
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
@@ -644,8 +645,10 @@ def main(argv):
                 PS(),
                 batch_partition,
                 PS(),
+                train_state_partition.params,
             ),
             out_shardings=(
+                train_state_partition.params,
                 train_state_partition.params,
                 PS(),
                 PS(),
@@ -775,6 +778,7 @@ def main(argv):
 
 
         start_step = int(jax.device_get(train_state.step))
+        cg_warm_start_offset = jax.tree_util.tree_map(jnp.zeros_like, train_state.params)
         
         def copy_array(x):
             return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
@@ -907,8 +911,9 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
-                candidate_params, sharded_rng, cg_metrics = sharded_train_step_cg(
-                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                cg_x0 = cg_warm_start_offset if FLAGS.cg_warm_start else jax.tree_util.tree_map(jnp.zeros_like, train_state.params)
+                candidate_params, cg_offset, sharded_rng, cg_metrics = sharded_train_step_cg(
+                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, cg_x0
                 )
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
@@ -926,7 +931,9 @@ def main(argv):
                 effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
                 print("Step size:", effective_step_size)
 
-                updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size * y, train_state.params, dir)
+                applied_update = jax.tree_util.tree_map(lambda y: effective_step_size * y, dir)
+                updated_params = jax.tree_util.tree_map(lambda x, y: x + y, train_state.params, applied_update)
+                cg_warm_start_offset = applied_update
                 train_state = train_state.replace(step=train_state.step + 1, params=updated_params)
 
                 metrics = dict(cg_metrics)
