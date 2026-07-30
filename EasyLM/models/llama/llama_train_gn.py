@@ -130,7 +130,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_damping=0.0, # Deprecated: old Tikhonov/LM damping. Kept for checkpoint/script compatibility.
-    cg_adam_damping=1.0, # lambda in (G + lambda D_t)x = -g
+    cg_interpolation_lambda=1.0,
+    cg_adam_lr=0.001,
+    cg_adam_beta1=0.9,
     cg_adam_beta2=0.999,
     cg_adam_eps=1e-8,
 )
@@ -589,6 +591,7 @@ def main(argv):
 
     def train_step_cg(
         params0,
+        first_moment,
         second_moment,
         adam_step,
         rng,
@@ -630,23 +633,40 @@ def main(argv):
         # J^T: transpose of the linearized model Jacobian.
         jt_fn = linear_transpose(jvp_fn, params0)
 
-        # Current parameter-space gradient: g = J^T grad_y L.
+        # Current parameter-space gradient: g_t = J^T grad_y L.
         (b_param,) = jt_fn(g0)
 
-        # Persistent Adam/RMS second moment used as the CG damping diagonal.
         new_adam_step = adam_step + 1
+
+        # Persistent Adam first moment used as the CG RHS.
+        new_first_moment = jax.tree_util.tree_map(
+            lambda m, g: FLAGS.cg_adam_beta1 * m
+            + (1.0 - FLAGS.cg_adam_beta1) * g,
+            first_moment,
+            b_param,
+        )
+
+        # Persistent Adam/RMS second moment used as the CG damping diagonal.
         new_second_moment = jax.tree_util.tree_map(
             lambda s, g: FLAGS.cg_adam_beta2 * s
             + (1.0 - FLAGS.cg_adam_beta2) * jnp.square(g),
             second_moment,
             b_param,
         )
-        bias_correction = 1.0 - jnp.power(
+        beta1_correction = 1.0 - jnp.power(
+            jnp.asarray(FLAGS.cg_adam_beta1, dtype=jnp.float32),
+            new_adam_step,
+        )
+        beta2_correction = 1.0 - jnp.power(
             jnp.asarray(FLAGS.cg_adam_beta2, dtype=jnp.float32),
             new_adam_step,
         )
-        # We want to solve: (G + lambda D_t) x = -b, where G = J^T H J.
-        rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
+
+        # We use the bias-corrected first moment as the RHS: A_t x = -m_hat_t.
+        rhs = jax.tree_util.tree_map(
+            lambda m: -m / beta1_correction,
+            new_first_moment,
+        )
 
         def Gv(v):
             """
@@ -666,12 +686,25 @@ def main(argv):
             # J^T H Jv
             (Gv_param,) = jt_fn(Hv)
 
-            # Adam-diagonal damping:
-            # (G + lambda D_t)v = Gv + lambda * (sqrt(s_hat_t) + eps) * v
+            # Interpolated GN/Adam operator:
+            #
+            # A_t(v) = lambda * Gv
+            #     + (1 - lambda) / eta * (sqrt(s_hat_t) + eps) * v
+            #
+            # The Adam diagonal is intentionally computed inside this tree_map.
+            # Do not materialize s_hat or D_t as full pytrees.
+            interpolation_lambda = jnp.asarray(
+                FLAGS.cg_interpolation_lambda,
+                dtype=jnp.float32,
+            )
+            adam_diagonal_scale = (
+                (1.0 - interpolation_lambda)
+                / FLAGS.cg_adam_lr
+            )
             Gv_param = jax.tree_util.tree_map(
-                lambda gv, vi, second_moment: gv
-                + FLAGS.cg_adam_damping
-                * (jnp.sqrt(second_moment / bias_correction) + FLAGS.cg_adam_eps)
+                lambda gv, vi, second_moment: interpolation_lambda * gv
+                + adam_diagonal_scale
+                * (jnp.sqrt(second_moment / beta2_correction) + FLAGS.cg_adam_eps)
                 * vi,
                 Gv_param,
                 v,
@@ -680,7 +713,7 @@ def main(argv):
 
             return Gv_param
 
-        # Solve using built-in solver:  G x = -b
+        # Solve using built-in solver: A_t x = -m_hat_t.
         x, _ = cg(
             Gv,
             rhs,
@@ -697,16 +730,17 @@ def main(argv):
             x
         )
 
-        # Compute residual for logging: r = Gx + b
-        Gx = Gv(x)
+        # Residual of the actual system: A_t x = -m_hat_t.
+        Ax = Gv(x)
         residual = jax.tree_util.tree_map(
-            lambda gx, b: gx + b,
-            Gx,
-            b_param
+            lambda ax, rhs_leaf: ax - rhs_leaf,
+            Ax,
+            rhs,
         )
 
         residual_norm = global_norm(residual)
-        b_norm = global_norm(b_param)
+        rhs_norm = global_norm(rhs)
+        relative_residual = residual_norm / (rhs_norm + 1e-12)
 
         metrics = {
             'linear_model_loss': jnp.float32(0.0),
@@ -714,8 +748,9 @@ def main(argv):
             'param_norm': global_norm(new_params),
             'gpu_memory': get_gpu_memory()[0],
             'learning_rate': jnp.float32(0.0),
-            'b_norm': b_norm,
-            'relative_residual': residual_norm / (b_norm + 1e-12),
+            'b_norm': rhs_norm,
+            'rhs_norm': rhs_norm,
+            'relative_residual': relative_residual,
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
             'adam_step': new_adam_step,
@@ -723,6 +758,7 @@ def main(argv):
 
         return (
             new_params,
+            new_first_moment,
             new_second_moment,
             new_adam_step,
             rng_generator(),
@@ -782,6 +818,7 @@ def main(argv):
             train_step_cg,
             in_shardings=(
                 train_state_partition.params,  # params0
+                train_state_partition.params,  # first_moment
                 train_state_partition.params,  # second_moment
                 PS(),                          # adam_step
                 PS(),                          # rng
@@ -790,12 +827,13 @@ def main(argv):
             ),
             out_shardings=(
                 train_state_partition.params,  # new_params
+                train_state_partition.params,  # new_first_moment
                 train_state_partition.params,  # new_second_moment
                 PS(),                          # new_adam_step
                 PS(),                          # new_rng
                 PS(),                          # metrics
             ),
-            donate_argnums=(1,),
+            donate_argnums=(1, 2),
         )
     sharded_eval_step = pjit(
         eval_step,
@@ -949,7 +987,11 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
-        # Persistent RMS/Adam second-moment state for CG.
+        # Persistent Adam first and second moments for the CG path.
+        cg_first_moment = jax.tree_util.tree_map(
+            jnp.zeros_like,
+            train_state.params,
+        )
         cg_second_moment = jax.tree_util.tree_map(
             jnp.zeros_like,
             train_state.params,
@@ -1062,12 +1104,14 @@ def main(argv):
                 )
                 (
                     candidate_params,
+                    cg_first_moment,
                     cg_second_moment,
                     cg_adam_step,
                     sharded_rng,
                     cg_metrics,
                 ) = sharded_train_step_cg(
                     train_state.params,
+                    cg_first_moment,
                     cg_second_moment,
                     cg_adam_step,
                     sharded_rng,
