@@ -129,7 +129,10 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
-    cg_damping=0.0, # Tikhonov/LM damping added to G (as G + damping*I) for numerical stability
+    cg_damping=0.0, # Deprecated: old Tikhonov/LM damping. Kept for checkpoint/script compatibility.
+    cg_adam_damping=1.0, # lambda in (G + lambda D_t)x = -g
+    cg_adam_beta2=0.999,
+    cg_adam_eps=1e-8,
 )
 
 def get_gpu_memory():
@@ -584,7 +587,14 @@ def main(argv):
         return rng_generator(), metrics
         
 
-    def train_step_cg(params0, rng, batch, wd):
+    def train_step_cg(
+        params0,
+        second_moment,
+        adam_step,
+        rng,
+        batch,
+        wd,
+    ):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
@@ -620,10 +630,31 @@ def main(argv):
         # J^T: transpose of the linearized model Jacobian.
         jt_fn = linear_transpose(jvp_fn, params0)
 
-        # b = J^T g0.
+        # Current parameter-space gradient: g = J^T grad_y L.
         (b_param,) = jt_fn(g0)
 
-        # We want to solve: G x = -b, where G = J^T H J.
+        # Persistent Adam/RMS second moment used as the CG damping diagonal.
+        new_adam_step = adam_step + 1
+        new_second_moment = jax.tree_util.tree_map(
+            lambda s, g: FLAGS.cg_adam_beta2 * s
+            + (1.0 - FLAGS.cg_adam_beta2) * jnp.square(g),
+            second_moment,
+            b_param,
+        )
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(FLAGS.cg_adam_beta2, dtype=jnp.float32),
+            new_adam_step,
+        )
+        second_moment_hat = jax.tree_util.tree_map(
+            lambda s: s / bias_correction,
+            new_second_moment,
+        )
+        adam_diagonal = jax.tree_util.tree_map(
+            lambda s: jnp.sqrt(s) + FLAGS.cg_adam_eps,
+            second_moment_hat,
+        )
+
+        # We want to solve: (G + lambda D_t) x = -b, where G = J^T H J.
         rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
 
         def Gv(v):
@@ -644,9 +675,13 @@ def main(argv):
             # J^T H Jv
             (Gv_param,) = jt_fn(Hv)
 
-            # Damping for numerical stability (Tikhonov/Levenberg-Marquardt style)
+            # Adam-diagonal damping:
+            # (G + lambda D_t)v = Gv + lambda * (sqrt(s_hat_t) + eps) * v
             Gv_param = jax.tree_util.tree_map(
-                lambda g, vi: g + FLAGS.cg_damping * vi, Gv_param, v
+                lambda gv, vi, d: gv + FLAGS.cg_adam_damping * d * vi,
+                Gv_param,
+                v,
+                adam_diagonal,
             )
 
             return Gv_param
@@ -689,9 +724,18 @@ def main(argv):
             'relative_residual': residual_norm / (b_norm + 1e-12),
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
+            'adam_second_moment_norm': global_norm(new_second_moment),
+            'adam_diagonal_norm': global_norm(adam_diagonal),
+            'adam_step': new_adam_step,
         }
 
-        return new_params, rng_generator(), metrics
+        return (
+            new_params,
+            new_second_moment,
+            new_adam_step,
+            rng_generator(),
+            metrics,
+        )
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -745,15 +789,19 @@ def main(argv):
         sharded_train_step_cg = pjit(
             train_step_cg,
             in_shardings=(
-                train_state_partition.params,
-                PS(),
-                batch_partition,
-                PS(),
+                train_state_partition.params,  # params0
+                train_state_partition.params,  # second_moment
+                PS(),                          # adam_step
+                PS(),                          # rng
+                batch_partition,               # batch
+                PS(),                          # wd
             ),
             out_shardings=(
-                train_state_partition.params,
-                PS(),
-                PS(),
+                train_state_partition.params,  # new_params
+                train_state_partition.params,  # new_second_moment
+                PS(),                          # new_adam_step
+                PS(),                          # new_rng
+                PS(),                          # metrics
             ),
         )
     sharded_eval_step = pjit(
@@ -908,6 +956,13 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
+        # Persistent RMS/Adam second-moment state for CG.
+        cg_second_moment = jax.tree_util.tree_map(
+            jnp.zeros_like,
+            train_state.params,
+        )
+        cg_adam_step = jnp.array(0, dtype=jnp.int32)
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
@@ -1012,8 +1067,19 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
-                candidate_params, sharded_rng, cg_metrics = sharded_train_step_cg(
-                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                (
+                    candidate_params,
+                    cg_second_moment,
+                    cg_adam_step,
+                    sharded_rng,
+                    cg_metrics,
+                ) = sharded_train_step_cg(
+                    train_state.params,
+                    cg_second_moment,
+                    cg_adam_step,
+                    sharded_rng,
+                    batch,
+                    FLAGS.inner_loop_wd,
                 )
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
