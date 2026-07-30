@@ -131,9 +131,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_maxiter=100, # Maximum number of CG iterations
     cg_damping=0.0, # Deprecated: old Tikhonov/LM damping. Kept for checkpoint/script compatibility.
     cg_interpolation_lambda=1.0,
-    cg_adam_lr=0.001,
+    cg_adam_lr=0.003,
     cg_adam_beta1=0.9,
-    cg_adam_beta2=0.999,
+    cg_adam_beta2=0.95,
     cg_adam_eps=1e-8,
 )
 
