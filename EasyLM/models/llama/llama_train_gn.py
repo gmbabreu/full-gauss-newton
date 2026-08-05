@@ -66,7 +66,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     train_dataset_batch_size=8,
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
-    # optimizer=OptimizerFactory.get_default_config(),
+    optimizer=OptimizerFactory.get_default_config(),
     checkpointer=StreamingCheckpointer.get_default_config(),
     llama=LLaMAConfigurator.get_default_config(),
     # logger=mlxu.WandBLogger.get_default_config(),
@@ -129,7 +129,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
-    cg_damping=0.0, # Tikhonov/LM damping added to G (as G + damping*I) for numerical stability
+    cg_damping=0.0, # Deprecated: old Tikhonov/LM damping. Kept for checkpoint/script compatibility.
+    cg_interpolation_lambda=1.0,
 )
 
 def get_gpu_memory():
@@ -418,7 +419,9 @@ def main(argv):
             optimizer = optax.set_to_zero()
         return optimizer
 
-    # optimizer, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
+    _, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
+    # Use the exact same learning-rate schedule as the regular AdamW path.
+    adamw_lr_schedule = optimizer_info['learning_rate_schedule']
     lr_sched = get_global_lr_sched(FLAGS.lr_sched, FLAGS.inner_loop_lr, FLAGS.total_steps, FLAGS.inner_loop_iter, FLAGS.global_warmup, FLAGS.inner_loop_warmup, FLAGS.end_lr)
     tayl_solver = build_optimizer(lr_sched, FLAGS.inner_b1, FLAGS.inner_b2, FLAGS.inner_clip_gradient, FLAGS.optimizer_wd, FLAGS.optimizer_type)
 
@@ -584,7 +587,16 @@ def main(argv):
         return rng_generator(), metrics
         
 
-    def train_step_cg(params0, rng, batch, wd):
+    def train_step_cg(
+        params0,
+        first_moment,
+        second_moment,
+        adam_step,
+        outer_step,
+        rng,
+        batch,
+        wd,
+    ):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
@@ -620,11 +632,41 @@ def main(argv):
         # J^T: transpose of the linearized model Jacobian.
         jt_fn = linear_transpose(jvp_fn, params0)
 
-        # b = J^T g0.
+        # Current parameter-space gradient: g_t = J^T grad_y L.
         (b_param,) = jt_fn(g0)
 
-        # We want to solve: G x = -b, where G = J^T H J.
-        rhs = jax.tree_util.tree_map(lambda x: -x, b_param)
+        new_adam_step = adam_step + 1
+        adam_lr = adamw_lr_schedule(outer_step)
+
+        # Persistent Adam first moment used as the CG RHS.
+        new_first_moment = jax.tree_util.tree_map(
+            lambda m, g: FLAGS.optimizer.adamw_optimizer.b1 * m
+            + (1.0 - FLAGS.optimizer.adamw_optimizer.b1) * g,
+            first_moment,
+            b_param,
+        )
+
+        # Persistent Adam/RMS second moment used as the CG damping diagonal.
+        new_second_moment = jax.tree_util.tree_map(
+            lambda s, g: FLAGS.optimizer.adamw_optimizer.b2 * s
+            + (1.0 - FLAGS.optimizer.adamw_optimizer.b2) * jnp.square(g),
+            second_moment,
+            b_param,
+        )
+        beta1_correction = 1.0 - jnp.power(
+            jnp.asarray(FLAGS.optimizer.adamw_optimizer.b1, dtype=jnp.float32),
+            new_adam_step,
+        )
+        beta2_correction = 1.0 - jnp.power(
+            jnp.asarray(FLAGS.optimizer.adamw_optimizer.b2, dtype=jnp.float32),
+            new_adam_step,
+        )
+
+        # We use the bias-corrected first moment as the RHS: A_t x = -m_hat_t.
+        rhs = jax.tree_util.tree_map(
+            lambda m: -m / beta1_correction,
+            new_first_moment,
+        )
 
         def Gv(v):
             """
@@ -644,14 +686,42 @@ def main(argv):
             # J^T H Jv
             (Gv_param,) = jt_fn(Hv)
 
-            # Damping for numerical stability (Tikhonov/Levenberg-Marquardt style)
+            # Interpolated GN/Adam operator:
+            #
+            # A_t(v) = lambda * Gv
+            #     + (1 - lambda) / eta * (sqrt(s_hat_t) + eps) * v
+            #
+            # The Adam diagonal is intentionally computed inside this tree_map.
+            # Do not materialize s_hat or D_t as full pytrees.
+            interpolation_lambda = jnp.asarray(
+                FLAGS.cg_interpolation_lambda,
+                dtype=jnp.float32,
+            )
+            # Protect against division by zero during the first warmup step.
+            safe_adam_lr = jnp.maximum(
+                adam_lr,
+                jnp.asarray(1e-12, dtype=jnp.float32),
+            )
+            adam_diagonal_scale = (
+                (1.0 - interpolation_lambda)
+                / safe_adam_lr
+            )
             Gv_param = jax.tree_util.tree_map(
-                lambda g, vi: g + FLAGS.cg_damping * vi, Gv_param, v
+                lambda gv, vi, second_moment: interpolation_lambda * gv
+                + adam_diagonal_scale
+                * (
+                    jnp.sqrt(second_moment / beta2_correction)
+                    + jnp.asarray(1e-8, dtype=jnp.float32)
+                )
+                * vi,
+                Gv_param,
+                v,
+                new_second_moment,
             )
 
             return Gv_param
 
-        # Solve using built-in solver:  G x = -b
+        # Solve using built-in solver: A_t x = -m_hat_t.
         x, _ = cg(
             Gv,
             rhs,
@@ -661,37 +731,62 @@ def main(argv):
             maxiter=FLAGS.cg_maxiter,
         )
 
-        # The result x is the GN/CG parameter update.
+        # AdamW-style decoupled weight decay, scaled by the Adam fraction.
+        interpolation_lambda = jnp.asarray(
+            FLAGS.cg_interpolation_lambda,
+            dtype=jnp.float32,
+        )
+        adam_fraction = 1.0 - interpolation_lambda
+        weight_decay = jnp.asarray(
+            FLAGS.optimizer.adamw_optimizer.weight_decay,
+            dtype=jnp.float32,
+        )
+        # Fuse the parameter update and decoupled weight decay so XLA can avoid
+        # materializing an intermediate full-parameter pytree for p + update.
         new_params = jax.tree_util.tree_map(
-            lambda p0, xi: p0 + xi,
+            lambda p, update: p
+            + update
+            - adam_fraction * adam_lr * weight_decay * p,
             params0,
-            x
+            x,
         )
 
-        # Compute residual for logging: r = Gx + b
-        Gx = Gv(x)
+        # Residual of the actual system: A_t x = -m_hat_t.
+        Ax = Gv(x)
         residual = jax.tree_util.tree_map(
-            lambda gx, b: gx + b,
-            Gx,
-            b_param
+            lambda ax, rhs_leaf: ax - rhs_leaf,
+            Ax,
+            rhs,
         )
 
         residual_norm = global_norm(residual)
-        b_norm = global_norm(b_param)
+        rhs_norm = global_norm(rhs)
+        relative_residual = residual_norm / (rhs_norm + 1e-12)
 
         metrics = {
             'linear_model_loss': jnp.float32(0.0),
             'gradient_norm': residual_norm,
             'param_norm': global_norm(new_params),
             'gpu_memory': get_gpu_memory()[0],
-            'learning_rate': jnp.float32(0.0),
-            'b_norm': b_norm,
-            'relative_residual': residual_norm / (b_norm + 1e-12),
+            'learning_rate': adam_lr,
+            'adamw_learning_rate': adam_lr,
+            'adamw_weight_decay': weight_decay,
+            'b_norm': rhs_norm,
+            'rhs_norm': rhs_norm,
+            'relative_residual': relative_residual,
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
+            'adam_step': new_adam_step,
         }
 
-        return new_params, rng_generator(), metrics
+        return (
+            new_params,
+            new_first_moment,
+            new_second_moment,
+            new_adam_step,
+            rng_generator(),
+            metrics,
+        )
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -745,16 +840,24 @@ def main(argv):
         sharded_train_step_cg = pjit(
             train_step_cg,
             in_shardings=(
-                train_state_partition.params,
-                PS(),
-                batch_partition,
-                PS(),
+                train_state_partition.params,  # params0
+                train_state_partition.params,  # first_moment
+                train_state_partition.params,  # second_moment
+                PS(),                          # adam_step
+                PS(),                          # outer_step
+                PS(),                          # rng
+                batch_partition,               # batch
+                PS(),                          # wd
             ),
             out_shardings=(
-                train_state_partition.params,
-                PS(),
-                PS(),
+                train_state_partition.params,  # new_params
+                train_state_partition.params,  # new_first_moment
+                train_state_partition.params,  # new_second_moment
+                PS(),                          # new_adam_step
+                PS(),                          # new_rng
+                PS(),                          # metrics
             ),
+            donate_argnums=(1, 2),
         )
     sharded_eval_step = pjit(
         eval_step,
@@ -908,6 +1011,17 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
+        # Persistent Adam first and second moments for the CG path.
+        cg_first_moment = jax.tree_util.tree_map(
+            jnp.zeros_like,
+            train_state.params,
+        )
+        cg_second_moment = jax.tree_util.tree_map(
+            jnp.zeros_like,
+            train_state.params,
+        )
+        cg_adam_step = jnp.array(0, dtype=jnp.int32)
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
@@ -1012,8 +1126,22 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
-                candidate_params, sharded_rng, cg_metrics = sharded_train_step_cg(
-                    train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd
+                (
+                    candidate_params,
+                    cg_first_moment,
+                    cg_second_moment,
+                    cg_adam_step,
+                    sharded_rng,
+                    cg_metrics,
+                ) = sharded_train_step_cg(
+                    train_state.params,
+                    cg_first_moment,
+                    cg_second_moment,
+                    cg_adam_step,
+                    train_state.step,
+                    sharded_rng,
+                    batch,
+                    FLAGS.inner_loop_wd,
                 )
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
