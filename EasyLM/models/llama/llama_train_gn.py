@@ -667,75 +667,106 @@ def main(argv):
             lambda m: -m / beta1_correction,
             new_first_moment,
         )
+        
+        # Adam diagonal:
+        #
+        # D_t = diag(sqrt(s_hat_t) + eps)
+        #
+        # We apply D_t^{-1/2} lazily inside tree_map operations rather
+        # than materializing D_t or D_t^{-1/2} as parameter pytrees.
+        adam_eps = jnp.asarray(1e-8, dtype=jnp.float32)
 
-        def Gv(v):
+        interpolation_lambda = jnp.asarray(
+            FLAGS.cg_interpolation_lambda,
+            dtype=jnp.float32,
+        )
+
+        safe_adam_lr = jnp.maximum(
+            adam_lr,
+            jnp.asarray(1e-12, dtype=jnp.float32),
+        )
+
+        def apply_D_inv_sqrt(tree):
             """
-            Compute G v = J^T H J v.
+            Apply D_t^{-1/2} to a parameter pytree:
+
+                D_t^{-1/2} v
+                =
+                v / sqrt(sqrt(s_hat_t) + eps).
             """
-
-            # Jv
-            logits_v = jvp_fn(v)
-
-            # H(Jv)
-            _, Hv = jax.jvp(
-                grad_Ly,
-                (logits0,),
-                (logits_v,)
-            )
-
-            # J^T H Jv
-            (Gv_param,) = jt_fn(Hv)
-
-            # Interpolated GN/Adam operator:
-            #
-            # A_t(v) = lambda * Gv
-            #     + (1 - lambda) / eta * (sqrt(s_hat_t) + eps) * v
-            #
-            # The Adam diagonal is intentionally computed inside this tree_map.
-            # Do not materialize s_hat or D_t as full pytrees.
-            interpolation_lambda = jnp.asarray(
-                FLAGS.cg_interpolation_lambda,
-                dtype=jnp.float32,
-            )
-            # Protect against division by zero during the first warmup step.
-            safe_adam_lr = jnp.maximum(
-                adam_lr,
-                jnp.asarray(1e-12, dtype=jnp.float32),
-            )
-            adam_diagonal_scale = (
-                (1.0 - interpolation_lambda)
-                / safe_adam_lr
-            )
-            Gv_param = jax.tree_util.tree_map(
-                lambda gv, vi, second_moment: interpolation_lambda * gv
-                + adam_diagonal_scale
-                * (
-                    jnp.sqrt(second_moment / beta2_correction)
-                    + jnp.asarray(1e-8, dtype=jnp.float32)
-                )
-                * vi,
-                Gv_param,
-                v,
+            return jax.tree_util.tree_map(
+                lambda value, second_moment: (
+                    value
+                    / jnp.sqrt(
+                        jnp.sqrt(second_moment / beta2_correction)
+                        + adam_eps
+                    )
+                ),
+                tree,
                 new_second_moment,
             )
 
-            return Gv_param
+        def Gv(v):
+            """
+            Apply the symmetrically preconditioned operator
+                A_tilde(v)=lambda D_t^{-1/2} G D_t^{-1/2} v +(1 - lambda) / eta * v.
+            """
 
-        # Solve using built-in solver: A_t x = -m_hat_t.
-        x, _ = cg(
+            # Right preconditioning:
+            # v -> D_t^{-1/2} v
+            preconditioned_v = apply_D_inv_sqrt(v)
+
+            # G(D_t^{-1/2} v)
+            logits_v = jvp_fn(preconditioned_v)
+
+            # H G input in logit space.
+            _, Hv = jax.jvp(
+                grad_Ly,
+                (logits0,),
+                (logits_v,),
+            )
+
+            # G(D_t^{-1/2} v)
+            (Gv_param,) = jt_fn(Hv)
+
+            # Left preconditioning:
+            # G(D_t^{-1/2} v) -> D_t^{-1/2} G D_t^{-1/2} v.
+            preconditioned_Gv = apply_D_inv_sqrt(Gv_param)
+
+            # The Adam contribution is now a scaled identity:
+            # D_t^{-1/2}[(1-lambda)/eta * D_t]D_t^{-1/2} = (1-lambda)/eta * I.
+            return jax.tree_util.tree_map(
+                lambda gv, vi: (
+                    interpolation_lambda * gv
+                    + (
+                        (1.0 - interpolation_lambda)
+                        / safe_adam_lr
+                    ) * vi
+                ),
+                preconditioned_Gv,
+                v,
+            )
+            
+        # Symmetrically precondition the right-hand side:
+        # rhs_tilde = -D_t^{-1/2} m_hat_t.
+        preconditioned_rhs = apply_D_inv_sqrt(rhs)
+
+        # Solve the symmetrically preconditioned system:
+        # Solve using built-in solver: A_t y = -D_t^{-1/2} m_hat_t.
+        y, _ = cg(
             Gv,
-            rhs,
+            preconditioned_rhs,
             x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
             tol=FLAGS.cg_tol,
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
         )
 
+        # Transform the CG solution back to the original
+        # x = D_t^{-1/2} y.
+        x = apply_D_inv_sqrt(y)
+
         # AdamW-style decoupled weight decay, scaled by the Adam fraction.
-        interpolation_lambda = jnp.asarray(
-            FLAGS.cg_interpolation_lambda,
-            dtype=jnp.float32,
-        )
         adam_fraction = 1.0 - interpolation_lambda
         weight_decay = jnp.asarray(
             FLAGS.optimizer.adamw_optimizer.weight_decay,
@@ -751,16 +782,18 @@ def main(argv):
             x,
         )
 
-        # Residual of the actual system: A_t x = -m_hat_t.
-        Ax = Gv(x)
+        # Residual of the symmetrically preconditioned system:
+        # A_tilde y = -D_t^{-1/2} m_hat_t.
+        Ay = Gv(y)
+
         residual = jax.tree_util.tree_map(
-            lambda ax, rhs_leaf: ax - rhs_leaf,
-            Ax,
-            rhs,
+            lambda ay, rhs_leaf: ay - rhs_leaf,
+            Ay,
+            preconditioned_rhs,
         )
 
         residual_norm = global_norm(residual)
-        rhs_norm = global_norm(rhs)
+        rhs_norm = global_norm(preconditioned_rhs)
         relative_residual = residual_norm / (rhs_norm + 1e-12)
 
         metrics = {
