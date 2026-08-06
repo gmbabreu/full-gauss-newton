@@ -591,6 +591,7 @@ def main(argv):
         params0,
         first_moment,
         second_moment,
+        cg_x0,
         adam_step,
         outer_step,
         rng,
@@ -756,12 +757,12 @@ def main(argv):
         y, _ = cg(
             Gv,
             preconditioned_rhs,
-            x0=jax.tree_util.tree_map(jnp.zeros_like, params0),
+            x0=cg_x0,
             tol=FLAGS.cg_tol,
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
         )
-
+        
         # Transform the CG solution back to the original
         # x = D_t^{-1/2} y.
         x = apply_D_inv_sqrt(y)
@@ -816,6 +817,7 @@ def main(argv):
             new_params,
             new_first_moment,
             new_second_moment,
+            y,         # return for warm start
             new_adam_step,
             rng_generator(),
             metrics,
@@ -876,16 +878,19 @@ def main(argv):
                 train_state_partition.params,  # params0
                 train_state_partition.params,  # first_moment
                 train_state_partition.params,  # second_moment
+                train_state_partition.params,  # cg_x0   
                 PS(),                          # adam_step
                 PS(),                          # outer_step
                 PS(),                          # rng
                 batch_partition,               # batch
                 PS(),                          # wd
             ),
+            
             out_shardings=(
                 train_state_partition.params,  # new_params
                 train_state_partition.params,  # new_first_moment
                 train_state_partition.params,  # new_second_moment
+                train_state_partition.params,  # new_cg_x0 
                 PS(),                          # new_adam_step
                 PS(),                          # new_rng
                 PS(),                          # metrics
@@ -1055,6 +1060,12 @@ def main(argv):
         )
         cg_adam_step = jnp.array(0, dtype=jnp.int32)
 
+        if FLAGS.reset_start:
+            cg_x0 = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
@@ -1163,6 +1174,7 @@ def main(argv):
                     candidate_params,
                     cg_first_moment,
                     cg_second_moment,
+                    cg_x0,                 # NEW
                     cg_adam_step,
                     sharded_rng,
                     cg_metrics,
@@ -1170,12 +1182,14 @@ def main(argv):
                     train_state.params,
                     cg_first_moment,
                     cg_second_moment,
+                    cg_x0,                 # NEW
                     cg_adam_step,
                     train_state.step,
                     sharded_rng,
                     batch,
                     FLAGS.inner_loop_wd,
                 )
+                
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
                 )
