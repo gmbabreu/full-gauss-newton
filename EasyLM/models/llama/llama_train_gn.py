@@ -780,7 +780,6 @@ def main(argv):
         # Transform the CG solution back to the original
         # x = D_t^{-1/2} y.
         x = apply_D_inv_sqrt(y)
-        del y
 
         # AdamW-style decoupled weight decay, scaled by the Adam fraction.
         adam_fraction = 1.0 - interpolation_lambda
