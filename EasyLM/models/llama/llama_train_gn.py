@@ -1059,12 +1059,10 @@ def main(argv):
             train_state.params,
         )
         cg_adam_step = jnp.array(0, dtype=jnp.int32)
-
-        if FLAGS.reset_start:
-            cg_x0 = jax.tree_util.tree_map(
-                jnp.zeros_like,
-                train_state.params,
-            )
+        cg_x0 = jax.tree_util.tree_map(
+            jnp.zeros_like,
+            train_state.params,
+        )
 
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
@@ -1077,6 +1075,12 @@ def main(argv):
                 inner_state = inner_state.replace(
                     params=train_state.params,
                     opt_state=tayl_solver.init(train_state.params)
+                )
+
+                # Equivalent reset for cg
+                cg_x0 = jax.tree_util.tree_map(
+                    jnp.zeros_like,
+                    train_state.params,
                 )
 
             if FLAGS.single_batch_inner:
