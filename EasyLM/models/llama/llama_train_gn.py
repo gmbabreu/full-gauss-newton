@@ -762,10 +762,25 @@ def main(argv):
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
         )
+
+        # Residual of the symmetrically preconditioned system:
+        # A_tilde y = -D_t^{-1/2} m_hat_t.
+        Ay = Gv(y)
+
+        residual = jax.tree_util.tree_map(
+            lambda ay, rhs_leaf: ay - rhs_leaf,
+            Ay,
+            preconditioned_rhs,
+        )
+
+        residual_norm = global_norm(residual)
+        rhs_norm = global_norm(preconditioned_rhs)
+        relative_residual = residual_norm / (rhs_norm + 1e-12)
         
         # Transform the CG solution back to the original
         # x = D_t^{-1/2} y.
         x = apply_D_inv_sqrt(y)
+        del y
 
         # AdamW-style decoupled weight decay, scaled by the Adam fraction.
         adam_fraction = 1.0 - interpolation_lambda
@@ -782,20 +797,6 @@ def main(argv):
             params0,
             x,
         )
-
-        # Residual of the symmetrically preconditioned system:
-        # A_tilde y = -D_t^{-1/2} m_hat_t.
-        Ay = Gv(y)
-
-        residual = jax.tree_util.tree_map(
-            lambda ay, rhs_leaf: ay - rhs_leaf,
-            Ay,
-            preconditioned_rhs,
-        )
-
-        residual_norm = global_norm(residual)
-        rhs_norm = global_norm(preconditioned_rhs)
-        relative_residual = residual_norm / (rhs_norm + 1e-12)
 
         metrics = {
             'linear_model_loss': jnp.float32(0.0),
@@ -895,7 +896,7 @@ def main(argv):
                 PS(),                          # new_rng
                 PS(),                          # metrics
             ),
-            donate_argnums=(1, 2),
+            donate_argnums=(1, 2, 3),
         )
     sharded_eval_step = pjit(
         eval_step,
