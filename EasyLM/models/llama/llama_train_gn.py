@@ -129,8 +129,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
-    cg_damping=0.0, # Deprecated: old Tikhonov/LM damping. Kept for checkpoint/script compatibility.
     cg_interpolation_lambda=1.0,
+    cg_n_micro=1,   # microbatches for CG Gv; 1 = no microbatching (default, backward-compatible)
 )
 
 def get_gpu_memory():
@@ -621,20 +621,73 @@ def main(argv):
             )
             return loss
 
-        # Linearize the model once around params0.
-        logits0, jvp_fn = linearize(f_batch, params0)
+        # Microbatched b_param = average_i J_i^T grad L_i.
+        #
+        # lax.fori_loop is used here: Python unrolling would cause XLA
+        # to keep n_micro separate vocab-sized intermediates in the
+        # while_loop carry. fori_loop collapses them to one accumulator.
+        # ------------------------------------------------------------
+        n_micro = FLAGS.cg_n_micro
 
-        # Gradient of the loss with respect to logits.
-        grad_Ly = jax.grad(scalar_loss_on_logits)
+        batch_size = batch_['input_tokens'].shape[0]
+        assert batch_size % n_micro == 0
+        mb_size = batch_size // n_micro
 
-        # g0 = gradient of the loss at the base point.
-        g0 = grad_Ly(logits0)
+        def b_param_body(i, carry):
+            start = i * mb_size
+            input_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['input_tokens'], start, mb_size, axis=0
+            )
+            target_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['target_tokens'], start, mb_size, axis=0
+            )
+            mask_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['loss_masks'], start, mb_size, axis=0
+            )
 
-        # J^T: transpose of the linearized model Jacobian.
-        jt_fn = linear_transpose(jvp_fn, params0)
+            def f_mb(p):
+                out = model.apply(
+                    p,
+                    input_mb,
+                    deterministic=False,
+                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                )
+                return out.logits
 
-        # Current parameter-space gradient: g_t = J^T grad_y L.
-        (b_param,) = jt_fn(g0)
+            def scalar_loss_mb(logits):
+                loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                    logits,
+                    target_mb,
+                    params0,
+                    params0,
+                    mask_mb,
+                    weight_decay=wd,
+                )
+                return loss
+
+            logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+            grad_Ly_mb = jax.grad(scalar_loss_mb)
+            g0_mb = grad_Ly_mb(logits0_mb)
+            jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
+            (b_mb,) = jt_fn_mb(g0_mb)
+            return jax.tree_util.tree_map(
+                lambda accumulated, contribution: accumulated + contribution,
+                carry,
+                b_mb,
+            )
+
+        b_param_sum = jax.lax.fori_loop(
+            0,
+            n_micro,
+            b_param_body,
+            jax.tree_util.tree_map(jnp.zeros_like, params0),
+        )
+        # Each microbatch loss is mean-normalized over mb_size; averaging
+        # n_micro such gradients recovers the full-batch gradient.
+        b_param = jax.tree_util.tree_map(
+            lambda x: x / n_micro,
+            b_param_sum,
+        )
 
         new_adam_step = adam_step + 1
         adam_lr = adamw_lr_schedule(outer_step)
@@ -709,33 +762,88 @@ def main(argv):
 
         def Gv(v):
             """
-            Apply the symmetrically preconditioned operator
-                A_tilde(v)=lambda D_t^{-1/2} G D_t^{-1/2} v +(1 - lambda) / eta * v.
+            Symmetrically preconditioned GN/Adam operator.
+
+            A_tilde(v)
+              = lambda D^{-1/2} G D^{-1/2} v
+                + (1-lambda)/eta * v
+
+            The GN term is accumulated over microbatches via lax.fori_loop
+            so that XLA carries one parameter-sized accumulator rather than
+            n_micro vocab-sized tensors in the CG while_loop carry.
             """
 
-            # Right preconditioning:
-            # v -> D_t^{-1/2} v
+            # Right preconditioning: v -> D_t^{-1/2} v
             preconditioned_v = apply_D_inv_sqrt(v)
 
-            # G(D_t^{-1/2} v)
-            logits_v = jvp_fn(preconditioned_v)
+            def gn_body(i, carry):
+                start = i * mb_size
+                input_mb = jax.lax.dynamic_slice_in_dim(
+                    batch_['input_tokens'], start, mb_size, axis=0
+                )
+                target_mb = jax.lax.dynamic_slice_in_dim(
+                    batch_['target_tokens'], start, mb_size, axis=0
+                )
+                mask_mb = jax.lax.dynamic_slice_in_dim(
+                    batch_['loss_masks'], start, mb_size, axis=0
+                )
 
-            # H G input in logit space.
-            _, Hv = jax.jvp(
-                grad_Ly,
-                (logits0,),
-                (logits_v,),
+                def f_mb(p):
+                    out = model.apply(
+                        p,
+                        input_mb,
+                        deterministic=False,
+                        rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                    )
+                    return out.logits
+
+                def scalar_loss_mb(logits):
+                    loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
+                        logits,
+                        target_mb,
+                        params0,
+                        params0,
+                        mask_mb,
+                        weight_decay=wd,
+                    )
+                    return loss
+
+                logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+                grad_Ly_mb = jax.grad(scalar_loss_mb)
+                jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
+
+                logits_v_mb = jvp_fn_mb(preconditioned_v)
+                _, Hv_mb = jax.jvp(
+                    grad_Ly_mb,
+                    (logits0_mb,),
+                    (logits_v_mb,),
+                )
+                (Gv_mb,) = jt_fn_mb(Hv_mb)
+
+                return jax.tree_util.tree_map(
+                    lambda accumulated, contribution: accumulated + contribution,
+                    carry,
+                    Gv_mb,
+                )
+
+            gn_sum = jax.lax.fori_loop(
+                0,
+                n_micro,
+                gn_body,
+                jax.tree_util.tree_map(jnp.zeros_like, params0),
+            )
+            # Each microbatch loss is mean-normalized; average to recover
+            # the full-batch GN quadratic form.
+            Gv_param = jax.tree_util.tree_map(
+                lambda x: x / n_micro,
+                gn_sum,
             )
 
-            # G(D_t^{-1/2} v)
-            (Gv_param,) = jt_fn(Hv)
-
-            # Left preconditioning:
-            # G(D_t^{-1/2} v) -> D_t^{-1/2} G D_t^{-1/2} v.
+            # Left preconditioning: G(D_t^{-1/2} v) -> D_t^{-1/2} G D_t^{-1/2} v
             preconditioned_Gv = apply_D_inv_sqrt(Gv_param)
 
-            # The Adam contribution is now a scaled identity:
-            # D_t^{-1/2}[(1-lambda)/eta * D_t]D_t^{-1/2} = (1-lambda)/eta * I.
+            # Adam diagonal is a scaled identity after symmetric preconditioning.
+            # Applied once here, outside the microbatch loop -- not per microbatch.
             return jax.tree_util.tree_map(
                 lambda gv, vi: (
                     interpolation_lambda * gv
