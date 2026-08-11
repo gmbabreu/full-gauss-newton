@@ -130,7 +130,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_interpolation_lambda=1.0,
-    cg_n_micro=1,   # microbatches for CG Gv; 1 = no microbatching (default, backward-compatible)
+    cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
 )
 
 def get_gpu_memory():
@@ -588,12 +588,12 @@ def main(argv):
         
 
     def train_step_cg(
-        params0,
-        first_moment,
-        second_moment,
-        cg_x0,
-        adam_step,
-        outer_step,
+        params0,          # base parameters θ_0 for this outer step
+        first_moment,     # persistent Adam first moment m_{t-1}
+        second_moment,    # persistent Adam second moment s_{t-1}
+        cg_x0,            # warm-start for CG (previous step's solution y, in preconditioned space)
+        adam_step,        # outer step count, used for bias correction
+        outer_step,       # same counter, used for the LR schedule
         rng,
         batch,
         wd,
@@ -601,6 +601,9 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
+        # f_batch and scalar_loss_on_logits are kept for any non-microbatched
+        # code paths that still reference them (e.g. residual evaluation above).
+        # They are not used inside the fori_loop bodies.
         def f_batch(p):
             out = model.apply(
                 p,
@@ -621,12 +624,10 @@ def main(argv):
             )
             return loss
 
-        # Microbatched b_param = average_i J_i^T grad L_i.
-        #
-        # lax.fori_loop is used here: Python unrolling would cause XLA
-        # to keep n_micro separate vocab-sized intermediates in the
-        # while_loop carry. fori_loop collapses them to one accumulator.
-        # ------------------------------------------------------------
+        # ── compute b_param = ∇_theta L = J^T (∇_f L) (the parameter-space gradient) ──
+        # Split the batch into equal microbatches. Each microbatch loss is
+        # mean-normalized internally, so averaging their J^T ∇_f L contributions
+        # recovers the full-batch parameter-space gradient.
         n_micro = FLAGS.cg_n_micro
 
         batch_size = batch_['input_tokens'].shape[0]
@@ -634,6 +635,7 @@ def main(argv):
         mb_size = batch_size // n_micro
 
         def b_param_body(i, carry):
+            # Slice the i-th microbatch out of the full batch.
             start = i * mb_size
             input_mb = jax.lax.dynamic_slice_in_dim(
                 batch_['input_tokens'], start, mb_size, axis=0
@@ -646,10 +648,9 @@ def main(argv):
             )
 
             def f_mb(p):
-                # deterministic=True: all dropout rates are 0.0 in this config,
-                # so no RNG keys are consumed regardless. Using True avoids
-                # calling rng_generator() inside the traced fori_loop body,
-                # which would cause a tracer leak (JaxRNG mutates self.rng).
+                # Run the model on the microbatch to get logits.
+                # deterministic=True is safe because dropout/FCM are disabled in this config,
+                # and avoids mutating JaxRNG inside the traced fori_loop.
                 out = model.apply(
                     p,
                     input_mb,
@@ -668,34 +669,46 @@ def main(argv):
                 )
                 return loss
 
+            # Linearize the model at params0: this gives the current logits and a JVP
+            # function for applying the parameter-space Jacobian.
             logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+
+            # Compute the logit-space loss gradient (∇_f L), then apply J^T to obtain the
+            # parameter-space gradient contribution for this microbatch.
             grad_Ly_mb = jax.grad(scalar_loss_mb)
             g0_mb = grad_Ly_mb(logits0_mb)
             jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
             (b_mb,) = jt_fn_mb(g0_mb)
+
+            # Accumulate into the running sum. Division by n_micro happens after
+            # the loop to keep the carry parameter-sized (not scaled-parameter-sized).
             return jax.tree_util.tree_map(
                 lambda accumulated, contribution: accumulated + contribution,
                 carry,
                 b_mb,
             )
-
+        # Apply jax loop
         b_param_sum = jax.lax.fori_loop(
             0,
             n_micro,
             b_param_body,
             jax.tree_util.tree_map(jnp.zeros_like, params0),
         )
-        # Each microbatch loss is mean-normalized over mb_size; averaging
-        # n_micro such gradients recovers the full-batch gradient.
+        # Average: each microbatch loss is mean-normalized over mb_size, so
+        # averaging n_micro microbatch gradients recovers the full-batch gradient.
         b_param = jax.tree_util.tree_map(
-            lambda x: x / n_micro,
+            lambda b: b / n_micro,
             b_param_sum,
         )
 
+        # ── Adam EMA updates ──────────────────────────────────────────
+        #
+        # Both moments are updated once per outer step  using the full-batch gradient b_param
+        # The bias-corrected moments are used to construct the CG right-hand side and the Adam diagonal preconditioner.
         new_adam_step = adam_step + 1
         adam_lr = adamw_lr_schedule(outer_step)
 
-        # Persistent Adam first moment used as the CG RHS.
+        # First moment: exponential moving average of b_param (the gradient).
         new_first_moment = jax.tree_util.tree_map(
             lambda m, g: FLAGS.optimizer.adamw_optimizer.b1 * m
             + (1.0 - FLAGS.optimizer.adamw_optimizer.b1) * g,
@@ -703,13 +716,15 @@ def main(argv):
             b_param,
         )
 
-        # Persistent Adam/RMS second moment used as the CG damping diagonal.
+        # Second moment: exponential moving average of b_param^2 (the gradient variance).
         new_second_moment = jax.tree_util.tree_map(
             lambda s, g: FLAGS.optimizer.adamw_optimizer.b2 * s
             + (1.0 - FLAGS.optimizer.adamw_optimizer.b2) * jnp.square(g),
             second_moment,
             b_param,
         )
+
+        # Bias corrections for Adam: account for the zero-initialization of moments.
         beta1_correction = 1.0 - jnp.power(
             jnp.asarray(FLAGS.optimizer.adamw_optimizer.b1, dtype=jnp.float32),
             new_adam_step,
@@ -719,18 +734,21 @@ def main(argv):
             new_adam_step,
         )
 
-        # We use the bias-corrected first moment as the RHS: A_t x = -m_hat_t.
+        # ── build the CG right-hand side ─────────────────────────────
+        # Build the Adam-based CG RHS: -m_hat_t.
         rhs = jax.tree_util.tree_map(
             lambda m: -m / beta1_correction,
             new_first_moment,
         )
-        
-        # Adam diagonal:
+
+        # ── Symmetric Adam preconditioning ────────────────────────────
         #
-        # D_t = diag(sqrt(s_hat_t) + eps)
+        # The interpolated operator is A_t(v) = λG + (1-λ)/η * D_t, where:
+        #   G   = J^T H J   (Gauss-Newton curvature)
+        #   D_t = diag(sqrt(s_hat_t) + eps)   (Adam second-moment diagonal)
         #
-        # We apply D_t^{-1/2} lazily inside tree_map operations rather
-        # than materializing D_t or D_t^{-1/2} as parameter pytrees.
+        # Symmetric preconditioning with D_t^{-1/2} gives
+        #   A_tilde = λ D_t^{-1/2} G D_t^{-1/2} + (1-λ)/η * I.
         adam_eps = jnp.asarray(1e-8, dtype=jnp.float32)
 
         interpolation_lambda = jnp.asarray(
@@ -738,6 +756,7 @@ def main(argv):
             dtype=jnp.float32,
         )
 
+        # Protect against division by zero at the first warmup step.
         safe_adam_lr = jnp.maximum(
             adam_lr,
             jnp.asarray(1e-12, dtype=jnp.float32),
@@ -745,41 +764,42 @@ def main(argv):
 
         def apply_D_inv_sqrt(tree):
             """
-            Apply D_t^{-1/2} to a parameter pytree:
-
-                D_t^{-1/2} v
-                =
-                v / sqrt(sqrt(s_hat_t) + eps).
+            Apply D_t^{-1/2} elementwise:
+        
+                D_t^{-1/2} v = v / sqrt(sqrt(s_hat_t) + eps)
+        
+            The diagonal is never materialized; the operation is applied lazily
+            to the parameter pytree.
             """
             return jax.tree_util.tree_map(
                 lambda value, second_moment: (
-                    value
-                    / jnp.sqrt(
-                        jnp.sqrt(second_moment / beta2_correction)
-                        + adam_eps
-                    )
+                    value/ jnp.sqrt(jnp.sqrt(second_moment / beta2_correction)+ adam_eps)
                 ),
                 tree,
                 new_second_moment,
             )
 
-        def Gv(v):
+        # ── CG operator Av ────────────────────────────────
+        #
+        # Av(v) computes A_tilde(v) = λ D^{-1/2} G D^{-1/2} v + (1-λ)/η * v.
+        # CG calls this repeatedly to solve A_tilde y = rhs_tilde.
+        def Av(v):
             """
-            Symmetrically preconditioned GN/Adam operator.
-
-            A_tilde(v)
-              = lambda D^{-1/2} G D^{-1/2} v
-                + (1-lambda)/eta * v
-
-            The GN term is accumulated over microbatches via lax.fori_loop
-            so that XLA carries one parameter-sized accumulator rather than
-            n_micro vocab-sized tensors in the CG while_loop carry.
+            Apply the symmetrically preconditioned GN/Adam operator.
+              v -> D^{-1/2} v
+              G(D^{-1/2} v)
+              G(...) -> D^{-1/2} G(D^{-1/2} v)
+            Then add the Adam scaled-identity term: (1-λ)/η * v
+        
+            The GN quadratic form G(D^{-1/2} v) is accumulated over microbatches
+            via lax.fori_loop so that XLA carries one parameter-sized accumulator.
             """
 
-            # Right preconditioning: v -> D_t^{-1/2} v
+            # Right preconditioning
             preconditioned_v = apply_D_inv_sqrt(v)
 
             def gn_body(i, carry):
+                # Slice microbatch i from the full batch.
                 start = i * mb_size
                 input_mb = jax.lax.dynamic_slice_in_dim(
                     batch_['input_tokens'], start, mb_size, axis=0
@@ -792,10 +812,9 @@ def main(argv):
                 )
 
                 def f_mb(p):
-                    # deterministic=True: all dropout rates are 0.0 in this config,
-                    # so no RNG keys are consumed regardless. Using True avoids
-                    # calling rng_generator() inside the traced fori_loop body,
-                    # which would cause a tracer leak (JaxRNG mutates self.rng).
+                    # Run the model on the microbatch to get logits.
+                    # deterministic=True is safe because dropout/FCM are disabled in this config,
+                    # and avoids mutating JaxRNG inside the traced fori_loop
                     out = model.apply(
                         p,
                         input_mb,
@@ -814,10 +833,15 @@ def main(argv):
                     )
                     return loss
 
+                # Linearize the model at params0 to obtain J_mb and the current logits.
                 logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
                 grad_Ly_mb = jax.grad(scalar_loss_mb)
                 jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
 
+                # Compute the GN-vector product J^T H J v:
+                #   J v        -> forward-mode JVP
+                #   H(J v)     -> Hessian-vector product in logit space
+                #   J^T H J v  -> transpose JVP
                 logits_v_mb = jvp_fn_mb(preconditioned_v)
                 _, Hv_mb = jax.jvp(
                     grad_Ly_mb,
@@ -831,25 +855,24 @@ def main(argv):
                     carry,
                     Gv_mb,
                 )
-
+            # Apply microbatch loop
             gn_sum = jax.lax.fori_loop(
                 0,
                 n_micro,
                 gn_body,
                 jax.tree_util.tree_map(jnp.zeros_like, params0),
             )
-            # Each microbatch loss is mean-normalized; average to recover
-            # the full-batch GN quadratic form.
+            # Average the mean-normalized microbatch GN contributions to recover
+            # the full-batch GN-vector product.
             Gv_param = jax.tree_util.tree_map(
                 lambda x: x / n_micro,
                 gn_sum,
             )
 
-            # Left preconditioning: G(D_t^{-1/2} v) -> D_t^{-1/2} G D_t^{-1/2} v
+            # Left preconditioning: D^{-1/2} G D^{-1/2} v.
             preconditioned_Gv = apply_D_inv_sqrt(Gv_param)
 
-            # Adam diagonal is a scaled identity after symmetric preconditioning.
-            # Applied once here, outside the microbatch loop -- not per microbatch.
+            # Add the Adam diagonal contribution: (1-λ)/η * I
             return jax.tree_util.tree_map(
                 lambda gv, vi: (
                     interpolation_lambda * gv
@@ -861,15 +884,16 @@ def main(argv):
                 preconditioned_Gv,
                 v,
             )
-            
-        # Symmetrically precondition the right-hand side:
-        # rhs_tilde = -D_t^{-1/2} m_hat_t.
-        preconditioned_rhs = apply_D_inv_sqrt(rhs)
 
+        # ── Run CG ────────────────────────────────────────────────────
+        #
         # Solve the symmetrically preconditioned system:
-        # Solve using built-in solver: A_t y = -D_t^{-1/2} m_hat_t.
+        #   A_tilde y = -D_t^{-1/2} rhs
+        # where y lives in preconditioned space; x = D_t^{-1/2}y
+        
+        preconditioned_rhs = apply_D_inv_sqrt(rhs)
         y, _ = cg(
-            Gv,
+            Av,
             preconditioned_rhs,
             x0=cg_x0,
             tol=FLAGS.cg_tol,
@@ -877,10 +901,9 @@ def main(argv):
             maxiter=FLAGS.cg_maxiter,
         )
 
-        # Residual of the symmetrically preconditioned system:
-        # A_tilde y = -D_t^{-1/2} m_hat_t.
-        Ay = Gv(y)
-
+        # Compute residual for logging 
+        # relative_residual = ||A_tilde y - rhs_tilde|| / ||rhs_tilde||
+        Ay = Av(y)
         residual = jax.tree_util.tree_map(
             lambda ay, rhs_leaf: ay - rhs_leaf,
             Ay,
@@ -890,19 +913,23 @@ def main(argv):
         residual_norm = global_norm(residual)
         rhs_norm = global_norm(preconditioned_rhs)
         relative_residual = residual_norm / (rhs_norm + 1e-12)
-        
-        # Transform the CG solution back to the original
-        # x = D_t^{-1/2} y.
+
+        # Map the CG solution y back from preconditioned space to parameter space:
+        #   x = D_t^{-1/2} y
         x = apply_D_inv_sqrt(y)
 
-        # AdamW-style decoupled weight decay, scaled by the Adam fraction.
+        # ── Apply update with decoupled weight decay ──────────────────
+        #
+        # Full parameter update:
+        #   θ_new = θ_0 + x - adam_fraction * η * λ_wd * θ_0
+        # where adam_fraction = (1 - λ) scales the AdamW weight decay by how
+        # much of the operator is the Adam diagonal (vs the GN term).
         adam_fraction = 1.0 - interpolation_lambda
         weight_decay = jnp.asarray(
             FLAGS.optimizer.adamw_optimizer.weight_decay,
             dtype=jnp.float32,
         )
-        # Fuse the parameter update and decoupled weight decay so XLA can avoid
-        # materializing an intermediate full-parameter pytree for p + update.
+        # Fused: avoids materializing an intermediate parameter pytree for p + update.
         new_params = jax.tree_util.tree_map(
             lambda p, update: p
             + update
@@ -911,6 +938,7 @@ def main(argv):
             x,
         )
 
+        # ── Collect metrics ──────────────────────────────────────────
         metrics = {
             'linear_model_loss': jnp.float32(0.0),
             'gradient_norm': residual_norm,
@@ -920,7 +948,6 @@ def main(argv):
             'adamw_learning_rate': adam_lr,
             'adamw_weight_decay': weight_decay,
             'b_norm': rhs_norm,
-            'rhs_norm': rhs_norm,
             'relative_residual': relative_residual,
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
@@ -931,7 +958,7 @@ def main(argv):
             new_params,
             new_first_moment,
             new_second_moment,
-            y,         # return for warm start
+            y,              # returned for warm-starting next outer step's CG
             new_adam_step,
             rng_generator(),
             metrics,
