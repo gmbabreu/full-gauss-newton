@@ -601,29 +601,6 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
-        # f_batch and scalar_loss_on_logits are kept for any non-microbatched
-        # code paths that still reference them (e.g. residual evaluation above).
-        # They are not used inside the fori_loop bodies.
-        def f_batch(p):
-            out = model.apply(
-                p,
-                batch_['input_tokens'],
-                deterministic=False,
-                rngs=rng_generator(LLaMAConfigurator.rng_keys())
-            )
-            return out.logits
-
-        def scalar_loss_on_logits(logits):
-            loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                logits,
-                batch_['target_tokens'],
-                params0,
-                params0,
-                batch_['loss_masks'],
-                weight_decay=wd
-            )
-            return loss
-
         # ── compute b_param = ∇_theta L = J^T (∇_f L) (the parameter-space gradient) ──
         # Split the batch into equal microbatches. Each microbatch loss is
         # mean-normalized internally, so averaging their J^T ∇_f L contributions
