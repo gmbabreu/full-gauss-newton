@@ -646,11 +646,14 @@ def main(argv):
             )
 
             def f_mb(p):
+                # deterministic=True: all dropout rates are 0.0 in this config,
+                # so no RNG keys are consumed regardless. Using True avoids
+                # calling rng_generator() inside the traced fori_loop body,
+                # which would cause a tracer leak (JaxRNG mutates self.rng).
                 out = model.apply(
                     p,
                     input_mb,
-                    deterministic=False,
-                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                    deterministic=True,
                 )
                 return out.logits
 
@@ -789,11 +792,14 @@ def main(argv):
                 )
 
                 def f_mb(p):
+                    # deterministic=True: all dropout rates are 0.0 in this config,
+                    # so no RNG keys are consumed regardless. Using True avoids
+                    # calling rng_generator() inside the traced fori_loop body,
+                    # which would cause a tracer leak (JaxRNG mutates self.rng).
                     out = model.apply(
                         p,
                         input_mb,
-                        deterministic=False,
-                        rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                        deterministic=True,
                     )
                     return out.logits
 
