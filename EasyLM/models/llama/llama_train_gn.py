@@ -718,14 +718,7 @@ def main(argv):
             new_first_moment,
         )
 
-        # ── Symmetric Adam preconditioning ────────────────────────────
-        #
-        # The interpolated operator is A_t(v) = λG + (1-λ)/η * D_t, where:
-        #   G   = J^T H J   (Gauss-Newton curvature)
-        #   D_t = diag(sqrt(s_hat_t) + eps)   (Adam second-moment diagonal)
-        #
-        # Symmetric preconditioning with D_t^{-1/2} gives
-        #   A_tilde = λ D_t^{-1/2} G D_t^{-1/2} + (1-λ)/η * I.
+        
         adam_eps = jnp.asarray(1e-8, dtype=jnp.float32)
 
         interpolation_lambda = jnp.asarray(
@@ -739,18 +732,28 @@ def main(argv):
             jnp.asarray(1e-12, dtype=jnp.float32),
         )
 
-        def apply_D_inv_sqrt(tree):
+        # ── Adam Interpolation ────────────────────────────
+        #
+        # The interpolated operator is A_t(v) = λG + (1-λ)/η * D_t, where:
+        #   G   = J^T H J   (Gauss-Newton curvature)
+        #   D_t = diag(sqrt(s_hat_t) + eps)   (Adam second-moment diagonal)
+        def apply_D_inv(tree):
             """
-            Apply D_t^{-1/2} elementwise:
+            Apply the inverse Adam diagonal D_t^{-1} elementwise:
         
-                D_t^{-1/2} v = v / sqrt(sqrt(s_hat_t) + eps)
+                D_t = sqrt(s_hat_t) + eps
+        
+                D_t^{-1} v = v / (sqrt(s_hat_t) + eps).
         
             The diagonal is never materialized; the operation is applied lazily
             to the parameter pytree.
             """
             return jax.tree_util.tree_map(
                 lambda value, second_moment: (
-                    value/ jnp.sqrt(jnp.sqrt(second_moment / beta2_correction)+ adam_eps)
+                    value / (
+                        jnp.sqrt(second_moment / beta2_correction)
+                        + adam_eps
+                    )
                 ),
                 tree,
                 new_second_moment,
@@ -758,22 +761,16 @@ def main(argv):
 
         # ── CG operator Av ────────────────────────────────
         #
-        # Av(v) computes A_tilde(v) = λ D^{-1/2} G D^{-1/2} v + (1-λ)/η * v.
-        # CG calls this repeatedly to solve A_tilde y = rhs_tilde.
+        # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
+        # CG calls this repeatedly to solve A_t x = rhs.
         def Av(v):
             """
-            Apply the symmetrically preconditioned GN/Adam operator.
-              v -> D^{-1/2} v
-              G(D^{-1/2} v)
-              G(...) -> D^{-1/2} G(D^{-1/2} v)
+            Apply the GN operator G(v)
             Then add the Adam scaled-identity term: (1-λ)/η * v
         
-            The GN quadratic form G(D^{-1/2} v) is accumulated over microbatches
+            The GN quadratic form G(v) is accumulated over microbatches
             via lax.fori_loop so that XLA carries one parameter-sized accumulator.
             """
-
-            # Right preconditioning
-            preconditioned_v = apply_D_inv_sqrt(v)
 
             def gn_body(i, carry):
                 # Slice microbatch i from the full batch.
@@ -819,7 +816,7 @@ def main(argv):
                 #   J v        -> forward-mode JVP
                 #   H(J v)     -> Hessian-vector product in logit space
                 #   J^T H J v  -> transpose JVP
-                logits_v_mb = jvp_fn_mb(preconditioned_v)
+                logits_v_mb = jvp_fn_mb(v)
                 _, Hv_mb = jax.jvp(
                     grad_Ly_mb,
                     (logits0_mb,),
@@ -846,54 +843,58 @@ def main(argv):
                 gn_sum,
             )
 
-            # Left preconditioning: D^{-1/2} G D^{-1/2} v.
-            preconditioned_Gv = apply_D_inv_sqrt(Gv_param)
-
             # Add the Adam diagonal contribution: (1-λ)/η * I
             return jax.tree_util.tree_map(
-                lambda gv, vi: (
+                lambda gv, vi, second_moment: (
                     interpolation_lambda * gv
                     + (
                         (1.0 - interpolation_lambda)
                         / safe_adam_lr
-                    ) * vi
+                    )
+                    * (
+                        jnp.sqrt(second_moment / beta2_correction)
+                        + adam_eps
+                    )
+                    * vi
                 ),
-                preconditioned_Gv,
+                Gv_param,
                 v,
+                new_second_moment,
             )
 
-        # ── Run CG ────────────────────────────────────────────────────
+        # ── Run preconditioned CG ─────────────────────────────────────
         #
-        # Solve the symmetrically preconditioned system:
-        #   A_tilde y = -D_t^{-1/2} rhs
-        # where y lives in preconditioned space; x = D_t^{-1/2}y
-        
-        preconditioned_rhs = apply_D_inv_sqrt(rhs)
-        y, _ = cg(
+        # Solve the original interpolated system:
+        #
+        #     A_t x = rhs
+        #
+        # where
+        #
+        #     A_t = λ G + (1-λ)/η * D_t.
+        #
+        # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
+        x, _ = cg(
             Av,
-            preconditioned_rhs,
+            rhs,
             x0=cg_x0,
             tol=FLAGS.cg_tol,
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
+            M=apply_D_inv,
         )
 
         # Compute residual for logging 
-        # relative_residual = ||A_tilde y - rhs_tilde|| / ||rhs_tilde||
-        Ay = Av(y)
+        # relative_residual = ||A x - rhs|| / ||rhs||
         residual = jax.tree_util.tree_map(
-            lambda ay, rhs_leaf: ay - rhs_leaf,
-            Ay,
-            preconditioned_rhs,
+            lambda ax, rhs_leaf: ax - rhs_leaf,
+            Av(x),
+            rhs,
         )
-
+        
         residual_norm = global_norm(residual)
-        rhs_norm = global_norm(preconditioned_rhs)
+        rhs_norm = global_norm(rhs)
         relative_residual = residual_norm / (rhs_norm + 1e-12)
-
-        # Map the CG solution y back from preconditioned space to parameter space:
-        #   x = D_t^{-1/2} y
-        x = apply_D_inv_sqrt(y)
+        
 
         # ── Apply update with decoupled weight decay ──────────────────
         #
@@ -935,7 +936,7 @@ def main(argv):
             new_params,
             new_first_moment,
             new_second_moment,
-            y,              # returned for warm-starting next outer step's CG
+            x,              # returned for warm-starting next outer step's CG
             new_adam_step,
             rng_generator(),
             metrics,
