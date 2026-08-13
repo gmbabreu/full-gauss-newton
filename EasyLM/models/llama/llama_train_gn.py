@@ -1167,20 +1167,21 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
-        # Persistent Adam first and second moments for the CG path.
-        cg_first_moment = jax.tree_util.tree_map(
-            jnp.zeros_like,
-            train_state.params,
-        )
-        cg_second_moment = jax.tree_util.tree_map(
-            jnp.zeros_like,
-            train_state.params,
-        )
-        cg_adam_step = jnp.array(0, dtype=jnp.int32)
-        cg_x0 = jax.tree_util.tree_map(
-            jnp.zeros_like,
-            train_state.params,
-        )
+        if FLAGS.optimizer_type == "cg":
+            # Persistent Adam first and second moments for the CG path.
+            cg_first_moment = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+            cg_second_moment = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+            cg_adam_step = jnp.array(0, dtype=jnp.int32)
+            cg_x0 = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
 
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
@@ -1195,11 +1196,13 @@ def main(argv):
                     opt_state=tayl_solver.init(train_state.params)
                 )
 
-                # Equivalent reset for cg
-                cg_x0 = jax.tree_util.tree_map(
-                    jnp.zeros_like,
-                    train_state.params,
-                )
+                if FLAGS.optimizer_type == "cg":
+                    # Equivalent reset for cg
+                    cg_x0 = jax.tree_util.tree_map(
+                        jnp.zeros_like,
+                        train_state.params,
+                    )
+
 
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
