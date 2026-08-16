@@ -1025,6 +1025,36 @@ def main(argv):
 
     parallel_loss_fn = jax.jit(loss_fn)
 
+    def microbatched_loss_fn(params, batch, rng, n_micro):
+        """Evaluate loss by averaging over n_micro microbatches.
+        Uses a plain Python loop -- runs outside any JAX trace so no
+        fori_loop is needed. Each microbatch produces its own mean-normalized
+        loss; averaging recovers the full-batch loss for equal-sized splits.
+        Keeps per-evaluation peak tensor size proportional to mb_size,
+        not the full batch -- same principle as CG microbatching."""
+        if n_micro == 1:
+            loss, acc = parallel_loss_fn(params, batch, rng)
+            return float(jax.device_get(loss)), float(jax.device_get(acc))
+        batch_size = batch['input_tokens'].shape[0]
+        assert batch_size % n_micro == 0, (
+            f"Linesearch batch size {batch_size} must be divisible by cg_n_micro={n_micro}"
+        )
+        mb_size = batch_size // n_micro
+        total_loss = 0.0
+        total_acc  = 0.0
+        rng_key = rng
+        for i in range(n_micro):
+            rng_key, subrng = jax.random.split(rng_key)
+            mb = {
+                'input_tokens':  batch['input_tokens'][i*mb_size:(i+1)*mb_size],
+                'target_tokens': batch['target_tokens'][i*mb_size:(i+1)*mb_size],
+                'loss_masks':    batch['loss_masks'][i*mb_size:(i+1)*mb_size],
+            }
+            loss, acc = parallel_loss_fn(params, mb, subrng)
+            total_loss += float(jax.device_get(loss))
+            total_acc  += float(jax.device_get(acc))
+        return total_loss / n_micro, total_acc / n_micro
+
     def save_checkpoint(train_state, ema=None, milestone=False):
         step = int(jax.device_get(train_state.step))
         metadata = dict(
@@ -1226,7 +1256,7 @@ def main(argv):
                         )
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
                             accumulated_loss += loss
                         average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
                         print(f"step={step_size:.6f}  loss={average_loss:.6f}")
@@ -1250,7 +1280,7 @@ def main(argv):
                         )
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = parallel_loss_fn(updated_params, batch, subrng)
+                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
                             accumulated_loss += loss
                         average_loss = accumulated_loss / len(ls_batches)
                         losses.append((step_size, average_loss))
@@ -1278,7 +1308,7 @@ def main(argv):
                     ls_rngs.append(subrng)
                 baseline_loss = 0.0
                 for batch, subrng in zip(ls_batches, ls_rngs):
-                    bl, _ = parallel_loss_fn(base_params, batch, subrng)
+                    bl, _ = microbatched_loss_fn(base_params, batch, subrng, FLAGS.cg_n_micro)
                     baseline_loss += bl
                 baseline_loss = float(jax.device_get(baseline_loss / len(ls_batches)))
                 return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
