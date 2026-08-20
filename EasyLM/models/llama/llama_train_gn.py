@@ -112,6 +112,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     ls_lambdas='',
     fixed_step_size=0.0,
     ls_eval_batches=0,  # 0 means: default to inner_loop_iter
+    outer_momentum_beta=0.0,
     armijo_linesearch=False,
     adaptive_inner_loop=False,
     armijo_alpha=0.5,
@@ -1214,6 +1215,12 @@ def main(argv):
                 train_state.params,
             )
 
+        if FLAGS.optimizer_type == "cg" and FLAGS.outer_momentum_beta > 0.0:
+            outer_prev_update = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
@@ -1358,11 +1365,36 @@ def main(argv):
                     dir_norm_val = global_norm(dir)
                     dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
 
+                if FLAGS.outer_momentum_beta > 0.0:
+                    raw_dir_norm = global_norm(dir)
+                    prev_update_norm = global_norm(outer_prev_update)
+                    dir = jax.tree_util.tree_map(
+                        lambda d, prev: d + FLAGS.outer_momentum_beta * prev,
+                        dir,
+                        outer_prev_update,
+                    )
+
                 step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
                 effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
                 print("Step size:", effective_step_size)
 
-                updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size * y, train_state.params, dir)
+                if FLAGS.outer_momentum_beta > 0.0:
+                    accepted_update = jax.tree_util.tree_map(
+                        lambda d: effective_step_size * d,
+                        dir,
+                    )
+                    updated_params = jax.tree_util.tree_map(
+                        lambda p, u: p + u,
+                        train_state.params,
+                        accepted_update,
+                    )
+                    outer_prev_update = accepted_update
+                else:
+                    updated_params = jax.tree_util.tree_map(
+                        lambda p, d: p + effective_step_size * d,
+                        train_state.params,
+                        dir,
+                    )
                 train_state = train_state.replace(step=train_state.step + 1, params=updated_params)
 
                 metrics = dict(cg_metrics)
@@ -1376,6 +1408,13 @@ def main(argv):
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
                         "loss": baseline_loss,
+                        **({
+                            "raw_dir_norm": float(jax.device_get(raw_dir_norm)),
+                            "momentum_dir_norm": dir_norm,
+                            "prev_update_norm": float(jax.device_get(prev_update_norm)),
+                            "accepted_update_norm": float(jax.device_get(global_norm(accepted_update))),
+                            "outer_momentum_beta": FLAGS.outer_momentum_beta,
+                        } if FLAGS.outer_momentum_beta > 0.0 else {}),
                     }, step=step)
 
             elif FLAGS.adaptive_inner_loop and FLAGS.linesearch:
