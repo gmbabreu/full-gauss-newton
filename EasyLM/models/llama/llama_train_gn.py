@@ -957,11 +957,7 @@ def main(argv):
             lambda_balance_spec = (
                 d_spectral / (g_spectral + d_spectral + 1e-12)
             )
-            extra_operator_calls = jnp.asarray(
-                FLAGS.cg_matrix_norm_frobenius_probes
-                + FLAGS.cg_matrix_norm_power_iters,
-                dtype=jnp.int32,
-            )
+
             matrix_norm_metrics = {
                 'G_frob': g_frob,
                 'G_spectral': g_spectral,
@@ -975,7 +971,6 @@ def main(argv):
                 'G_D_ratio_spec': g_d_ratio_spec,
                 'cg_lambda_balance_frob': lambda_balance_frob,
                 'cg_lambda_balance_spec': lambda_balance_spec,
-                'cg_matrix_norm_extra_operator_calls': extra_operator_calls,
             }
             interpolation_lambda = jnp.asarray(
                 lambda_balance_spec,
