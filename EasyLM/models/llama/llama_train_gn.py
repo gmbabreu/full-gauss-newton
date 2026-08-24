@@ -132,6 +132,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_maxiter=100, # Maximum number of CG iterations
     cg_interpolation_lambda=1.0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
+    cg_log_matrix_norms=False,
+    cg_matrix_norm_frobenius_probes=4,
+    cg_matrix_norm_power_iters=8,
 )
 
 def get_gpu_memory():
@@ -760,17 +763,10 @@ def main(argv):
                 new_second_moment,
             )
 
-        # ── CG operator Av ────────────────────────────────
-        #
-        # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
-        # CG calls this repeatedly to solve A_t x = rhs.
-        def Av(v):
+        def apply_G(v):
             """
-            Apply the GN operator G(v)
-            Then add the Adam scaled-identity term: (1-λ)/η * v
-        
-            The GN quadratic form G(v) is accumulated over microbatches
-            via lax.fori_loop so that XLA carries one parameter-sized accumulator.
+            Apply the raw GN operator G(v), accumulating microbatches with a
+            parameter-sized lax.fori_loop carry.
             """
 
             def gn_body(i, carry):
@@ -843,7 +839,13 @@ def main(argv):
                 lambda x: x / n_micro,
                 gn_sum,
             )
+            return Gv_param
 
+        # ── CG operator Av ────────────────────────────────
+        # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
+        # CG calls this repeatedly to solve A_t x = rhs.
+        def Av(v):
+            Gv_param = apply_G(v)
             # Add the Adam diagonal contribution: (1-λ)/η * I
             return jax.tree_util.tree_map(
                 lambda gv, vi, second_moment: (
@@ -895,6 +897,143 @@ def main(argv):
         residual_norm = global_norm(residual)
         rhs_norm = global_norm(rhs)
         relative_residual = residual_norm / (rhs_norm + 1e-12)
+
+        matrix_norm_metrics = {}
+        if FLAGS.cg_log_matrix_norms:
+            assert FLAGS.cg_matrix_norm_frobenius_probes >= 1
+            assert FLAGS.cg_matrix_norm_power_iters >= 1
+
+            param_leaves, param_treedef = jax.tree_util.tree_flatten(params0)
+            num_param_leaves = len(param_leaves)
+
+            def diagnostic_tree_dot(left, right):
+                leaf_products = [
+                    jnp.sum(x.astype(jnp.float32) * y.astype(jnp.float32))
+                    for x, y in zip(
+                        jax.tree_util.tree_leaves(left),
+                        jax.tree_util.tree_leaves(right),
+                    )
+                ]
+                return jnp.sum(jnp.stack(leaf_products))
+
+            def diagnostic_tree_norm(tree):
+                return jnp.sqrt(jnp.maximum(diagnostic_tree_dot(tree, tree), 0.0))
+
+            def rademacher_tree(key):
+                keys = jax.random.split(key, num_param_leaves)
+                leaves = [
+                    jax.random.rademacher(key, leaf.shape, dtype=leaf.dtype)
+                    for key, leaf in zip(keys, param_leaves)
+                ]
+                return jax.tree_util.tree_unflatten(param_treedef, leaves)
+
+            diagnostic_rng = jax.random.PRNGKey(FLAGS.seed)
+            frobenius_rng, power_rng = jax.random.split(diagnostic_rng)
+
+            def frobenius_body(i, squared_norm_sum):
+                probe = rademacher_tree(jax.random.fold_in(frobenius_rng, i))
+                g_probe = apply_G(probe)
+                return squared_norm_sum + diagnostic_tree_dot(g_probe, g_probe)
+
+            g_frob_squared = jax.lax.fori_loop(
+                0,
+                FLAGS.cg_matrix_norm_frobenius_probes,
+                frobenius_body,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ) / jnp.asarray(
+                FLAGS.cg_matrix_norm_frobenius_probes, dtype=jnp.float32
+            )
+            g_frob = jnp.sqrt(jnp.maximum(g_frob_squared, 0.0))
+
+            power_vector = rademacher_tree(power_rng)
+            power_vector_norm = diagnostic_tree_norm(power_vector)
+            power_vector = jax.tree_util.tree_map(
+                lambda value: value / (power_vector_norm + 1e-12),
+                power_vector,
+            )
+
+            def power_body(_, vector):
+                g_vector = apply_G(vector)
+                g_vector_norm = diagnostic_tree_norm(g_vector)
+                return jax.tree_util.tree_map(
+                    lambda value: value / (g_vector_norm + 1e-12),
+                    g_vector,
+                )
+
+            power_vector = jax.lax.fori_loop(
+                0,
+                FLAGS.cg_matrix_norm_power_iters - 1,
+                power_body,
+                power_vector,
+            )
+            g_power_vector = apply_G(power_vector)
+            g_spectral = (
+                diagnostic_tree_dot(power_vector, g_power_vector)
+                / diagnostic_tree_dot(power_vector, power_vector)
+            )
+            power_residual = jax.tree_util.tree_map(
+                lambda gq, q: gq - g_spectral * q,
+                g_power_vector,
+                power_vector,
+            )
+            g_spectral_relative_residual = (
+                diagnostic_tree_norm(power_residual)
+                / (diagnostic_tree_norm(g_power_vector) + 1e-12)
+            )
+
+            adam_diag = jax.tree_util.tree_map(
+                lambda second_moment: (
+                    jnp.sqrt(second_moment.astype(jnp.float32) / beta2_correction)
+                    + adam_eps
+                ),
+                new_second_moment,
+            )
+            d_diag = jax.tree_util.tree_map(
+                lambda diagonal: diagonal / safe_adam_lr,
+                adam_diag,
+            )
+            d_leaves = jax.tree_util.tree_leaves(d_diag)
+            d_frob = jnp.sqrt(jnp.sum(jnp.stack([
+                jnp.sum(diagonal * diagonal) for diagonal in d_leaves
+            ])))
+            d_max_eig = jnp.max(jnp.stack([
+                jnp.max(diagonal) for diagonal in d_leaves
+            ]))
+            d_min_eig = jnp.min(jnp.stack([
+                jnp.min(diagonal) for diagonal in d_leaves
+            ]))
+            d_spectral = d_max_eig
+            d_condition = jnp.where(
+                d_min_eig > 0.0,
+                d_max_eig / d_min_eig,
+                jnp.asarray(jnp.inf, dtype=jnp.float32),
+            )
+            g_d_ratio_frob = g_frob / (d_frob + 1e-12)
+            g_d_ratio_spec = g_spectral / (d_spectral + 1e-12)
+            lambda_balance_frob = d_frob / (g_frob + d_frob + 1e-12)
+            lambda_balance_spec = (
+                d_spectral / (g_spectral + d_spectral + 1e-12)
+            )
+            extra_operator_calls = jnp.asarray(
+                FLAGS.cg_matrix_norm_frobenius_probes
+                + FLAGS.cg_matrix_norm_power_iters,
+                dtype=jnp.int32,
+            )
+            matrix_norm_metrics = {
+                'G_frob': g_frob,
+                'G_spectral': g_spectral,
+                'G_spectral_relative_residual': g_spectral_relative_residual,
+                'D_frob': d_frob,
+                'D_spectral': d_spectral,
+                'D_min_eig': d_min_eig,
+                'D_max_eig': d_max_eig,
+                'D_condition': d_condition,
+                'G_D_ratio_frob': g_d_ratio_frob,
+                'G_D_ratio_spec': g_d_ratio_spec,
+                'cg_lambda_balance_frob': lambda_balance_frob,
+                'cg_lambda_balance_spec': lambda_balance_spec,
+                'cg_matrix_norm_extra_operator_calls': extra_operator_calls,
+            }
         
 
         # ── Apply update with decoupled weight decay ──────────────────
@@ -931,6 +1070,7 @@ def main(argv):
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
             'adam_step': new_adam_step,
+            **matrix_norm_metrics,
         }
 
         return (
