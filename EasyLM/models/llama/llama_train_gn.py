@@ -840,64 +840,7 @@ def main(argv):
                 gn_sum,
             )
             return Gv_param
-
-        # ── CG operator Av ────────────────────────────────
-        # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
-        # CG calls this repeatedly to solve A_t x = rhs.
-        def Av(v):
-            Gv_param = apply_G(v)
-            # Add the Adam diagonal contribution: (1-λ)/η * I
-            return jax.tree_util.tree_map(
-                lambda gv, vi, second_moment: (
-                    interpolation_lambda * gv
-                    + (
-                        (1.0 - interpolation_lambda)
-                        / safe_adam_lr
-                    )
-                    * (
-                        jnp.sqrt(second_moment / beta2_correction)
-                        + adam_eps
-                    )
-                    * vi
-                ),
-                Gv_param,
-                v,
-                new_second_moment,
-            )
-
-        # ── Run preconditioned CG ─────────────────────────────────────
-        #
-        # Solve the original interpolated system:
-        #
-        #     A_t x = rhs
-        #
-        # where
-        #
-        #     A_t = λ G + (1-λ)/η * D_t.
-        #
-        # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
-        x, _ = cg(
-            Av,
-            rhs,
-            x0=cg_x0,
-            tol=FLAGS.cg_tol,
-            atol=FLAGS.cg_atol,
-            maxiter=FLAGS.cg_maxiter,
-            M=apply_D_inv,
-        )
-
-        # Compute residual for logging 
-        # relative_residual = ||A x - rhs|| / ||rhs||
-        residual = jax.tree_util.tree_map(
-            lambda ax, rhs_leaf: ax - rhs_leaf,
-            Av(x),
-            rhs,
-        )
         
-        residual_norm = global_norm(residual)
-        rhs_norm = global_norm(rhs)
-        relative_residual = residual_norm / (rhs_norm + 1e-12)
-
         matrix_norm_metrics = {}
         if FLAGS.cg_log_matrix_norms:
             assert FLAGS.cg_matrix_norm_frobenius_probes >= 1
@@ -1034,7 +977,68 @@ def main(argv):
                 'cg_lambda_balance_spec': lambda_balance_spec,
                 'cg_matrix_norm_extra_operator_calls': extra_operator_calls,
             }
+            interpolation_lambda = jnp.asarray(
+                lambda_balance_spec,
+                dtype=jnp.float32,
+            )
+
+
+        # ── CG operator Av ────────────────────────────────
+        # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
+        # CG calls this repeatedly to solve A_t x = rhs.
+        def Av(v):
+            Gv_param = apply_G(v)
+            # Add the Adam diagonal contribution: (1-λ)/η * I
+            return jax.tree_util.tree_map(
+                lambda gv, vi, second_moment: (
+                    interpolation_lambda * gv
+                    + (
+                        (1.0 - interpolation_lambda)
+                        / safe_adam_lr
+                    )
+                    * (
+                        jnp.sqrt(second_moment / beta2_correction)
+                        + adam_eps
+                    )
+                    * vi
+                ),
+                Gv_param,
+                v,
+                new_second_moment,
+            )
+
+        # ── Run preconditioned CG ─────────────────────────────────────
+        #
+        # Solve the original interpolated system:
+        #
+        #     A_t x = rhs
+        #
+        # where
+        #
+        #     A_t = λ G + (1-λ)/η * D_t.
+        #
+        # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
+        x, _ = cg(
+            Av,
+            rhs,
+            x0=cg_x0,
+            tol=FLAGS.cg_tol,
+            atol=FLAGS.cg_atol,
+            maxiter=FLAGS.cg_maxiter,
+            M=apply_D_inv,
+        )
+
+        # Compute residual for logging 
+        # relative_residual = ||A x - rhs|| / ||rhs||
+        residual = jax.tree_util.tree_map(
+            lambda ax, rhs_leaf: ax - rhs_leaf,
+            Av(x),
+            rhs,
+        )
         
+        residual_norm = global_norm(residual)
+        rhs_norm = global_norm(rhs)
+        relative_residual = residual_norm / (rhs_norm + 1e-12)        
 
         # ── Apply update with decoupled weight decay ──────────────────
         #
