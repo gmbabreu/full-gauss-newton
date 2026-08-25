@@ -973,7 +973,7 @@ def main(argv):
                 'cg_lambda_balance_spec': lambda_balance_spec,
             }
             interpolation_lambda = jnp.asarray(
-                lambda_balance_spec,
+                lambda_balance_spec*FLAGS.cg_interpolation_lambda,
                 dtype=jnp.float32,
             )
 
