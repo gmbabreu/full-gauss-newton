@@ -958,6 +958,10 @@ def main(argv):
                 d_spectral / (g_spectral + d_spectral + 1e-12)
             )
 
+            interpolation_lambda = jnp.asarray(
+                lambda_balance_spec*FLAGS.cg_interpolation_lambda,
+                dtype=jnp.float32,
+            )
             matrix_norm_metrics = {
                 'G_frob': g_frob,
                 'G_spectral': g_spectral,
@@ -970,12 +974,9 @@ def main(argv):
                 'G_D_ratio_frob': g_d_ratio_frob,
                 'G_D_ratio_spec': g_d_ratio_spec,
                 'cg_lambda_balance_frob': lambda_balance_frob,
-                'cg_lambda_balance_spec': lambda_balance_spec,
+                'cg_lambda_balance_spec': interpolation_lambda,
             }
-            interpolation_lambda = jnp.asarray(
-                lambda_balance_spec*FLAGS.cg_interpolation_lambda,
-                dtype=jnp.float32,
-            )
+
 
 
         # ── CG operator Av ────────────────────────────────
