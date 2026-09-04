@@ -135,6 +135,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_log_matrix_norms=False,
     cg_matrix_norm_frobenius_probes=4,
     cg_matrix_norm_power_iters=8,
+
+    muon_interpolated_system=False,
+    muon_interpolation_lambda=0.2,
 )
 
 def get_gpu_memory():
@@ -188,6 +191,52 @@ def get_tpu_metrics():
 
 
 def main(argv):
+    if (
+        FLAGS.muon_interpolated_system
+        and not 0.0 <= FLAGS.muon_interpolation_lambda <= 1.0
+    ):
+        raise ValueError("muon_interpolation_lambda must be in [0, 1]")
+    if FLAGS.muon_interpolated_system and FLAGS.optimizer_type != 'muon':
+        raise ValueError("muon_interpolated_system requires optimizer_type='muon'")
+
+    muon_interpolated_enabled = (
+        FLAGS.optimizer_type == 'muon' and FLAGS.muon_interpolated_system
+    )
+    if muon_interpolated_enabled:
+        if not FLAGS.gauss_newton:
+            raise ValueError("muon_interpolated_system requires gauss_newton=True")
+        if not FLAGS.single_batch_inner:
+            raise ValueError(
+                "muon_interpolated_system requires single_batch_inner=True "
+                "so the batch and GN operator stay fixed during each solve"
+            )
+        if FLAGS.adaptive_inner_loop:
+            raise ValueError(
+                "muon_interpolated_system does not support adaptive_inner_loop"
+            )
+        if FLAGS.optimizer.type != 'adamw':
+            raise ValueError(
+                "muon_interpolated_system requires optimizer.type='adamw' "
+                "for the Adam moment hyperparameters and learning-rate schedule"
+            )
+        nonzero_weight_decay = {
+            'inner_loop_wd': FLAGS.inner_loop_wd,
+            'optimizer_wd': FLAGS.optimizer_wd,
+            'optimizer.adamw_optimizer.weight_decay': (
+                FLAGS.optimizer.adamw_optimizer.weight_decay
+            ),
+        }
+        nonzero_weight_decay = {
+            name: value
+            for name, value in nonzero_weight_decay.items()
+            if value != 0.0
+        }
+        if nonzero_weight_decay:
+            raise ValueError(
+                "muon_interpolated_system requires zero weight decay; got "
+                f"{nonzero_weight_decay}"
+            )
+
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
@@ -230,6 +279,25 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+    if muon_interpolated_enabled:
+        stochastic_model_rates = {
+            'embedding_dropout': llama_config.embedding_dropout,
+            'feedforward_dropout': llama_config.feedforward_dropout,
+            'attention_dropout': llama_config.attention_dropout,
+            'residue_dropout': llama_config.residue_dropout,
+            'fcm_min_ratio': llama_config.fcm_min_ratio,
+            'fcm_max_ratio': llama_config.fcm_max_ratio,
+        }
+        stochastic_model_rates = {
+            name: value
+            for name, value in stochastic_model_rates.items()
+            if value != 0.0
+        }
+        if stochastic_model_rates:
+            raise ValueError(
+                "muon_interpolated_system requires deterministic model settings; "
+                f"got {stochastic_model_rates}"
+            )
 
     model = FlaxLLaMAForCausalLMModule(
         llama_config,
@@ -434,6 +502,234 @@ def main(argv):
     def create_trainstate_from_params(params):
         return CustomTrainState.create(params=params, tx=tayl_solver, apply_fn=None)
 
+    def compute_muon_outer_gradient(params0, batch):
+        """Compute the fixed full-batch gradient used by one interpolated solve."""
+        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        n_micro = FLAGS.cg_n_micro
+        batch_size = batch_['input_tokens'].shape[0]
+        assert n_micro >= 1 and batch_size % n_micro == 0
+        mb_size = batch_size // n_micro
+
+        def gradient_body(i, carry):
+            start = i * mb_size
+            input_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['input_tokens'], start, mb_size, axis=0
+            )
+            target_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['target_tokens'], start, mb_size, axis=0
+            )
+            mask_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['loss_masks'], start, mb_size, axis=0
+            )
+
+            def f_mb(p):
+                return model.apply(p, input_mb, deterministic=True).logits
+
+            def scalar_loss_mb(logits):
+                loss, _ = cross_entropy_loss_and_accuracy(
+                    logits, target_mb, mask_mb
+                )
+                return loss
+
+            logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+            logit_gradient = jax.grad(scalar_loss_mb)(logits0_mb)
+            (gradient_mb,) = linear_transpose(jvp_fn_mb, params0)(logit_gradient)
+            return jax.tree_util.tree_map(
+                lambda total, contribution: total + contribution,
+                carry,
+                gradient_mb,
+            )
+
+        gradient_sum = jax.lax.fori_loop(
+            0,
+            n_micro,
+            gradient_body,
+            jax.tree_util.tree_map(jnp.zeros_like, params0),
+        )
+        return jax.tree_util.tree_map(
+            lambda value: value / n_micro,
+            gradient_sum,
+        )
+
+    def apply_muon_G_t(params0, x, batch):
+        """Apply the fixed matrix-free GN operator to a model-space offset."""
+        batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        n_micro = FLAGS.cg_n_micro
+        batch_size = batch_['input_tokens'].shape[0]
+        assert n_micro >= 1 and batch_size % n_micro == 0
+        mb_size = batch_size // n_micro
+
+        def gauss_newton_body(i, carry):
+            start = i * mb_size
+            input_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['input_tokens'], start, mb_size, axis=0
+            )
+            target_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['target_tokens'], start, mb_size, axis=0
+            )
+            mask_mb = jax.lax.dynamic_slice_in_dim(
+                batch_['loss_masks'], start, mb_size, axis=0
+            )
+
+            def f_mb(p):
+                return model.apply(p, input_mb, deterministic=True).logits
+
+            def scalar_loss_mb(logits):
+                loss, _ = cross_entropy_loss_and_accuracy(
+                    logits, target_mb, mask_mb
+                )
+                return loss
+
+            logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+            grad_on_logits = jax.grad(scalar_loss_mb)
+            _, hessian_times_jx = jax.jvp(
+                grad_on_logits,
+                (logits0_mb,),
+                (jvp_fn_mb(x),),
+            )
+            (G_x_mb,) = linear_transpose(jvp_fn_mb, params0)(hessian_times_jx)
+            return jax.tree_util.tree_map(
+                lambda total, contribution: total + contribution,
+                carry,
+                G_x_mb,
+            )
+
+        G_x_sum = jax.lax.fori_loop(
+            0,
+            n_micro,
+            gauss_newton_body,
+            jax.tree_util.tree_map(jnp.zeros_like, params0),
+        )
+        return jax.tree_util.tree_map(
+            lambda value: value / n_micro,
+            G_x_sum,
+        )
+
+    def direct_muon_residual_terms(
+        params, params0, batch, adam_first_moment_hat,
+        adam_second_moment_hat, adam_learning_rate,
+    ):
+        """Assemble the direct-x interpolated residual after microbatch averaging."""
+        x = jax.tree_util.tree_map(lambda p, p0: p - p0, params, params0)
+        G_x = apply_muon_G_t(params0, x, batch)
+        lambda_ = jnp.asarray(FLAGS.muon_interpolation_lambda, dtype=jnp.float32)
+        adam_epsilon = jnp.asarray(1e-8, dtype=jnp.float32)
+        adam_diagonal = jax.tree_util.tree_map(
+            lambda second_moment: (
+                jnp.sqrt(second_moment) + adam_epsilon
+            ) / adam_learning_rate,
+            adam_second_moment_hat,
+        )
+        D_x = jax.tree_util.tree_map(
+            lambda diagonal, offset: diagonal * offset,
+            adam_diagonal,
+            x,
+        )
+        residual = jax.tree_util.tree_map(
+            lambda gx, dx, m_hat: (
+                lambda_ * gx + (1.0 - lambda_) * dx + m_hat
+            ),
+            G_x,
+            D_x,
+            adam_first_moment_hat,
+        )
+        return x, G_x, D_x, residual, lambda_
+
+    def prepare_muon_interpolated_system(
+        params0, first_moment, second_moment, adam_step, outer_step, batch,
+    ):
+        """Update and bias-correct the Adam statistics once per outer step."""
+        gradient = compute_muon_outer_gradient(params0, batch)
+        beta1 = jnp.asarray(
+            FLAGS.optimizer.adamw_optimizer.b1, dtype=jnp.float32
+        )
+        beta2 = jnp.asarray(
+            FLAGS.optimizer.adamw_optimizer.b2, dtype=jnp.float32
+        )
+        new_first_moment = jax.tree_util.tree_map(
+            lambda moment, grad: beta1 * moment + (1.0 - beta1) * grad,
+            first_moment,
+            gradient,
+        )
+        new_second_moment = jax.tree_util.tree_map(
+            lambda moment, grad: beta2 * moment + (1.0 - beta2) * jnp.square(grad),
+            second_moment,
+            gradient,
+        )
+        new_adam_step = adam_step + 1
+        beta1_correction = 1.0 - jnp.power(beta1, new_adam_step)
+        beta2_correction = 1.0 - jnp.power(beta2, new_adam_step)
+        adam_first_moment_hat = jax.tree_util.tree_map(
+            lambda moment: moment / beta1_correction,
+            new_first_moment,
+        )
+        # The first local correction gives m_hat=g; later lambda=1 keeps the EMA RHS.
+        adam_second_moment_hat = jax.tree_util.tree_map(
+            lambda moment: moment / beta2_correction,
+            new_second_moment,
+        )
+        adam_learning_rate = adamw_lr_schedule(outer_step)
+        mhat_difference = jax.tree_util.tree_map(
+            lambda m_hat, grad: m_hat - grad,
+            adam_first_moment_hat,
+            gradient,
+        )
+        mhat_vs_gradient_relative_error = (
+            global_norm(mhat_difference)
+            / jnp.maximum(global_norm(gradient), jnp.asarray(1e-12, jnp.float32))
+        )
+        return (
+            new_first_moment,
+            new_second_moment,
+            adam_first_moment_hat,
+            adam_second_moment_hat,
+            new_adam_step,
+            adam_learning_rate,
+            mhat_vs_gradient_relative_error,
+        )
+
+    def evaluate_muon_interpolated_system(
+        params, params0, batch, adam_first_moment_hat,
+        adam_second_moment_hat, adam_learning_rate,
+        mhat_vs_gradient_relative_error, gv_calls,
+    ):
+        """Evaluate the final direct-x residual without changing solver state."""
+        x, G_x, D_x, residual, lambda_ = direct_muon_residual_terms(
+            params,
+            params0,
+            batch,
+            adam_first_moment_hat,
+            adam_second_moment_hat,
+            adam_learning_rate,
+        )
+        residual_norm = global_norm(residual)
+        rhs_norm = global_norm(adam_first_moment_hat)
+        relative_residual = residual_norm / jnp.maximum(
+            rhs_norm, jnp.asarray(1e-12, jnp.float32)
+        )
+        G_x_norm = global_norm(G_x)
+        D_x_norm = global_norm(D_x)
+        return {
+            'gradient_norm': residual_norm,
+            'b_norm': rhs_norm,
+            'relative_residual': relative_residual,
+            'param_norm': global_norm(params),
+            'muon_interpolated_lambda': lambda_,
+            'muon_interpolated_relative_residual': relative_residual,
+            'muon_interpolated_residual_norm': residual_norm,
+            'muon_interpolated_rhs_norm': rhs_norm,
+            'muon_interpolated_x_norm': global_norm(x),
+            'muon_interpolated_gx_norm': G_x_norm,
+            'muon_interpolated_dx_norm': D_x_norm,
+            'muon_interpolated_g_term_norm': lambda_ * G_x_norm,
+            'muon_interpolated_d_term_norm': (1.0 - lambda_) * D_x_norm,
+            'muon_interpolated_adam_lr': adam_learning_rate,
+            'muon_interpolated_gv_calls': gv_calls,
+            'muon_interpolated_mhat_vs_gradient_relative_error': (
+                mhat_vs_gradient_relative_error
+            ),
+        }
+
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
@@ -481,7 +777,45 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
-    def train_step_gauss_newton(train_state, params0, rng, batch, wd, is_last_step):
+    def train_step_gauss_newton(
+        train_state, params0, rng, batch, wd, is_last_step,
+        adam_first_moment_hat=None, adam_second_moment_hat=None,
+        adam_learning_rate=None,
+    ):
+        if muon_interpolated_enabled:
+            rng_generator = JaxRNG(rng)
+            x, G_x, D_x, residual, lambda_ = direct_muon_residual_terms(
+                train_state.params,
+                params0,
+                batch,
+                adam_first_moment_hat,
+                adam_second_moment_hat,
+                adam_learning_rate,
+            )
+            quadratic_loss = (
+                0.5 * lambda_ * tree_dot(x, G_x)
+                + 0.5 * (1.0 - lambda_) * tree_dot(x, D_x)
+                + tree_dot(adam_first_moment_hat, x)
+            )
+            residual_norm = global_norm(residual)
+            rhs_norm = global_norm(adam_first_moment_hat)
+            train_state = train_state.apply_gradients(grads=residual)
+            metrics = dict(
+                linear_model_loss=quadratic_loss,
+                perplexity=jnp.exp(quadratic_loss),
+                accuracy=jnp.int32(0),
+                learning_rate=lr_sched(train_state.step),
+                gradient_norm=residual_norm,
+                b_norm=rhs_norm,
+                relative_residual=(
+                    residual_norm
+                    / jnp.maximum(rhs_norm, jnp.asarray(1e-12, jnp.float32))
+                ),
+                param_norm=global_norm(train_state.params),
+                gpu_memory=get_gpu_memory()[0],
+            )
+            return train_state, rng_generator(), metrics
+
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
@@ -1116,12 +1450,29 @@ def main(argv):
     )
 
     if FLAGS.gauss_newton and FLAGS.optimizer_type != 'cg':
-        sharded_train_step = pjit(
-            train_step_gauss_newton,
-            in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS(), PS()),
-            out_shardings=(train_state_partition, PS(), PS()),
-            # donate_argnums=(0, 1),
-        )
+        if muon_interpolated_enabled:
+            sharded_train_step = pjit(
+                train_step_gauss_newton,
+                in_shardings=(
+                    train_state_partition,
+                    train_state_partition.params,
+                    PS(),
+                    batch_partition,
+                    PS(),
+                    PS(),
+                    train_state_partition.params,
+                    train_state_partition.params,
+                    PS(),
+                ),
+                out_shardings=(train_state_partition, PS(), PS()),
+            )
+        else:
+            sharded_train_step = pjit(
+                train_step_gauss_newton,
+                in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS(), PS()),
+                out_shardings=(train_state_partition, PS(), PS()),
+                # donate_argnums=(0, 1),
+            )
     elif not FLAGS.gauss_newton:
 
         sharded_train_step = pjit(
@@ -1156,6 +1507,42 @@ def main(argv):
                 PS(),                          # metrics
             ),
             donate_argnums=(1, 2, 3),
+        )
+    if muon_interpolated_enabled:
+        sharded_prepare_muon_interpolated_system = pjit(
+            prepare_muon_interpolated_system,
+            in_shardings=(
+                train_state_partition.params,
+                train_state_partition.params,
+                train_state_partition.params,
+                PS(),
+                PS(),
+                batch_partition,
+            ),
+            out_shardings=(
+                train_state_partition.params,
+                train_state_partition.params,
+                train_state_partition.params,
+                train_state_partition.params,
+                PS(),
+                PS(),
+                PS(),
+            ),
+            donate_argnums=(1, 2),
+        )
+        sharded_evaluate_muon_interpolated_system = pjit(
+            evaluate_muon_interpolated_system,
+            in_shardings=(
+                train_state_partition.params,
+                train_state_partition.params,
+                batch_partition,
+                train_state_partition.params,
+                train_state_partition.params,
+                PS(),
+                PS(),
+                PS(),
+            ),
+            out_shardings=PS(),
         )
     sharded_eval_step = pjit(
         eval_step,
@@ -1355,6 +1742,18 @@ def main(argv):
                 train_state.params,
             )
 
+        if muon_interpolated_enabled:
+            # Keep interpolation moments process-local without changing checkpoints.
+            muon_first_moment = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+            muon_second_moment = jax.tree_util.tree_map(
+                jnp.zeros_like,
+                train_state.params,
+            )
+            muon_adam_step = jnp.array(0, dtype=jnp.int32)
+
         if FLAGS.optimizer_type == "cg" and FLAGS.outer_momentum_beta > 0.0:
             outer_prev_update = jax.tree_util.tree_map(
                 jnp.zeros_like,
@@ -1462,6 +1861,35 @@ def main(argv):
 
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = next(dataset)
+
+            muon_gv_calls = 0
+            if muon_interpolated_enabled:
+                muon_system_batch = jax.tree.map(
+                    lambda value: jax.lax.with_sharding_constraint(
+                        value, PS(('dp', 'fsdp'))
+                    ),
+                    single_batch_,
+                )
+                (
+                    muon_first_moment,
+                    muon_second_moment,
+                    muon_first_moment_hat,
+                    muon_second_moment_hat,
+                    muon_adam_step,
+                    muon_adam_learning_rate,
+                    muon_mhat_vs_gradient_relative_error,
+                ) = sharded_prepare_muon_interpolated_system(
+                    train_state.params,
+                    muon_first_moment,
+                    muon_second_moment,
+                    muon_adam_step,
+                    train_state.step,
+                    muon_system_batch,
+                )
+                if float(jax.device_get(muon_adam_learning_rate)) <= 0.0:
+                    raise ValueError(
+                        "muon_interpolated_system requires a positive Adam learning rate"
+                    )
 
             ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536,1792, 2048, 2560]
             if FLAGS.optimizer_type == 'cg':
@@ -1661,9 +2089,24 @@ def main(argv):
                         batch_
                     )
                     is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
-                    inner_state, sharded_rng, metrics = sharded_train_step(
-                        inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
-                    )
+                    if muon_interpolated_enabled:
+                        muon_gv_calls += 1
+                        inner_state, sharded_rng, metrics = sharded_train_step(
+                            inner_state,
+                            train_state.params,
+                            sharded_rng,
+                            muon_system_batch,
+                            FLAGS.inner_loop_wd,
+                            is_last_step,
+                            muon_first_moment_hat,
+                            muon_second_moment_hat,
+                            muon_adam_learning_rate,
+                        )
+                    else:
+                        inner_state, sharded_rng, metrics = sharded_train_step(
+                            inner_state, train_state.params, sharded_rng, batch,
+                            FLAGS.inner_loop_wd, is_last_step
+                        )
                     if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
@@ -1678,31 +2121,62 @@ def main(argv):
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
 
-                if FLAGS.linesearch:
-                    ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
-                        sharded_rng, train_state.params, dataset
+                if muon_interpolated_enabled:
+                    interpolation_metrics = sharded_evaluate_muon_interpolated_system(
+                        inner_state.params,
+                        train_state.params,
+                        muon_system_batch,
+                        muon_first_moment_hat,
+                        muon_second_moment_hat,
+                        muon_adam_learning_rate,
+                        muon_mhat_vs_gradient_relative_error,
+                        jnp.asarray(muon_gv_calls + 1, dtype=jnp.int32),
                     )
-                    if exit_flag:
-                        break
-                    print(f"\nTrue model loss: {baseline_loss:.6f}")
+                    metrics.update(interpolation_metrics)
 
+                if FLAGS.linesearch:
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
                     if FLAGS.normalize_step:
                         dir_norm_val = global_norm(dir)
                         dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
 
-                    step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
-
-                    effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                    if muon_interpolated_enabled and FLAGS.fixed_step_size > 0.0:
+                        # A fixed accepted scale does not need candidate loss evaluations.
+                        effective_step_size = FLAGS.fixed_step_size
+                        losses = []
+                        baseline_loss = None
+                    else:
+                        (
+                            ls_batches,
+                            ls_rngs,
+                            sharded_rng,
+                            baseline_loss,
+                            exit_flag,
+                        ) = pull_ls_batches_and_baseline(
+                            sharded_rng, train_state.params, dataset
+                        )
+                        if exit_flag:
+                            break
+                        print(f"\nTrue model loss: {baseline_loss:.6f}")
+                        step_size, losses = run_linesearch(
+                            train_state.params, dir, ls_batches, ls_rngs
+                        )
+                        effective_step_size = (
+                            FLAGS.fixed_step_size
+                            if FLAGS.fixed_step_size > 0.0
+                            else step_size
+                        )
                     print("Step size:", effective_step_size)
                     dir_norm = float(jax.device_get(global_norm(dir)))
-                    wandb.log({
+                    linesearch_log = {
                         "step_size": effective_step_size,
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "loss": baseline_loss,
-                        }, step=step)
+                    }
+                    if baseline_loss is not None:
+                        linesearch_log["loss"] = baseline_loss
+                    wandb.log(linesearch_log, step=step)
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
                         loss_improvement = baseline_loss - float(jax.device_get(_loss))
