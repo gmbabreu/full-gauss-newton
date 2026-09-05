@@ -43,6 +43,10 @@ from EasyLM.gcs_utils import (
     upload_to_gcs, load_first_n_files_from_gcs, 
     modify_dataset_info_gcs, modify_state_json_gcs
 )
+from EasyLM.outer_decay import (
+    commit_outer_update, construct_outer_candidate, muon_matrix_mask, outer_update_stats,
+    restore_inner_solver_state, run_outer_linesearch, selected_matrix_descriptions,
+)
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
@@ -86,6 +90,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_clip_gradient=0.0,
     optimizer_wd=0.0,
     parameter_wd=0.0,  # Dead flag
+    outer_weight_decay=0.0,  # dimensionless fractional shrink per outer update
+    log_outer_update_stats=False,
 
     wandb_run_id='',
     start_tokens=0,
@@ -146,6 +152,23 @@ def get_gpu_memory():
     except Exception:
         return [0]
 
+
+def get_optax_schedule_counters(opt_state):
+    """Return schedule counters embedded in Optax state without transferring them."""
+    counters = []
+    def visit(value):
+        if type(value).__name__ == 'ScaleByScheduleState':
+            counters.append(value.count)
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+    visit(opt_state)
+    return counters
+
 def is_embedding_param(param_name, param_value):
     if 'embedding' in param_name:
         return True
@@ -189,6 +212,17 @@ def get_tpu_metrics():
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
+        raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")
+    if FLAGS.outer_weight_decay and not (
+        FLAGS.optimizer_type == 'muon' and FLAGS.gauss_newton
+        and not FLAGS.adaptive_inner_loop
+    ):
+        raise ValueError(
+            "nonzero outer_weight_decay is supported only for ordinary, "
+            "non-adaptive Muon--GN"
+        )
 
     output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
@@ -1230,6 +1264,7 @@ def main(argv):
     with mesh:
         print(mesh)
         train_state, restored_params = None, None
+        restored_full_train_state = False
         warmstart_params = None
         if FLAGS.load_checkpoint != '':
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
@@ -1253,8 +1288,9 @@ def main(argv):
                     print('\tstart tokens:', start_tokens)
 
             if train_state is not None: # do this in both cases
+                restored_full_train_state = True
                 opt_state = train_state.opt_state
-                if train_state.warmstart_params:
+                if train_state.warmstart_params is not None:
                     warmstart_params = train_state.warmstart_params
 
         if train_state is None and restored_params is None:
@@ -1337,7 +1373,17 @@ def main(argv):
 
 
         inner_state = create_trainstate_from_params(train_state.params)
+        # Full checkpoints carry stateful Muon moments and schedule counters.
+        # Parameter-only warmup checkpoints intentionally initialize fresh state.
+        inner_state = restore_inner_solver_state(
+            inner_state, train_state, restored_full_train_state, FLAGS.reset_start)
         dataset = iter(dataset)
+
+        outer_decay_mask = muon_matrix_mask(train_state.params)
+        if FLAGS.outer_weight_decay or FLAGS.log_outer_update_stats:
+            print("Outer decay Muon matrices (name, shape):", flush=True)
+            for name, shape in selected_matrix_descriptions(train_state.params, outer_decay_mask):
+                print(f"  {name}: {shape}", flush=True)
 
         if FLAGS.optimizer_type == "cg":
             # Persistent Adam first and second moments for the CG path.
@@ -1389,51 +1435,25 @@ def main(argv):
             # Shared helpers, factored out of the original inline linesearch code
             # so the adaptive and non-adaptive paths use identical math.
             # ------------------------------------------------------------------
+            def outer_candidate(base_params, direction, alpha):
+                return construct_outer_candidate(
+                    base_params, direction, alpha, FLAGS.outer_weight_decay,
+                    outer_decay_mask,
+                )
+
             def run_linesearch(base_params, dir, ls_batches, ls_rngs, init_step=None):
-                losses = []
-                if FLAGS.armijo_linesearch:
-                    step_size = init_step if init_step is not None else FLAGS.armijo_init_step
-                    best_loss = float("inf")
-                    best_step_size = step_size
-                    patience = FLAGS.patience
-                    bad = 0
-                    while step_size > 1e-6:
-                        updated_params = jax.tree_util.tree_map(
-                            lambda x, y: x + step_size * y, base_params, dir
-                        )
-                        accumulated_loss = 0.0
-                        for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
-                            accumulated_loss += loss
-                        average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
-                        print(f"step={step_size:.6f}  loss={average_loss:.6f}")
-                        losses.append((step_size, average_loss))
-                        if average_loss < best_loss:
-                            best_loss = average_loss
-                            best_step_size = step_size
-                            bad = 0
-                        else:
-                            bad += 1
-                        if bad >= patience:
-                            break
-                        step_size *= FLAGS.armijo_beta
-                    step_size = best_step_size
-                    print(f"Chosen step size: {step_size:.6f}\n")
-                else:
-                    ls_candidates = [1 / jnp.sqrt(2) ** i for i in range(FLAGS.ls_range)]
-                    for step_size in ls_candidates:
-                        updated_params = jax.tree_util.tree_map(
-                            lambda x, y: x + step_size * y, base_params, dir
-                        )
-                        accumulated_loss = 0.0
-                        for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
-                            accumulated_loss += loss
-                        average_loss = accumulated_loss / len(ls_batches)
-                        losses.append((step_size, average_loss))
-                    step_size, _ = min(losses, key=lambda x: x[1])
-                    step_size = jax.device_get(step_size)
-                return step_size, losses
+                def evaluate(candidate_params, batch, subrng):
+                    loss, _ = microbatched_loss_fn(
+                        candidate_params, batch, subrng, FLAGS.cg_n_micro)
+                    return loss
+                return run_outer_linesearch(
+                    base_params, dir, ls_batches, ls_rngs, evaluate, outer_candidate,
+                    armijo=FLAGS.armijo_linesearch,
+                    candidates=[1 / jnp.sqrt(2) ** i for i in range(FLAGS.ls_range)],
+                    init_step=(init_step if init_step is not None
+                               else FLAGS.armijo_init_step),
+                    beta=FLAGS.armijo_beta, patience=FLAGS.patience,
+                )
 
             def pull_ls_batches_and_baseline(sharded_rng, base_params, dataset):
                 exit_flag = False
@@ -1651,6 +1671,10 @@ def main(argv):
 
             else:
                 # ---------------- Existing (non-adaptive) behavior, unchanged math ----------------
+                outer_params_before = train_state.params
+                first_inner_schedule_counter = None
+                first_inner_applied_lr = None
+                first_optax_schedule_counter = None
                 for i in range(FLAGS.inner_loop_iter):
                     if FLAGS.single_batch_inner:
                         batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
@@ -1661,6 +1685,18 @@ def main(argv):
                         batch_
                     )
                     is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
+                    schedule_counter = inner_state.step
+                    optax_counters = get_optax_schedule_counters(inner_state.opt_state)
+                    optax_schedule_counter = (
+                        optax_counters[0] if optax_counters else schedule_counter)
+                    applied_lr = lr_sched(optax_schedule_counter)
+                    if i == 0:
+                        first_inner_schedule_counter = schedule_counter
+                        first_optax_schedule_counter = optax_schedule_counter
+                        first_inner_applied_lr = applied_lr
+                    last_inner_schedule_counter = schedule_counter
+                    last_optax_schedule_counter = optax_schedule_counter
+                    last_inner_applied_lr = applied_lr
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                     )
@@ -1674,7 +1710,8 @@ def main(argv):
                         log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         log_metrics['inner_learning_rate'] = metrics['learning_rate']
                         wandb.log(log_metrics)
-                    if FLAGS.weight_average and not FLAGS.linesearch:
+                    if (FLAGS.weight_average and not FLAGS.linesearch
+                            and FLAGS.outer_weight_decay == 0.0):
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
 
@@ -1702,6 +1739,10 @@ def main(argv):
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
                         "loss": baseline_loss,
+                        "outer/line_search_batches": len(ls_batches),
+                        "outer/line_search_tokens": (
+                            len(ls_batches) * FLAGS.train_dataset_batch_size * seq_length
+                        ),
                         }, step=step)
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
@@ -1711,22 +1752,66 @@ def main(argv):
                             "global_step": step,
                         }, step=step)
 
-                    updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
-                    train_state = train_state.replace(
-                        step=train_state.step+1,
-                        opt_state=inner_state.opt_state,
-                        params=updated_params,
-                        warmstart_params=inner_state.params,
+                    updated_params = outer_candidate(train_state.params, dir, effective_step_size)
+                    # fixed_step_size can differ from every searched candidate.
+                    accepted_loss = next(
+                        (loss for scale, loss in losses
+                         if abs(float(scale) - float(effective_step_size)) < 1e-12),
+                        None,
                     )
+                    if accepted_loss is None:
+                        accepted_loss = 0.0
+                        for ls_batch, ls_rng in zip(ls_batches, ls_rngs):
+                            loss, _ = microbatched_loss_fn(
+                                updated_params, ls_batch, ls_rng, FLAGS.cg_n_micro)
+                            accepted_loss += loss
+                        accepted_loss = accepted_loss / len(ls_batches)
+                    wandb.log({"outer/accepted_candidate_loss": accepted_loss}, step=step)
+                    train_state = commit_outer_update(
+                        train_state, inner_state, dir, effective_step_size,
+                        FLAGS.outer_weight_decay, outer_decay_mask)
                     if FLAGS.weight_average:
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
                 else:
-                    train_state = train_state.replace(
-                        step=train_state.step+1,
-                        opt_state=inner_state.opt_state,
-                        params=inner_state.params
+                    dir = jax.tree_util.tree_map(
+                        lambda inner, outer: inner - outer,
+                        inner_state.params, train_state.params,
                     )
+                    effective_step_size = 1.0
+                    if FLAGS.outer_weight_decay == 0.0:
+                        # Preserve the historical no-search expression bit-for-bit.
+                        updated_params = inner_state.params
+                    else:
+                        updated_params = outer_candidate(train_state.params, dir, 1.0)
+                    if FLAGS.outer_weight_decay == 0.0:
+                        train_state = train_state.replace(
+                            step=train_state.step+1, opt_state=inner_state.opt_state,
+                            params=updated_params, warmstart_params=inner_state.params)
+                    else:
+                        train_state = commit_outer_update(
+                            train_state, inner_state, dir, 1.0,
+                            FLAGS.outer_weight_decay, outer_decay_mask)
+                    if FLAGS.weight_average and FLAGS.outer_weight_decay != 0.0:
+                        alpha = FLAGS.weight_average_decay
+                        ema = jax.tree_util.tree_map(
+                            lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
+
+                if FLAGS.log_outer_update_stats:
+                    outer_metrics = outer_update_stats(
+                        outer_params_before,
+                        dir, updated_params, effective_step_size,
+                        FLAGS.outer_weight_decay, outer_decay_mask,
+                    )
+                    outer_metrics.update({
+                        "outer/inner_lr_first": first_inner_applied_lr,
+                        "outer/inner_lr_last": last_inner_applied_lr,
+                        "outer/inner_schedule_counter_first": first_inner_schedule_counter,
+                        "outer/inner_schedule_counter_last": last_inner_schedule_counter,
+                        "outer/inner_optax_schedule_counter_first": first_optax_schedule_counter,
+                        "outer/inner_optax_schedule_counter_last": last_optax_schedule_counter,
+                    })
+                    wandb.log(jax.device_get(outer_metrics), step=step)
        
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"global_step": step}
