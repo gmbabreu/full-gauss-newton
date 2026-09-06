@@ -1732,6 +1732,7 @@ def main(argv):
                 log_metrics = {"global_step": step}
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
+                log_metrics["param_norm"] = global_norm(train_state.params)
                 # log_metrics.update(dataset_metrics)
                 # Token consumption logging (distinct tokens only)
                 batches_per_step = 1 if FLAGS.single_batch_inner else FLAGS.inner_loop_iter
