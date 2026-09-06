@@ -1348,11 +1348,13 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
-        outer_decay_mask = unflatten_dict({
+        muon_matrix_mask = unflatten_dict({
             name: w.ndim == 2 and name not in (
                 'params.transformer.wte.embedding', 'params.lm_head.kernel')
             for name, w in flatten_dict(train_state.params, sep='.').items()
         }, sep='.')
+        outer_decay_mask = jax.tree.map(
+            lambda w: w.ndim == 2, train_state.params)
 
         def apply_outer_decay(base, candidate):
             if FLAGS.outer_weight_decay == 0.0:
@@ -1364,7 +1366,7 @@ def main(argv):
         def muon_matrix_norm(params):
             return global_norm([
                 w.astype(jnp.float32) for w, use in zip(
-                    jax.tree.leaves(params), jax.tree.leaves(outer_decay_mask)) if use])
+                    jax.tree.leaves(params), jax.tree.leaves(muon_matrix_mask)) if use])
 
         @jax.jit
         def outer_update_metrics(before, after, direction, alpha):
@@ -1377,6 +1379,10 @@ def main(argv):
                 'outer/muon_solver_relative_update': alpha * muon_matrix_norm(direction) / denom,
                 'outer/muon_total_relative_update': muon_matrix_norm(delta) / denom,
                 'outer/muon_decay_relative_update': FLAGS.outer_weight_decay * wnorm / denom,
+                'outer/embedding_weight_norm_after': jnp.linalg.norm(
+                    after['params']['transformer']['wte']['embedding'].astype(jnp.float32)),
+                'outer/head_weight_norm_after': jnp.linalg.norm(
+                    after['params']['lm_head']['kernel'].astype(jnp.float32)),
             }
 
         if FLAGS.optimizer_type == "cg":
