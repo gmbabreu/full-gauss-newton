@@ -85,6 +85,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_b2=0.999,
     inner_clip_gradient=0.0,
     optimizer_wd=0.0,
+    outer_weight_decay=0.0,  # fractional outer shrink; independent of line search
     parameter_wd=0.0,  # Dead flag
 
     wandb_run_id='',
@@ -189,6 +190,14 @@ def get_tpu_metrics():
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
+        raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")
+    if FLAGS.outer_weight_decay and (
+        FLAGS.optimizer_type != 'muon' or not FLAGS.gauss_newton
+        or FLAGS.adaptive_inner_loop or FLAGS.weight_average
+    ):
+        raise ValueError("outer decay requires non-adaptive Muon-GN and weight_average=False")
 
     output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
@@ -1339,6 +1348,43 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset = iter(dataset)
 
+        muon_matrix_mask = unflatten_dict({
+            name: w.ndim == 2 and name not in (
+                'params.transformer.wte.embedding', 'params.lm_head.kernel')
+            for name, w in flatten_dict(train_state.params, sep='.').items()
+        }, sep='.')
+        outer_decay_mask = jax.tree.map(
+            lambda w: w.ndim == 2, train_state.params)
+
+        def apply_outer_decay(base, candidate):
+            if FLAGS.outer_weight_decay == 0.0:
+                return candidate
+            return jax.tree.map(
+                lambda w, c, use: c - FLAGS.outer_weight_decay * w if use else c,
+                base, candidate, outer_decay_mask)
+
+        def muon_matrix_norm(params):
+            return global_norm([
+                w.astype(jnp.float32) for w, use in zip(
+                    jax.tree.leaves(params), jax.tree.leaves(muon_matrix_mask)) if use])
+
+        @jax.jit
+        def outer_update_metrics(before, after, direction, alpha):
+            wnorm = muon_matrix_norm(before)
+            denom = jnp.maximum(wnorm, 1e-12)
+            delta = jax.tree.map(lambda new, old: new - old, after, before)
+            return {
+                'outer/muon_weight_norm_before': wnorm,
+                'outer/muon_weight_norm_after': muon_matrix_norm(after),
+                'outer/muon_solver_relative_update': alpha * muon_matrix_norm(direction) / denom,
+                'outer/muon_total_relative_update': muon_matrix_norm(delta) / denom,
+                'outer/muon_decay_relative_update': FLAGS.outer_weight_decay * wnorm / denom,
+                'outer/embedding_weight_norm_after': jnp.linalg.norm(
+                    after['params']['transformer']['wte']['embedding'].astype(jnp.float32)),
+                'outer/head_weight_norm_after': jnp.linalg.norm(
+                    after['params']['lm_head']['kernel'].astype(jnp.float32)),
+            }
+
         if FLAGS.optimizer_type == "cg":
             # Persistent Adam first and second moments for the CG path.
             cg_first_moment = jax.tree_util.tree_map(
@@ -1401,6 +1447,7 @@ def main(argv):
                         updated_params = jax.tree_util.tree_map(
                             lambda x, y: x + step_size * y, base_params, dir
                         )
+                        updated_params = apply_outer_decay(base_params, updated_params)
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
                             loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
@@ -1425,6 +1472,7 @@ def main(argv):
                         updated_params = jax.tree_util.tree_map(
                             lambda x, y: x + step_size * y, base_params, dir
                         )
+                        updated_params = apply_outer_decay(base_params, updated_params)
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
                             loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
@@ -1651,6 +1699,7 @@ def main(argv):
 
             else:
                 # ---------------- Existing (non-adaptive) behavior, unchanged math ----------------
+                outer_params_before = train_state.params
                 for i in range(FLAGS.inner_loop_iter):
                     if FLAGS.single_batch_inner:
                         batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
@@ -1712,6 +1761,7 @@ def main(argv):
                         }, step=step)
 
                     updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
+                    updated_params = apply_outer_decay(train_state.params, updated_params)
                     train_state = train_state.replace(
                         step=train_state.step+1,
                         opt_state=inner_state.opt_state,
@@ -1722,11 +1772,19 @@ def main(argv):
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, updated_params)
                 else:
+                    dir = jax.tree.map(lambda inner, outer: inner - outer,
+                                       inner_state.params, train_state.params)
+                    effective_step_size = 1.0
+                    updated_params = apply_outer_decay(train_state.params, inner_state.params)
                     train_state = train_state.replace(
                         step=train_state.step+1,
                         opt_state=inner_state.opt_state,
-                        params=inner_state.params
+                        params=updated_params
                     )
+                if FLAGS.optimizer_type == 'muon' and FLAGS.gauss_newton and step % FLAGS.log_freq == 0:
+                    metrics.update(outer_update_metrics(
+                        outer_params_before, train_state.params, dir, effective_step_size))
+                del outer_params_before
        
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"global_step": step}
