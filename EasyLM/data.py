@@ -221,7 +221,7 @@ class HuggingfaceDataset(object):
             tokenizer_name=getattr(self.tokenizer, 'name_or_path', None),
             tokenizer_vocab_size=len(self.tokenizer), **deepcopy(self._live_state))
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, allow_batch_size_change=False):
         if state_dict.get('packed_state_version') != 1:
             if 'config' in state_dict:
                 self.config.update(mlxu.ConfigDict(state_dict['config']))
@@ -232,7 +232,9 @@ class HuggingfaceDataset(object):
             return
         matching_keys = ('path', 'name', 'split', 'streaming', 'seq_length',
             'always_start_with_bos', 'batch_token_dtype', 'shuffle_data',
-            'shuffle_seed', 'shuffle_buffer_size', 'batch_size')
+            'shuffle_seed', 'shuffle_buffer_size')
+        if not allow_batch_size_change:
+            matching_keys += ('batch_size',)
         saved_config = state_dict['config']
         for key in matching_keys:
             if saved_config.get(key) != self.config[key]:

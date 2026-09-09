@@ -26,7 +26,7 @@ from jax.scipy.sparse.linalg import cg
 
 import optax
 
-from EasyLM.data import DatasetFactory
+from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.jax_utils import (
@@ -222,13 +222,33 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
-        FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
+    if FLAGS.load_dataset_state.startswith('gs://'):
+        FLAGS.load_dataset_state = load_from_gcs(
+            FLAGS.load_dataset_state,
+            os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl'),
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
-        dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
+    if FLAGS.load_dataset_state:
+        dataset_state = mlxu.load_pickle(FLAGS.load_dataset_state)
+        if dataset_state is None:
+            raise ValueError('Checkpoint has no dataset state')
+        if isinstance(dataset, HuggingfaceDataset):
+            # A fresh Muon-GN branch can regroup the saved token stream.
+            # Full-state continuation keeps strict batch-size validation.
+            allow_rebatch = (
+                FLAGS.optimizer_type == 'muon' and FLAGS.gauss_newton
+                and init_checkpoint_path.startswith('trainstate_params::')
+            )
+            if allow_rebatch and dataset_state.get('packed_state_version') != 1:
+                raise ValueError('Muon-GN branching requires a packed dataset checkpoint')
+            dataset.load_state_dict(
+                dataset_state,
+                allow_batch_size_change=allow_rebatch,
+            )
+        else:
+            dataset.load_state_dict(dataset_state)
         print('loaded dataset state', flush=True)
 
     if FLAGS.eval_steps > 0:
