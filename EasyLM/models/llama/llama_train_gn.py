@@ -1646,7 +1646,10 @@ def main(argv):
                     sharded_rng, train_state.params, dataset
                 )
                 if exit_flag:
-                    timing.cancel()
+                    jax.block_until_ready((train_state, inner_state, sharded_rng,
+                                           cg_first_moment, cg_second_moment,
+                                           cg_x0, cg_adam_step, cg_metrics))
+                    timing.stop_train_interval(completed_update=False)
                     break
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -1776,7 +1779,8 @@ def main(argv):
                     best_checkpoint = checkpoint
 
                 if exit_training:
-                    timing.cancel()
+                    jax.block_until_ready((train_state, inner_state, sharded_rng))
+                    timing.stop_train_interval(completed_update=False)
                     break  # dataset exhausted; end training, same as the non-adaptive path
 
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, best_inner_state.params, train_state.params)
@@ -1835,7 +1839,9 @@ def main(argv):
                         sharded_rng, train_state.params, dataset
                     )
                     if exit_flag:
-                        timing.cancel()
+                        jax.block_until_ready(
+                            (train_state, inner_state, sharded_rng, metrics))
+                        timing.stop_train_interval(completed_update=False)
                         break
                     print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -1966,6 +1972,7 @@ def main(argv):
                 else:
                     save_checkpoint(train_state)
 
+        terminal_metrics = {}
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
             timing.start()
             eval_iterator = iter(eval_dataset)
@@ -1981,17 +1988,16 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
-            log_metrics = {}
             if eval_metric_list:
-                log_metrics.update(average_metrics(eval_metric_list))
-            log_metrics = jax.device_get(log_metrics)
-            jax.block_until_ready((sharded_rng, log_metrics))
+                terminal_metrics.update(average_metrics(eval_metric_list))
+            terminal_metrics = jax.device_get(terminal_metrics)
+            jax.block_until_ready((sharded_rng, terminal_metrics))
             timing.stop_eval()
-            log_metrics.update(timing.metrics())
-            terminal_record = progress.record(
-                progress.phase_completed_updates - 1, **log_metrics)
-            for name, value in terminal_record.items():
-                wandb.run.summary[f'terminal_{name}'] = value
+        terminal_metrics.update(timing.metrics())
+        terminal_record = progress.record(
+            progress.phase_completed_updates - 1, **terminal_metrics)
+        for name, value in terminal_record.items():
+            wandb.run.summary[f'terminal_{name}'] = value
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
 

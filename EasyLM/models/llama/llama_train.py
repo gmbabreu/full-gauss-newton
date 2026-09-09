@@ -619,6 +619,7 @@ def main(argv):
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
 
+        terminal_metrics = {}
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
             timing.start()
             eval_iterator = iter(eval_dataset)
@@ -634,14 +635,14 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
-            terminal_metrics = jax.device_get(average_metrics(eval_metric_list))
+            terminal_metrics.update(jax.device_get(average_metrics(eval_metric_list)))
             jax.block_until_ready((sharded_rng, terminal_metrics))
             timing.stop_eval()
-            terminal_metrics.update(timing.metrics())
-            terminal_record = progress.record(
-                progress.phase_completed_updates - 1, **terminal_metrics)
-            for name, value in terminal_record.items():
-                wandb.run.summary[f'terminal_{name}'] = value
+        terminal_metrics.update(timing.metrics())
+        terminal_record = progress.record(
+            progress.phase_completed_updates - 1, **terminal_metrics)
+        for name, value in terminal_record.items():
+            wandb.run.summary[f'terminal_{name}'] = value
 
     # jax.profiler.stop_trace()
     wandb.finish()

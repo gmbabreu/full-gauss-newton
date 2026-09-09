@@ -8,3 +8,4 @@
 - Progress schema 2 separates cumulative completed updates, distinct solve/line-search tokens, discarded fetches, and the absolute dataset cursor; reporting offsets never affect optimizer or schedule state.
 - Muon-GN full-state continuation remains explicitly unsupported; parameter-only branches with packed dataset state validate metadata, completion, and dataset snapshot identity before claiming a cumulative prefix.
 - Timing uses synchronized process-local wall time: training includes fetch/compile/solve/search/update work, validation is accumulated separately, and no elapsed-time prefix is inferred or checkpointed.
+- Partially completed GN work caused by dataset exhaustion contributes to process training time without advancing the latest completed-update duration or progress counters.

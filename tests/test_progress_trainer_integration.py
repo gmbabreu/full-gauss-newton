@@ -1,5 +1,6 @@
 """Source-level regression gates for progress integration in heavyweight trainers."""
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAM = (ROOT / 'EasyLM/models/llama/llama_train.py').read_text()
@@ -50,7 +51,8 @@ def test_timers_start_before_fetch_and_synchronize_before_stop():
     assert adam_loop.index('jax.block_until_ready') < adam_loop.index('timing.stop_train_interval')
     gn_loop = GN[GN.index('for step in step_counter:'):]
     assert gn_loop.index('timing.start()') < gn_loop.index("pull_training_batch('skipped')")
-    assert gn_loop.index('jax.block_until_ready(live_results)') < gn_loop.index('timing.stop_train_interval')
+    ready = gn_loop.index('jax.block_until_ready(live_results)')
+    assert ready < gn_loop.index('timing.stop_train_interval(completed_update=True)', ready)
 
 
 def test_timing_config_and_terminal_summary_are_process_local():
@@ -59,3 +61,22 @@ def test_timing_config_and_terminal_summary_are_process_local():
         assert "'timing_includes_first_use_compilation': True" in source
         assert 'terminal_record = progress.record(' in source
         assert 'timing.stop_eval()' in source
+
+
+def test_gn_interrupted_work_is_preserved_without_completing_update():
+    assert 'timing.cancel()' not in GN
+    assert GN.count('timing.stop_train_interval(completed_update=False)') == 3
+    assert GN.count('jax.block_until_ready') >= 7
+
+
+def test_final_timing_summary_is_outside_terminal_eval_condition():
+    for source in (ADAM, GN):
+        terminal_if = source.rindex('if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0:')
+        summary = source.rindex("wandb.run.summary[f'terminal_{name}']")
+        finish = source.index('\n    wandb.finish()', terminal_if)
+        # The summary loop is dedented to the same trainer scope as the
+        # conditional, so it runs whether or not terminal evaluation is enabled.
+        assert terminal_if < summary < finish
+        assert re.search(
+            r"\n        for name, value in terminal_record\.items\(\):\n"
+            r"            wandb\.run\.summary\[f'terminal_\{name\}'\]", source)
