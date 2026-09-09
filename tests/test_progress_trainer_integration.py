@@ -57,6 +57,8 @@ def test_timers_start_before_fetch_and_synchronize_before_stop():
 
 def test_timing_config_and_terminal_summary_are_process_local():
     for source in (ADAM, GN):
+        assert 'log_time_offset_s=0.0' in source
+        assert "'log_time_offset_s': FLAGS.log_time_offset_s" in source
         assert "'timing_scope': 'current_process'" in source
         assert "'timing_includes_first_use_compilation': True" in source
         assert 'terminal_record = progress.record(' in source

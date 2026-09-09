@@ -29,3 +29,7 @@ Training timing includes batch fetch, first-use compilation, solve/line search,
 accepted updates, and in-section diagnostics; it excludes validation, checkpoint
 saving, and W&B commits. These values reset after every process restart and are
 not serialized as resumable progress.
+
+`log_time_offset_s` is stored in run configuration as a reporting annotation
+for downstream comparisons. It defaults to zero and does not alter the
+process-local timing counters, optimizer state, or schedules.

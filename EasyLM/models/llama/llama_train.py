@@ -60,6 +60,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_freq=50,
     log_step_offset=-1,
     log_token_offset=-1,
+    log_time_offset_s=0.0,
     log_initial_eval=False,
     save_model_freq=0,
     save_milestone_freq=0,
@@ -466,6 +467,7 @@ def main(argv):
         flags_config_dict['training_progress'] = progress.state_dict()
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
         wandb.config.update({
+            'log_time_offset_s': FLAGS.log_time_offset_s,
             'timing_scope': 'current_process',
             'timing_includes_first_use_compilation': True,
         }, allow_val_change=True)

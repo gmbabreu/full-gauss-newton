@@ -11,3 +11,5 @@ Trainer integration now copies evaluation RNGs before donated calls, retains Ada
 Adam and GN now report synchronized `update_time_s`, cumulative process-local `train_time_s`, and cumulative process-local `eval_time_s`, including initial and terminal validation where enabled.
 
 Interrupted GN outer work is retained in final training time, and final timing/progress summaries are exported even when terminal evaluation is disabled.
+
+Both trainers expose and record the reporting-only `log_time_offset_s` annotation.
