@@ -1,5 +1,5 @@
 import pytest
-from EasyLM.training_progress import TrainingProgress, resolve_progress
+from EasyLM.training_progress import ProcessTiming, TrainingProgress, resolve_progress
 from EasyLM.training_resume import validate_branch_parent
 
 class Tokens:
@@ -41,3 +41,28 @@ def test_params_only_parent_bundle_validation():
                                300, 196608000)
     with pytest.raises(ValueError, match='log_token_offset'):
         validate_branch_parent(metadata, complete, dataset, 300, 1)
+
+
+def test_process_local_training_and_evaluation_timing():
+    readings = iter((0, 3, 3, 5, 5, 10, 10, 14, 14, 15))
+    timing = ProcessTiming(clock=lambda: next(readings))
+    timing.start(); timing.stop_eval()
+    timing.start(); timing.stop_train_interval(completed_update=True)
+    timing.start(); timing.stop_eval()
+    assert timing.metrics() == {
+        'update_time_s': 2, 'train_time_s': 2, 'eval_time_s': 8}
+    timing.start(); timing.stop_train_interval(completed_update=True)
+    assert timing.metrics() == {
+        'update_time_s': 4, 'train_time_s': 6, 'eval_time_s': 8}
+    timing.start(); timing.stop_eval()
+    assert timing.metrics() == {
+        'update_time_s': 4, 'train_time_s': 6, 'eval_time_s': 9}
+
+
+def test_accumulation_timing_is_pending_until_update():
+    readings = iter((0, 1, 1, 3))
+    timing = ProcessTiming(clock=lambda: next(readings))
+    timing.start(); timing.stop_train_interval(completed_update=False)
+    assert timing.update_time_s == 0 and timing.train_time_s == 1
+    timing.start(); timing.stop_train_interval(completed_update=True)
+    assert timing.update_time_s == 3 and timing.train_time_s == 3

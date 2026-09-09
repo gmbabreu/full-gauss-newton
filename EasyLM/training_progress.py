@@ -4,6 +4,7 @@ These counters are reporting-only: they must never be used as optimizer or
 learning-rate schedule state.
 """
 from dataclasses import asdict, dataclass
+import time
 
 PROGRESS_SCHEMA_VERSION = 2
 TOKEN_CONVENTION = "distinct global input-token positions used by solve or line search"
@@ -100,3 +101,50 @@ def configure_wandb_run(run):
     run.define_metric("*", step_metric="total_tokens")
     for name in ("total_tokens", "cumulative_tokens", "completed_updates", "step", "global_step"):
         run.define_metric(name, hidden=True)
+    for name in ("update_time_s", "train_time_s", "eval_time_s"):
+        run.define_metric(name, step_metric="total_tokens", summary="last")
+
+
+@dataclass
+class ProcessTiming:
+    """Process-local elapsed timing; deliberately absent from checkpoints."""
+    clock: object = time.perf_counter
+    train_time_s: float = 0.0
+    eval_time_s: float = 0.0
+    update_time_s: float = 0.0
+    _started: float = None
+    _pending_update_s: float = 0.0
+
+    def start(self):
+        if self._started is not None:
+            raise RuntimeError("timing section already active")
+        self._started = self.clock()
+
+    def stop_train_interval(self, *, completed_update=True):
+        elapsed = self._stop()
+        self.train_time_s += elapsed
+        self._pending_update_s += elapsed
+        if completed_update:
+            self.update_time_s = self._pending_update_s
+            self._pending_update_s = 0.0
+        return elapsed
+
+    def stop_eval(self):
+        elapsed = self._stop()
+        self.eval_time_s += elapsed
+        return elapsed
+
+    def cancel(self):
+        """Discard an interval that performed no work (for iterator exhaustion)."""
+        self._started = None
+
+    def metrics(self):
+        return dict(update_time_s=self.update_time_s,
+                    train_time_s=self.train_time_s, eval_time_s=self.eval_time_s)
+
+    def _stop(self):
+        if self._started is None:
+            raise RuntimeError("timing section is not active")
+        elapsed = self.clock() - self._started
+        self._started = None
+        return elapsed

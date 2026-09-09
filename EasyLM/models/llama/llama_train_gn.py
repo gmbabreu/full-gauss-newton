@@ -27,7 +27,7 @@ from jax.scipy.sparse.linalg import cg
 import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
-from EasyLM.training_progress import configure_wandb_run, resolve_progress
+from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -1378,6 +1378,11 @@ def main(argv):
 
         configure_wandb_run(wandb.run)
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
+        wandb.config.update({
+            'timing_scope': 'current_process',
+            'timing_includes_first_use_compilation': True,
+        }, allow_val_change=True)
+        timing = ProcessTiming()
 
 
         start_step = int(jax.device_get(train_state.step))
@@ -1478,7 +1483,9 @@ def main(argv):
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
 
+        jax.block_until_ready((train_state, inner_state, sharded_rng))
         if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
+            timing.start()
             initial_eval_metrics = []
             initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
             initial_eval_iterator = iter(eval_dataset)
@@ -1489,9 +1496,13 @@ def main(argv):
                 initial_eval_metrics.append(eval_metrics)
             initial_record = progress.record(
                 -1, **jax.device_get(average_metrics(initial_eval_metrics)))
+            jax.block_until_ready((initial_eval_rng, initial_record))
+            timing.stop_eval()
+            initial_record.update(timing.metrics())
             wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
 
         for step in step_counter:
+            timing.start()
             pending_record = {}
             inner_diagnostic_rows = []
 
@@ -1635,6 +1646,7 @@ def main(argv):
                     sharded_rng, train_state.params, dataset
                 )
                 if exit_flag:
+                    timing.cancel()
                     break
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -1764,6 +1776,7 @@ def main(argv):
                     best_checkpoint = checkpoint
 
                 if exit_training:
+                    timing.cancel()
                     break  # dataset exhausted; end training, same as the non-adaptive path
 
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, best_inner_state.params, train_state.params)
@@ -1822,6 +1835,7 @@ def main(argv):
                         sharded_rng, train_state.params, dataset
                     )
                     if exit_flag:
+                        timing.cancel()
                         break
                     print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -1877,6 +1891,12 @@ def main(argv):
                 del outer_params_before
        
             progress.complete_update()
+            live_results = [train_state, inner_state, sharded_rng, metrics]
+            if FLAGS.optimizer_type == 'cg':
+                live_results.extend((cg_first_moment, cg_second_moment,
+                                     cg_x0, cg_adam_step))
+            jax.block_until_ready(live_results)
+            timing.stop_train_interval(completed_update=True)
             if step % FLAGS.log_freq == 0:
                 log_metrics = {}
                 stop_after_log = False
@@ -1888,6 +1908,7 @@ def main(argv):
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
 
                 if do_eval: # eval_freq must be | by log_freq
+                    timing.start()
                     eval_iterator = iter(eval_dataset)
                     eval_metric_list = []
                     for _ in range(FLAGS.eval_steps):
@@ -1903,6 +1924,8 @@ def main(argv):
                         eval_metric_list.append(eval_metrics)
                     if eval_metric_list:
                         log_metrics.update(average_metrics(eval_metric_list))
+                    jax.block_until_ready((sharded_rng, log_metrics))
+                    timing.stop_eval()
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
@@ -1918,6 +1941,7 @@ def main(argv):
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
                 log_metrics.update(pending_record)
+                log_metrics.update(timing.metrics())
                 log_metrics = progress.record(step, **log_metrics)
                 if inner_diagnostic_rows:
                     log_metrics['inner_diagnostics'] = wandb.Table(
@@ -1943,6 +1967,7 @@ def main(argv):
                     save_checkpoint(train_state)
 
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
+            timing.start()
             eval_iterator = iter(eval_dataset)
             eval_metric_list = []
             for _ in range(FLAGS.eval_steps):
@@ -1960,6 +1985,9 @@ def main(argv):
             if eval_metric_list:
                 log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
+            jax.block_until_ready((sharded_rng, log_metrics))
+            timing.stop_eval()
+            log_metrics.update(timing.metrics())
             terminal_record = progress.record(
                 progress.phase_completed_updates - 1, **log_metrics)
             for name, value in terminal_record.items():

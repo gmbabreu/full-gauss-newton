@@ -42,3 +42,20 @@ def test_terminal_summary_uses_current_progress_boundary():
     assert expected in GN
     assert '{"global_step": start_step}' not in ADAM
     assert '{"global_step": start_step}' not in GN
+
+
+def test_timers_start_before_fetch_and_synchronize_before_stop():
+    adam_loop = ADAM[ADAM.index('for step in step_counter:'):]
+    assert adam_loop.index('timing.start()') < adam_loop.index('next(train_iterator)')
+    assert adam_loop.index('jax.block_until_ready') < adam_loop.index('timing.stop_train_interval')
+    gn_loop = GN[GN.index('for step in step_counter:'):]
+    assert gn_loop.index('timing.start()') < gn_loop.index("pull_training_batch('skipped')")
+    assert gn_loop.index('jax.block_until_ready(live_results)') < gn_loop.index('timing.stop_train_interval')
+
+
+def test_timing_config_and_terminal_summary_are_process_local():
+    for source in (ADAM, GN):
+        assert "'timing_scope': 'current_process'" in source
+        assert "'timing_includes_first_use_compilation': True" in source
+        assert 'terminal_record = progress.record(' in source
+        assert 'timing.stop_eval()' in source
