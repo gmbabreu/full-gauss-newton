@@ -27,6 +27,7 @@ from jax.scipy.sparse.linalg import cg
 import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
+from EasyLM.training_progress import configure_wandb_run, resolve_progress
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.jax_utils import (
@@ -55,6 +56,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_checkpoint='',
     load_dataset_state='',
     log_freq=50,
+    log_step_offset=-1,
+    log_token_offset=-1,
+    log_initial_eval=False,
     log_inner_steps=False,
     save_model_freq=0,
     save_milestone_freq=0,
@@ -243,6 +247,12 @@ def main(argv):
             )
             if allow_rebatch and dataset_state.get('packed_state_version') != 1:
                 raise ValueError('Muon-GN branching requires a packed dataset checkpoint')
+            if allow_rebatch and FLAGS.log_step_offset >= 0:
+                if dataset_state.get('training_step') != FLAGS.log_step_offset:
+                    raise ValueError('log_step_offset does not match the packed parent snapshot')
+                cursor = dataset_state.get('metadata', {}).get('dataset_total_tokens')
+                if FLAGS.log_token_offset < 0 or cursor != FLAGS.log_token_offset:
+                    raise ValueError('log_token_offset does not match the packed parent cursor')
             dataset.load_state_dict(
                 dataset_state,
                 allow_batch_size_change=allow_rebatch,
@@ -1232,6 +1242,7 @@ def main(argv):
             variant=variant,
             flags=flags_config_dict,
             llama_config=llama_config.to_dict(),
+            training_progress=progress.state_dict(),
         )
         checkpointer.save_all(
             train_state=train_state,
@@ -1316,11 +1327,18 @@ def main(argv):
         print(f"  Per-chip batch size: {FLAGS.train_dataset_batch_size // jax.device_count()}")
         print(f"========================\n")
 
+        progress = resolve_progress(
+            FLAGS.log_step_offset, FLAGS.log_token_offset,
+            branch=init_checkpoint_path.startswith('trainstate_params::'),
+        )
+        flags_config_dict['training_progress'] = progress.state_dict()
+
         if FLAGS.wandb_run_id:
+            if FLAGS.load_checkpoint:
+                raise ValueError('Use a new W&B run ID when replaying a checkpoint; backward history is unsupported')
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
         else:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, config=log_config, dir=FLAGS.wandb_dir)  # Replace with your project name
-
             is_gcs = output_dir.startswith("gs://")
 
             # If not GCS, create local directory
@@ -1337,6 +1355,9 @@ def main(argv):
             if is_gcs:
                 gcs_path = os.path.join(output_dir, "wandb_id.txt")
                 upload_to_gcs(local_path, gcs_path)
+
+        configure_wandb_run(wandb.run)
+        wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
 
 
         start_step = int(jax.device_get(train_state.step))
@@ -1366,7 +1387,13 @@ def main(argv):
 
 
         inner_state = create_trainstate_from_params(train_state.params)
-        dataset = iter(dataset)
+        dataset_object = dataset
+        dataset = iter(dataset_object)
+
+        def pull_training_batch(role):
+            batch, metadata = next(dataset)
+            progress.charge(role, batch, metadata)
+            return batch, metadata
 
         muon_matrix_mask = unflatten_dict({
             name: w.ndim == 2 and name not in (
@@ -1431,7 +1458,30 @@ def main(argv):
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
 
+        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
+            initial_eval_metrics = []
+            initial_eval_rng = sharded_rng
+            initial_eval_iterator = iter(eval_dataset)
+            for _ in range(FLAGS.eval_steps):
+                eval_batch, _ = next(initial_eval_iterator)
+                initial_eval_rng, eval_metrics = sharded_eval_step(
+                    train_state.params, initial_eval_rng, eval_batch)
+                initial_eval_metrics.append(eval_metrics)
+            initial_record = progress.record(
+                -1, **jax.device_get(average_metrics(initial_eval_metrics)))
+            wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
+
         for step in step_counter:
+            pending_record = {}
+            inner_diagnostic_rows = []
+
+            def defer_wandb(values, *args, **kwargs):
+                values = jax.device_get(values)
+                if 'inner_step' in values:
+                    inner_diagnostic_rows.append(dict(values))
+                else:
+                    pending_record.update(values)
+
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
 
             if FLAGS.reset_start:
@@ -1449,7 +1499,7 @@ def main(argv):
 
 
             if FLAGS.single_batch_inner:
-                single_batch_, single_dataset_metrics_ = next(dataset)
+                single_batch_, single_dataset_metrics_ = pull_training_batch('skipped')
         
             # ------------------------------------------------------------------
             # Shared helpers, factored out of the original inline linesearch code
@@ -1509,7 +1559,7 @@ def main(argv):
                 ls_batches = []
                 for _ in range(num_ls_batches):
                     try:
-                        batch, _ = next(dataset)
+                        batch, metadata = pull_training_batch('linesearch')
                         ls_batches.append(batch)
                     except StopIteration:
                         print("Dataset exhausted")
@@ -1529,14 +1579,14 @@ def main(argv):
                 return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
 
             if FLAGS.single_batch_inner:
-                single_batch_, single_dataset_metrics_ = next(dataset)
+                single_batch_, single_dataset_metrics_ = pull_training_batch('solve')
 
             ADAPTIVE_CHECKPOINTS_ALL = [1, 4, 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536,1792, 2048, 2560]
             if FLAGS.optimizer_type == 'cg':
                 if FLAGS.single_batch_inner:
                     batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
                 else:
-                    batch_, dataset_metrics_ = next(dataset)
+                    batch_, dataset_metrics_ = pull_training_batch('solve')
                 batch = jax.tree.map(
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
@@ -1610,7 +1660,7 @@ def main(argv):
 
                 if step % FLAGS.log_freq == 0:
                     dir_norm = float(jax.device_get(global_norm(dir)))
-                    wandb.log({
+                    defer_wandb({
                         "step_size": effective_step_size,
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
@@ -1651,7 +1701,7 @@ def main(argv):
                         if FLAGS.single_batch_inner:
                             batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
                         else:
-                            batch_, dataset_metrics_ = next(dataset)
+                            batch_, dataset_metrics_ = pull_training_batch('solve')
                         batch = jax.tree.map(
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
@@ -1673,7 +1723,7 @@ def main(argv):
                         #     log_metrics['inner_param_norm'] = metrics['param_norm']
                         #     log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         #     log_metrics['inner_learning_rate'] = metrics['learning_rate']
-                        #     wandb.log(log_metrics)
+                        #     defer_wandb(log_metrics)
 
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
                     if FLAGS.normalize_step:
@@ -1707,7 +1757,7 @@ def main(argv):
                 print(f"Chosen checkpoint: {best_checkpoint}, step_size: {best_step_size:.6f}", flush=True)
                 metrics = checkpoint_metrics[best_checkpoint]  # so b_norm/relative_residual reflect the chosen checkpoint
                 if step % FLAGS.log_freq == 0:
-                    wandb.log({
+                    defer_wandb({
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
@@ -1724,7 +1774,7 @@ def main(argv):
                     if FLAGS.single_batch_inner:
                         batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
                     else:
-                        batch_, dataset_metrics_ = next(dataset)
+                        batch_, dataset_metrics_ = pull_training_batch('solve')
                     batch = jax.tree.map(
                         lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                         batch_
@@ -1742,7 +1792,7 @@ def main(argv):
                         log_metrics['inner_param_norm'] = metrics['param_norm']
                         log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         log_metrics['inner_learning_rate'] = metrics['learning_rate']
-                        wandb.log(log_metrics)
+                        defer_wandb(log_metrics)
                     if FLAGS.weight_average and not FLAGS.linesearch:
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
@@ -1765,7 +1815,7 @@ def main(argv):
                     effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
                     print("Step size:", effective_step_size)
                     dir_norm = float(jax.device_get(global_norm(dir)))
-                    wandb.log({
+                    defer_wandb({
                         "step_size": effective_step_size,
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
@@ -1775,7 +1825,7 @@ def main(argv):
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
                         loss_improvement = baseline_loss - float(jax.device_get(_loss))
-                        wandb.log({
+                        defer_wandb({
                             f"ls_loss_improvement_{tag}": loss_improvement,
                             "global_step": step,
                         }, step=step)
@@ -1806,17 +1856,14 @@ def main(argv):
                         outer_params_before, train_state.params, dir, effective_step_size))
                 del outer_params_before
        
+            progress.complete_update()
             if step % FLAGS.log_freq == 0:
-                log_metrics = {"global_step": step}
+                log_metrics = {}
+                stop_after_log = False
                 log_metrics.update(get_tpu_metrics())
                 log_metrics.update(metrics)
                 log_metrics["param_norm"] = global_norm(train_state.params)
                 # log_metrics.update(dataset_metrics)
-                # Token consumption logging (distinct tokens only)
-                batches_per_step = 1 if FLAGS.single_batch_inner else FLAGS.inner_loop_iter
-                tokens_per_step = FLAGS.train_dataset_batch_size * seq_length * batches_per_step
-                log_metrics["total_tokens"] = tokens_per_step * (step + 1)
-                
 
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
 
@@ -1839,19 +1886,26 @@ def main(argv):
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
-                        wandb.log(log_metrics)
+                        defer_wandb(log_metrics)
                         tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                         
-                        break
+                        stop_after_log = True
                     elif FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] >= 15:
                         print(f"Loss {log_metrics['eval_loss']} too high, stopping at step {step}")
-                        break
+                        stop_after_log = True
                     # metrics.update({"step": step})
                     # metrics = jax.device_get(metrics)
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                wandb.log(log_metrics)
+                log_metrics.update(pending_record)
+                log_metrics = progress.record(step, **log_metrics)
+                if inner_diagnostic_rows:
+                    log_metrics['inner_diagnostics'] = wandb.Table(
+                        data=[[row] for row in inner_diagnostic_rows], columns=['metrics'])
+                wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                if stop_after_log:
+                    break
             
             
 
@@ -1886,8 +1940,8 @@ def main(argv):
             if eval_metric_list:
                 log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            wandb.log(log_metrics)
-            tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+            for name, value in log_metrics.items():
+                wandb.run.summary[f'terminal_{name}'] = value
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
 

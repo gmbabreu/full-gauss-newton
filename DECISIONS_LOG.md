@@ -5,3 +5,4 @@
 - Packed dataset snapshots retain the unconsumed token/mask remainder and replay the seeded document stream to the consumed-document count.
 - Existing legacy dataset snapshots remain loadable outside the exact-resume validation route.
 - Batch-size changes are accepted only through an explicit dataset-loader option, used by raw Hugging Face Muon-GN branches initialized from parameter-only checkpoints; strict full-state continuation remains the default.
+- Progress schema 2 separates cumulative completed updates, distinct solve/line-search tokens, discarded fetches, and the absolute dataset cursor; reporting offsets never affect optimizer or schedule state.
