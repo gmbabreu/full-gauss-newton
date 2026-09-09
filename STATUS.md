@@ -5,3 +5,5 @@ Resumable raw Hugging Face Adam checkpoints are implemented on CPU-facing reposi
 No TPU training, GCS transfer, multi-host execution, or live training process was run.
 
 Progress schema 2 reporting is integrated into Adam and GN logging and checkpoint metadata. Focused host-side accounting tests are included; full trainer tests remain limited by unavailable runtime dependencies in this checkout.
+
+Trainer integration now copies evaluation RNGs before donated calls, retains Adam's local evaluation cadence, validates parameter-only parent bundles, distinguishes line-search baseline loss, and reports terminal summaries at the current boundary.

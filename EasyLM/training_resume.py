@@ -47,3 +47,23 @@ def validate_dataset_snapshot(state, metadata):
                        * cfg["batch_size"] * cfg["seq_length"])
     if state["metadata"]["dataset_total_tokens"] != expected_tokens:
         raise ValueError("Packed dataset token count does not match completed updates")
+
+
+def validate_branch_parent(metadata, complete, dataset, step_offset, token_offset):
+    """Validate a params-only branch without restoring the parent's optimizer."""
+    if step_offset < 0 or token_offset < 0:
+        raise ValueError("Parameter-only continuation requires explicit reporting offsets")
+    if (not isinstance(metadata, dict) or not isinstance(complete, dict)
+            or not isinstance(dataset, dict)):
+        raise ValueError("Parameter-only branch checkpoint companions are missing")
+    snapshot_id = metadata.get("snapshot_id")
+    if (not snapshot_id or complete.get("snapshot_id") != snapshot_id
+            or dataset.get("snapshot_id") != snapshot_id):
+        raise ValueError("Parameter-only branch companions belong to different snapshots")
+    if (metadata.get("step") != step_offset
+            or complete.get("step") != step_offset
+            or dataset.get("training_step") != step_offset):
+        raise ValueError("log_step_offset does not match the parent checkpoint bundle")
+    cursor = dataset.get("metadata", {}).get("dataset_total_tokens")
+    if cursor != token_offset:
+        raise ValueError("log_token_offset does not match the packed parent cursor")

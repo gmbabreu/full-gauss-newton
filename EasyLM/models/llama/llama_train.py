@@ -488,7 +488,7 @@ def main(argv):
         old_params = jax.device_get(train_state.params)
         if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
             initial_eval_metrics = []
-            initial_eval_rng = sharded_rng
+            initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
             initial_eval_iterator = iter(eval_dataset)
             for _ in range(FLAGS.eval_steps):
                 eval_batch, _ = next(initial_eval_iterator)
@@ -525,7 +525,7 @@ def main(argv):
 
             
 
-            if applied_update and progress.phase_completed_updates % FLAGS.log_freq == 0:
+            if applied_update and step % FLAGS.log_freq == 0:
                 log_metrics = {}
                 stop_after_log = False
                 log_metrics.update(metrics)
@@ -607,7 +607,9 @@ def main(argv):
                 )
                 eval_metric_list.append(eval_metrics)
             terminal_metrics = jax.device_get(average_metrics(eval_metric_list))
-            for name, value in terminal_metrics.items():
+            terminal_record = progress.record(
+                progress.phase_completed_updates - 1, **terminal_metrics)
+            for name, value in terminal_record.items():
                 wandb.run.summary[f'terminal_{name}'] = value
 
     # jax.profiler.stop_trace()

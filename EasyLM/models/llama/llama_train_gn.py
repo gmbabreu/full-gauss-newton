@@ -28,6 +28,7 @@ import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import configure_wandb_run, resolve_progress
+from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.jax_utils import (
@@ -213,6 +214,27 @@ def main(argv):
 
     print(FLAGS.train_dataset)
     init_checkpoint_path = FLAGS.load_checkpoint
+    if init_checkpoint_path.startswith('trainstate::'):
+        raise ValueError(
+            'Full-state GN continuation is not supported; start a new params-only branch')
+    branch_parent_metadata = None
+    branch_parent_complete = None
+    if (init_checkpoint_path.startswith('trainstate_params::')
+            and FLAGS.load_dataset_state
+            and FLAGS.train_dataset.type == 'huggingface'
+            and not FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir):
+        parent_path = init_checkpoint_path.split('::', 1)[1]
+        parent_paths = resume_companion_paths(parent_path)
+
+        def load_parent_companion(name):
+            path = parent_paths[name]
+            if path.startswith('gs://'):
+                path = load_from_gcs(
+                    path, os.path.join(FLAGS.tmp_dir, f'branch_parent_{name}.pkl'))
+            return mlxu.load_pickle(path)
+
+        branch_parent_metadata = load_parent_companion('metadata')
+        branch_parent_complete = load_parent_companion('complete')
 
     if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
         FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint, local_path=os.path.join(FLAGS.tmp_dir, 'model.ckpt'))
@@ -247,12 +269,10 @@ def main(argv):
             )
             if allow_rebatch and dataset_state.get('packed_state_version') != 1:
                 raise ValueError('Muon-GN branching requires a packed dataset checkpoint')
-            if allow_rebatch and FLAGS.log_step_offset >= 0:
-                if dataset_state.get('training_step') != FLAGS.log_step_offset:
-                    raise ValueError('log_step_offset does not match the packed parent snapshot')
-                cursor = dataset_state.get('metadata', {}).get('dataset_total_tokens')
-                if FLAGS.log_token_offset < 0 or cursor != FLAGS.log_token_offset:
-                    raise ValueError('log_token_offset does not match the packed parent cursor')
+            if allow_rebatch:
+                validate_branch_parent(
+                    branch_parent_metadata, branch_parent_complete, dataset_state,
+                    FLAGS.log_step_offset, FLAGS.log_token_offset)
             dataset.load_state_dict(
                 dataset_state,
                 allow_batch_size_change=allow_rebatch,
@@ -1460,7 +1480,7 @@ def main(argv):
 
         if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
             initial_eval_metrics = []
-            initial_eval_rng = sharded_rng
+            initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
             initial_eval_iterator = iter(eval_dataset)
             for _ in range(FLAGS.eval_steps):
                 eval_batch, _ = next(initial_eval_iterator)
@@ -1665,7 +1685,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "loss": baseline_loss,
+                        "ls_baseline_loss": baseline_loss,
                         **({
                             "raw_dir_norm": float(jax.device_get(raw_dir_norm)),
                             "momentum_dir_norm": dir_norm,
@@ -1761,7 +1781,7 @@ def main(argv):
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
-                        "loss": baseline_loss,
+                        "ls_baseline_loss": baseline_loss,
                     }, step=step)
                 if FLAGS.weight_average:
                     alpha = FLAGS.weight_average_decay
@@ -1820,7 +1840,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "loss": baseline_loss,
+                        "ls_baseline_loss": baseline_loss,
                         }, step=step)
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
@@ -1936,11 +1956,13 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
-            log_metrics = {"global_step": start_step}
+            log_metrics = {}
             if eval_metric_list:
                 log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            for name, value in log_metrics.items():
+            terminal_record = progress.record(
+                progress.phase_completed_updates - 1, **log_metrics)
+            for name, value in terminal_record.items():
                 wandb.run.summary[f'terminal_{name}'] = value
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)

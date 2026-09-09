@@ -134,6 +134,8 @@ def test_actual_gn_restore_block_local_and_gcs():
             AutoTokenizer=SimpleNamespace(from_pretrained=lambda _: None),
             DatasetFactory=SimpleNamespace(load_dataset=lambda *_: make_dataset(batch_size=720)),
             HuggingfaceDataset=HuggingfaceDataset,
+            validate_branch_parent=lambda *args: None,
+            branch_parent_metadata={}, branch_parent_complete={},
             init_checkpoint_path='trainstate_params::/tmp/streaming_train_state_300',
         )
         exec(block, namespace)

@@ -1,5 +1,6 @@
 import pytest
 from EasyLM.training_progress import TrainingProgress, resolve_progress
+from EasyLM.training_resume import validate_branch_parent
 
 class Tokens:
     def __init__(self, size):
@@ -27,3 +28,16 @@ def test_offsets_conflict_and_accumulation_boundary():
     state=p.state_dict()
     with pytest.raises(ValueError,match='conflicts'): resolve_progress(9,-1,state)
     with pytest.raises(ValueError,match='both'): resolve_progress(3,-1,branch=True)
+
+
+def test_params_only_parent_bundle_validation():
+    metadata = {'step': 300, 'snapshot_id': 'same'}
+    complete = {'step': 300, 'snapshot_id': 'same'}
+    dataset = {'training_step': 300, 'snapshot_id': 'same',
+               'metadata': {'dataset_total_tokens': 196608000}}
+    validate_branch_parent(metadata, complete, dataset, 300, 196608000)
+    with pytest.raises(ValueError, match='different snapshots'):
+        validate_branch_parent(metadata, complete, dict(dataset, snapshot_id='bad'),
+                               300, 196608000)
+    with pytest.raises(ValueError, match='log_token_offset'):
+        validate_branch_parent(metadata, complete, dataset, 300, 1)
