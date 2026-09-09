@@ -1,4 +1,4 @@
-"""Host-side schema-v2 training progress accounting.
+"""Host-side schema-v3 training progress accounting.
 
 These counters are reporting-only: they must never be used as optimizer or
 learning-rate schedule state.
@@ -6,8 +6,11 @@ learning-rate schedule state.
 from dataclasses import asdict, dataclass
 import time
 
-PROGRESS_SCHEMA_VERSION = 2
-TOKEN_CONVENTION = "distinct global input-token positions used by solve or line search"
+PROGRESS_SCHEMA_VERSION = 3
+TOKEN_CONVENTION = (
+    "distinct global input-token positions used by solve; "
+    "excludes line search and skipped fetches"
+)
 
 
 @dataclass
@@ -32,7 +35,7 @@ class TrainingProgress:
 
     @property
     def cumulative_tokens(self):
-        return self.token_offset + self.phase_solve_tokens + self.phase_linesearch_tokens
+        return self.token_offset + self.phase_solve_tokens
 
     def charge(self, role, batch, dataset_metadata=None):
         tokens = int(batch["input_tokens"].size)
@@ -69,8 +72,11 @@ class TrainingProgress:
 
     @classmethod
     def from_state_dict(cls, state):
-        if state.get("progress_schema_version") != PROGRESS_SCHEMA_VERSION:
+        if state.get("progress_schema_version") not in (2, PROGRESS_SCHEMA_VERSION):
             raise ValueError("unsupported training progress metadata")
+        # V2 already stored separate counters. Retain them and the explicit
+        # parent prefix; only the derived token axis changes. Adam's axis is
+        # unchanged, and the trainers still reject full-state GN continuation.
         values = {name: state[name] for name in cls.__dataclass_fields__}
         return cls(**values)
 
