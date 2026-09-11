@@ -1,6 +1,7 @@
 import time
 from functools import partial
-from copy import deepcopy
+from copy import copy, deepcopy
+from contextlib import contextmanager
 from itertools import islice
 import json
 import base64
@@ -42,6 +43,27 @@ class DatasetFactory(object):
             return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
         else:
             raise ValueError(f'Unknown dataset type: {config.type}')
+
+    @staticmethod
+    @contextmanager
+    def initial_eval_iterator(dataset):
+        """Evaluate without advancing the regular loader's cursor or buffers.
+
+        Share the read-only dataset/tokenizer, but isolate loader state. Raw HF
+        packing is already iterator-local; JSON cursors live on the loader and
+        the pretokenized loader additionally mutates shared packing lists.
+        """
+        isolated = copy(dataset)
+        if isinstance(dataset, OptHuggingfaceDataset):
+            isolated._token_buffer = list(dataset._token_buffer)
+            isolated._loss_mask_buffer = list(dataset._loss_mask_buffer)
+        iterator = iter(isolated)
+        try:
+            yield iterator
+        finally:
+            close = getattr(iterator, 'close', None)
+            if close is not None:
+                close()
 
     def __init__(self):
         raise ValueError('DatasetFactory is a static class and should not be instantiated.')

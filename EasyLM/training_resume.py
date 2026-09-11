@@ -34,6 +34,15 @@ def validate_resume_metadata(metadata, complete, flags):
     changed = [key for key in keys if saved.get(key) != flags.get(key)]
     if changed:
         raise ValueError("Resume changes trajectory settings: " + ", ".join(changed))
+    if flags.get("eval_steps", 0) > 0 and flags.get("eval_freq", 0) != 0:
+        eval_config = flags.get("eval_dataset", {})
+        # Match DatasetFactory defaults. Only raw HF validation restarts from
+        # the same data on every evaluation; other loaders retain mutable state
+        # that these exact-resume checkpoints do not save.
+        if (eval_config.get("type", "huggingface") != "huggingface"
+                or eval_config.get("huggingface_dataset", {}).get("pretokenized_dataset_dir", "")):
+            raise ValueError("Exact Adam resume with validation requires a raw Hugging Face "
+                             "evaluation dataset; pretokenized/JSON validation state is not checkpointed")
 
 
 def validate_dataset_snapshot(state, metadata):

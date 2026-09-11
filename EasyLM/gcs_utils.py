@@ -35,13 +35,19 @@ def load_from_gcs(gcs_path, local_path):
         exact_blob.download_to_filename(local_path)
         print(f"Downloaded {blob_path} to {local_path}")
     else:  # Directory case
+        # GCS prefixes are lexical: "data" also matches "data_backup".
+        # Keep only descendants of this directory (or all objects at bucket root).
+        directory_prefix = blob_path.rstrip('/') + '/' if blob_path else ''
+        blobs = [blob for blob in blobs if blob.name.startswith(directory_prefix)]
+        if not blobs:
+            raise ValueError(f"No files found at {blob_path} in bucket {bucket_name}")
         if not local_path.endswith('/'):
             local_path += '/'  # Ensure local directory structure
         os.makedirs(local_path, exist_ok=True)
 
         for blob in blobs:
             if not blob.name.endswith('/'):  # Ignore "directory" markers
-                relative_path = blob.name[len(blob_path):].lstrip('/')  # Remove the prefix
+                relative_path = blob.name[len(directory_prefix):].lstrip('/')  # Remove the prefix
                 local_file_path = os.path.join(local_path, relative_path)
                 os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
                 blob.download_to_filename(local_file_path)

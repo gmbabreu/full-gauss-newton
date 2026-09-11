@@ -1490,12 +1490,12 @@ def main(argv):
             timing.start()
             initial_eval_metrics = []
             initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
-            initial_eval_iterator = iter(eval_dataset)
-            for _ in range(FLAGS.eval_steps):
-                eval_batch, _ = next(initial_eval_iterator)
-                initial_eval_rng, eval_metrics = sharded_eval_step(
-                    train_state.params, initial_eval_rng, eval_batch)
-                initial_eval_metrics.append(eval_metrics)
+            with DatasetFactory.initial_eval_iterator(eval_dataset) as initial_eval_iterator:
+                for _ in range(FLAGS.eval_steps):
+                    eval_batch, _ = next(initial_eval_iterator)
+                    initial_eval_rng, eval_metrics = sharded_eval_step(
+                        train_state.params, initial_eval_rng, eval_batch)
+                    initial_eval_metrics.append(eval_metrics)
             initial_record = progress.record(
                 -1, **jax.device_get(average_metrics(initial_eval_metrics)))
             jax.block_until_ready((initial_eval_rng, initial_record))
