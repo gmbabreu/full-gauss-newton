@@ -138,6 +138,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_interpolation_lambda=1.0,
+    cg_adam_aux=False,  # one outer Adam step on Muon-excluded leaves
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
     cg_log_matrix_norms=False,
     cg_matrix_norm_frobenius_probes=4,
@@ -1074,15 +1075,57 @@ def main(argv):
         #     A_t = λ G + (1-λ)/η * D_t.
         #
         # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
-        x, _ = cg(
-            Av,
-            rhs,
-            x0=cg_x0,
-            tol=FLAGS.cg_tol,
-            atol=FLAGS.cg_atol,
-            maxiter=FLAGS.cg_maxiter,
-            M=apply_D_inv,
-        )
+        if FLAGS.cg_adam_aux:
+            # Same effective groups as Muon: hidden 2D matrices versus
+            # embedding, head, and non-2D Adam fallback parameters.
+            hidden_mask = unflatten_dict({
+                name: p.ndim == 2 and name not in (
+                    'params.transformer.wte.embedding', 'params.lm_head.kernel')
+                for name, p in flatten_dict(params0, sep='.').items()
+            }, sep='.')
+
+            def hidden_only(tree):
+                return jax.tree_util.tree_map(
+                    lambda v, h: v if h else jnp.zeros_like(v), tree, hidden_mask)
+
+            # rhs = -m_hat; these moments already advance once per outer step.
+            adam_update = jax.tree_util.tree_map(
+                lambda u, h: jnp.zeros_like(u) if h else adam_lr * u,
+                apply_D_inv(rhs), hidden_mask)
+
+            # Hold Adam coordinates fixed; retain their GN coupling to hidden
+            # weights. Full-tree identity on unused coordinates keeps B SPD
+            # whenever the hidden restriction of A is SPD.
+            hidden_rhs = hidden_only(jax.tree_util.tree_map(
+                lambda b, aa: b - aa, rhs, Av(adam_update)))
+
+            def hidden_A(v):
+                return jax.tree_util.tree_map(
+                    lambda av, vi, h: av if h else vi,
+                    Av(hidden_only(v)), v, hidden_mask)
+
+            def hidden_M(v):
+                return jax.tree_util.tree_map(
+                    lambda mv, vi, h: mv if h else vi,
+                    apply_D_inv(hidden_only(v)), v, hidden_mask)
+
+            hidden_x, _ = cg(
+                hidden_A, hidden_rhs, x0=hidden_only(cg_x0),
+                tol=FLAGS.cg_tol, atol=FLAGS.cg_atol,
+                maxiter=FLAGS.cg_maxiter, M=hidden_M)
+            x = jax.tree_util.tree_map(
+                lambda hx, a, h: hx if h else a,
+                hidden_x, adam_update, hidden_mask)
+        else:
+            x, _ = cg(
+                Av,
+                rhs,
+                x0=cg_x0,
+                tol=FLAGS.cg_tol,
+                atol=FLAGS.cg_atol,
+                maxiter=FLAGS.cg_maxiter,
+                M=apply_D_inv,
+            )
 
         # Compute residual for logging 
         # relative_residual = ||A x - rhs|| / ||rhs||
@@ -1132,6 +1175,16 @@ def main(argv):
             'adam_step': new_adam_step,
             **matrix_norm_metrics,
         }
+        if FLAGS.cg_adam_aux:
+            # The existing relative_residual still measures the FULL system.
+            # Only this conditional residual should track CG convergence.
+            metrics.update({
+                'cg_hidden_relative_residual': global_norm(hidden_only(residual))
+                    / (global_norm(hidden_rhs) + 1e-12),
+                'cg_hidden_rhs_norm': global_norm(hidden_rhs),
+                'cg_hidden_update_norm': global_norm(hidden_only(x)),
+                'cg_adam_aux_update_norm': global_norm(adam_update),
+            })
 
         return (
             new_params,
@@ -1460,6 +1513,17 @@ def main(argv):
             }
 
         if FLAGS.optimizer_type == "cg":
+            if FLAGS.cg_adam_aux:
+                flat_params = flatten_dict(train_state.params, sep='.')
+                flat_mask = flatten_dict(muon_matrix_mask, sep='.')
+                for name, p in flat_params.items():
+                    if not flat_mask[name]:
+                        print(f"CG auxiliary Adam: {name}, shape={p.shape}", flush=True)
+                print("CG hidden parameter count:", sum(
+                    p.size for name, p in flat_params.items() if flat_mask[name]),
+                    "Adam auxiliary parameter count:", sum(
+                    p.size for name, p in flat_params.items() if not flat_mask[name]),
+                    flush=True)
             # Persistent Adam first and second moments for the CG path.
             cg_first_moment = jax.tree_util.tree_map(
                 jnp.zeros_like,
