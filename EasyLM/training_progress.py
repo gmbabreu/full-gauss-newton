@@ -103,6 +103,57 @@ def resolve_progress(step_override=-1, token_override=-1, saved_state=None, *, b
                             dataset_total_tokens=tokens, comparison_origin=origin)
 
 
+def restore_full_state_progress(metadata, flags, restored_step):
+    """Recover reporting for legacy first-order full-state checkpoints.
+
+    TrainState.step counts microsteps, including under Optax MultiSteps. This
+    only recovers reporting; it does not claim an exact RNG/data continuation.
+    """
+    if not isinstance(metadata, dict) or metadata.get('step') != restored_step:
+        raise ValueError('Full-state reporting requires metadata matching the restored step')
+    saved_flags = metadata.get('flags', {})
+
+    def dimensions(config):
+        dataset = config.get('train_dataset', {})
+        kind = dataset.get('type')
+        if kind not in ('huggingface', 'json'):
+            raise ValueError('Cannot reconstruct full-state reporting for this dataset type')
+        dataset_config = dataset.get(f'{kind}_dataset', {})
+        accumulation = config.get('optimizer', {}).get('accumulate_gradient_steps')
+        batch_size = dataset_config.get('batch_size')
+        seq_length = dataset_config.get('seq_length')
+        if any(value is None or value <= 0 for value in
+               (accumulation, batch_size, seq_length)):
+            raise ValueError('Full-state metadata lacks accumulation, batch size or sequence length')
+        return kind, accumulation, batch_size, seq_length
+
+    saved_dimensions = dimensions(saved_flags)
+    if saved_dimensions != dimensions(flags):
+        raise ValueError('Full-state reporting requires unchanged dataset type, accumulation, '
+                         'batch size and sequence length')
+    kind, accumulation, batch_size, seq_length = saved_dimensions
+    solved_tokens = restored_step * batch_size * seq_length
+    completed_updates = restored_step // accumulation
+    saved = metadata.get('training_progress')
+    if saved is not None:
+        progress = TrainingProgress.from_state_dict(saved)
+        if (progress.phase_completed_updates != completed_updates
+                or progress.phase_solve_tokens != solved_tokens):
+            raise ValueError('Saved reporting counters do not match the restored optimizer step')
+        return progress.state_dict()
+
+    # Old trainer totals assumed a constant batch size throughout the phase.
+    dataset_config = saved_flags['train_dataset'][f'{kind}_dataset']
+    return TrainingProgress(
+        step_offset=max(saved_flags.get('log_step_offset', -1), 0),
+        token_offset=max(saved_flags.get('log_token_offset', -1), 0),
+        phase_completed_updates=completed_updates,
+        phase_solve_tokens=solved_tokens,
+        dataset_total_tokens=dataset_config.get('tokens_count_at_start', 0) + solved_tokens,
+        comparison_origin='full-state checkpoint metadata',
+    ).state_dict()
+
+
 def configure_wandb_run(run):
     run.define_metric("*", step_metric="total_tokens")
     for name in ("total_tokens", "cumulative_tokens", "completed_updates", "step", "global_step"):

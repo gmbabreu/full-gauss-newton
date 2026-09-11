@@ -24,8 +24,12 @@ def load_from_gcs(gcs_path, local_path):
         raise ValueError(f"No files found at {blob_path} in bucket {bucket_name}")
 
     # Checkpoints may share a prefix with milestones, e.g. state and state_900.
-    # An exact object path is a file even when such siblings also exist.
-    exact_blob = next((blob for blob in blobs if blob.name == blob_path), None)
+    # An exact object path is a file even when such siblings also exist,
+    # unless it is a directory marker.
+    exact_blob = next(
+        (blob for blob in blobs if blob.name == blob_path and not blob.name.endswith('/')),
+        None,
+    )
     if exact_blob is not None:
         os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
         exact_blob.download_to_filename(local_path)

@@ -31,6 +31,7 @@ from EasyLM.training_resume import (
 )
 from EasyLM.training_progress import (
     ProcessTiming, TrainingProgress, configure_wandb_run, resolve_progress,
+    restore_full_state_progress,
 )
 from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
@@ -144,6 +145,7 @@ def main(argv):
                       and FLAGS.checkpointer.save_optimizer_state
                       and FLAGS.checkpointer.float_dtype == 'fp32')
     resume_metadata = None
+    reporting_metadata = None
     if raw_adam and FLAGS.load_checkpoint.startswith('trainstate::'):
         if not resumable_save:
             raise ValueError('Full raw-HF Adam resume requires FP32 state, accumulation=1, '
@@ -166,6 +168,14 @@ def main(argv):
         if name != 'streaming_train_state' and int(name.rsplit('_', 1)[1]) != resume_metadata['step']:
             raise ValueError('Milestone filename and metadata step differ')
         FLAGS.load_dataset_state = companions['dataset']
+    elif FLAGS.load_checkpoint.startswith('trainstate::'):
+        checkpoint_path = FLAGS.load_checkpoint.split('::', 1)[1]
+        metadata_path = resume_companion_paths(checkpoint_path)['metadata']
+        try:
+            reporting_metadata = mlxu.load_pickle(metadata_path)
+        except FileNotFoundError as exc:
+            raise ValueError('Full-state resume needs its metadata companion to recover '
+                             'reporting counters; use a params-only branch for a fresh phase') from exc
 
     set_random_seed(FLAGS.seed)
 
@@ -412,6 +422,11 @@ def main(argv):
             if restored_step >= FLAGS.total_steps:
                 raise ValueError(f'Checkpoint already completed {restored_step} updates; target is {FLAGS.total_steps}')
 
+        legacy_progress = None
+        if init_checkpoint_path.startswith('trainstate::') and resume_metadata is None:
+            legacy_progress = restore_full_state_progress(
+                reporting_metadata, flags_config_dict, int(jax.device_get(train_state.step)))
+
         # param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
         param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
@@ -460,6 +475,8 @@ def main(argv):
                 dataset_total_tokens=cursor,
                 comparison_origin='validated legacy Adam zero origin',
             ).state_dict()
+        elif init_checkpoint_path.startswith('trainstate::') and resume_metadata is None:
+            saved_progress = legacy_progress
         progress = resolve_progress(
             FLAGS.log_step_offset, FLAGS.log_token_offset, saved_progress,
             branch=init_checkpoint_path.startswith('trainstate_params::'),
@@ -511,7 +528,9 @@ def main(argv):
             jax.block_until_ready((initial_eval_rng, initial_record))
             timing.stop_eval()
             initial_record.update(timing.metrics())
-            wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
+            history_step = (initial_record['completed_updates']
+                            if FLAGS.optimizer.accumulate_gradient_steps == 1 else start_step)
+            wandb.log(initial_record, step=history_step, commit=True)
 
         train_iterator = iter(dataset)
         for step in step_counter:
@@ -545,7 +564,9 @@ def main(argv):
 
             
 
-            if applied_update and step % FLAGS.log_freq == 0:
+            # Preserve the historical evaluation cadence and its RNG advances,
+            # including evaluations between accumulated optimizer updates.
+            if step % FLAGS.log_freq == 0:
                 log_metrics = {}
                 stop_after_log = False
                 log_metrics.update(metrics)
@@ -594,7 +615,12 @@ def main(argv):
                 log_metrics = jax.device_get(log_metrics)
                 log_metrics.update(timing.metrics())
                 log_metrics = progress.record(step, **log_metrics)
-                wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
+                # Accumulation can emit several rows at one completed-update
+                # count. Use microsteps for W&B's internal index in that case;
+                # the explicit step/token metrics still describe actual progress.
+                history_step = (log_metrics['completed_updates']
+                                if FLAGS.optimizer.accumulate_gradient_steps == 1 else step + 1)
+                wandb.log(log_metrics, step=history_step, commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                 if stop_after_log:
                     break
@@ -642,7 +668,7 @@ def main(argv):
             timing.stop_eval()
         terminal_metrics.update(timing.metrics())
         terminal_record = progress.record(
-            progress.phase_completed_updates - 1, **terminal_metrics)
+            int(jax.device_get(train_state.step)) - 1, **terminal_metrics)
         for name, value in terminal_record.items():
             wandb.run.summary[f'terminal_{name}'] = value
 

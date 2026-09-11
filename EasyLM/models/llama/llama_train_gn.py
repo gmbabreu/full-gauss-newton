@@ -220,10 +220,14 @@ def main(argv):
             'Full-state GN continuation is not supported; start a new params-only branch')
     branch_parent_metadata = None
     branch_parent_complete = None
-    if (init_checkpoint_path.startswith('trainstate_params::')
-            and FLAGS.load_dataset_state
-            and FLAGS.train_dataset.type == 'huggingface'
-            and not FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir):
+    is_muon_gn_packed_branch = (
+        FLAGS.optimizer_type == 'muon' and FLAGS.gauss_newton
+        and init_checkpoint_path.startswith('trainstate_params::')
+        and bool(FLAGS.load_dataset_state)
+        and FLAGS.train_dataset.type == 'huggingface'
+        and not FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir
+    )
+    if is_muon_gn_packed_branch:
         parent_path = init_checkpoint_path.split('::', 1)[1]
         parent_paths = resume_companion_paths(parent_path)
 
@@ -263,20 +267,16 @@ def main(argv):
             raise ValueError('Checkpoint has no dataset state')
         if isinstance(dataset, HuggingfaceDataset):
             # A fresh Muon-GN branch can regroup the saved token stream.
-            # Full-state continuation keeps strict batch-size validation.
-            allow_rebatch = (
-                FLAGS.optimizer_type == 'muon' and FLAGS.gauss_newton
-                and init_checkpoint_path.startswith('trainstate_params::')
-            )
-            if allow_rebatch and dataset_state.get('packed_state_version') != 1:
+            # Other initialization routes keep strict batch-size validation.
+            if is_muon_gn_packed_branch and dataset_state.get('packed_state_version') != 1:
                 raise ValueError('Muon-GN branching requires a packed dataset checkpoint')
-            if allow_rebatch:
+            if is_muon_gn_packed_branch:
                 validate_branch_parent(
                     branch_parent_metadata, branch_parent_complete, dataset_state,
                     FLAGS.log_step_offset, FLAGS.log_token_offset)
             dataset.load_state_dict(
                 dataset_state,
-                allow_batch_size_change=allow_rebatch,
+                allow_batch_size_change=is_muon_gn_packed_branch,
             )
         else:
             dataset.load_state_dict(dataset_state)
