@@ -12,6 +12,7 @@ import timeit
 import os
 import wandb
 import copy
+import uuid
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,13 @@ import optax
 from EasyLM.data import DatasetFactory
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
+from EasyLM.training_resume import (
+    resume_companion_paths, validate_resume_metadata, validate_dataset_snapshot,
+)
+from EasyLM.training_progress import (
+    ProcessTiming, TrainingProgress, configure_wandb_run, resolve_progress,
+    restore_full_state_progress,
+)
 from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
@@ -51,6 +59,10 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_checkpoint='',
     load_dataset_state='',
     log_freq=50,
+    log_step_offset=-1,
+    log_token_offset=-1,
+    log_time_offset_s=0.0,
+    log_initial_eval=False,
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
@@ -124,6 +136,47 @@ def main(argv):
 
     log_config = mlxu.flatten_config_dict(flags_config_dict)
 
+    raw_adam = (FLAGS.optimizer.type == 'adamw'
+                and FLAGS.train_dataset.type == 'huggingface'
+                and not FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir)
+    resumable_save = (raw_adam and FLAGS.optimizer.accumulate_gradient_steps == 1
+                      and not FLAGS.weight_average and FLAGS.dtype == 'fp32'
+                      and FLAGS.param_dtype == 'fp32'
+                      and FLAGS.checkpointer.save_optimizer_state
+                      and FLAGS.checkpointer.float_dtype == 'fp32')
+    resume_metadata = None
+    reporting_metadata = None
+    if raw_adam and FLAGS.load_checkpoint.startswith('trainstate::'):
+        if not resumable_save:
+            raise ValueError('Full raw-HF Adam resume requires FP32 state, accumulation=1, '
+                             'weight_average=False and save_optimizer_state=True')
+        checkpoint_path = FLAGS.load_checkpoint.split('::', 1)[1]
+        companions = resume_companion_paths(checkpoint_path)
+        if FLAGS.load_dataset_state and FLAGS.load_dataset_state != companions['dataset']:
+            raise ValueError('load_dataset_state must match the model checkpoint companion')
+
+        def load_companion(name):
+            path = companions[name]
+            if path.startswith('gs://'):
+                path = load_from_gcs(path, os.path.join(FLAGS.tmp_dir, f'resume_{name}.pkl'))
+            return mlxu.load_pickle(path)
+
+        complete = load_companion('complete')
+        resume_metadata = load_companion('metadata')
+        validate_resume_metadata(resume_metadata, complete, flags_config_dict)
+        name = os.path.basename(checkpoint_path)
+        if name != 'streaming_train_state' and int(name.rsplit('_', 1)[1]) != resume_metadata['step']:
+            raise ValueError('Milestone filename and metadata step differ')
+        FLAGS.load_dataset_state = companions['dataset']
+    elif FLAGS.load_checkpoint.startswith('trainstate::'):
+        checkpoint_path = FLAGS.load_checkpoint.split('::', 1)[1]
+        metadata_path = resume_companion_paths(checkpoint_path)['metadata']
+        try:
+            reporting_metadata = mlxu.load_pickle(metadata_path)
+        except FileNotFoundError as exc:
+            raise ValueError('Full-state resume needs its metadata companion to recover '
+                             'reporting counters; use a params-only branch for a fresh phase') from exc
+
     set_random_seed(FLAGS.seed)
 
     print(FLAGS.train_dataset)
@@ -141,13 +194,18 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
+    if FLAGS.load_dataset_state.startswith('gs://'):
         FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != "" and mlxu.load_pickle(FLAGS.load_dataset_state) is not None:
-        dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
+    if FLAGS.load_dataset_state:
+        dataset_state = mlxu.load_pickle(FLAGS.load_dataset_state)
+        if dataset_state is None:
+            raise ValueError('Checkpoint has no dataset state')
+        if resume_metadata is not None:
+            validate_dataset_snapshot(dataset_state, resume_metadata)
+        dataset.load_state_dict(dataset_state)
         print('loaded dataset state', flush=True)
 
     if FLAGS.eval_steps > 0:
@@ -286,15 +344,32 @@ def main(argv):
             variant=variant,
             flags=flags_config_dict,
             llama_config=llama_config.to_dict(),
+            training_progress=progress.state_dict(),
         )
+        dataset_state = None
+        if resumable_save:
+            snapshot_id = uuid.uuid4().hex
+            metadata.update(resume_version=1, snapshot_id=snapshot_id,
+                train_rng=np.asarray(jax.device_get(sharded_rng)),
+                optimizer_saved=True, checkpoint_float_dtype='fp32')
+            dataset_state = dataset.get_state_dict()
+            dataset_state.update(training_step=step, snapshot_id=snapshot_id)
+            validate_dataset_snapshot(dataset_state, metadata)
         checkpointer.save_all(
             train_state=train_state,
             gather_fns=gather_fns,
             metadata=metadata,
             ema=ema,
-            # dataset=dataset.get_state_dict(),
+            dataset=dataset_state,
             milestone=milestone,
         )
+        if resumable_save:
+            suffix = f'_{step}' if milestone else ''
+            checkpointer.save_pickle(dict(resume_version=1, step=step,
+                snapshot_id=snapshot_id), f'complete{suffix}.pkl')
+            if checkpointer.enable:
+                print(f'CHECKPOINT_COMPLETE step={step} '
+                      f'path={output_dir}/streaming_train_state{suffix}', flush=True)
     
 
     def shard_batch(batch, num_devices):
@@ -316,7 +391,7 @@ def main(argv):
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
             # distinguish between loading from train_state and loading from params
-            if train_state is not None and output_dir in init_checkpoint_path: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
+            if resume_metadata is None and train_state is not None and output_dir in init_checkpoint_path: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
                 # dataset_path = os.path.join(output_dir, 'dataset.pkl')
                 # dataset.load_state_dict(mlxu.load_pickle(dataset_path))
                 
@@ -340,6 +415,18 @@ def main(argv):
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
+        if resume_metadata is not None:
+            restored_step = int(jax.device_get(train_state.step))
+            if restored_step != resume_metadata['step']:
+                raise ValueError('Model state and metadata step differ')
+            if restored_step >= FLAGS.total_steps:
+                raise ValueError(f'Checkpoint already completed {restored_step} updates; target is {FLAGS.total_steps}')
+
+        legacy_progress = None
+        if init_checkpoint_path.startswith('trainstate::') and resume_metadata is None:
+            legacy_progress = restore_full_state_progress(
+                reporting_metadata, flags_config_dict, int(jax.device_get(train_state.step)))
+
         # param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
         param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
@@ -349,6 +436,8 @@ def main(argv):
         flags_config_dict['param_count_nonembed'] = param_count_nonembed
 
         if FLAGS.wandb_run_id:
+            if FLAGS.load_checkpoint:
+                raise ValueError('Use a new W&B run ID when replaying a checkpoint; backward history is unsupported')
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
         else:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, config=log_config, dir=FLAGS.wandb_dir)  # Replace with your project name
@@ -370,8 +459,36 @@ def main(argv):
                 gcs_path = os.path.join(output_dir, "wandb_id.txt")
                 upload_to_gcs(local_path, gcs_path)
 
+        configure_wandb_run(wandb.run)
 
         start_step = int(jax.device_get(train_state.step))
+        sharded_rng = (jax.device_put(resume_metadata['train_rng'])
+                       if resume_metadata is not None else next_rng())
+        saved_progress = (resume_metadata or {}).get('training_progress')
+        if resume_metadata is not None and saved_progress is None:
+            # Validated accumulation-1 schema-v1 Adam checkpoints used a
+            # zero-origin token axis, so their reporting state is reconstructible.
+            cursor = dataset_state['metadata']['dataset_total_tokens']
+            saved_progress = TrainingProgress(
+                phase_completed_updates=resume_metadata['step'],
+                phase_solve_tokens=cursor,
+                dataset_total_tokens=cursor,
+                comparison_origin='validated legacy Adam zero origin',
+            ).state_dict()
+        elif init_checkpoint_path.startswith('trainstate::') and resume_metadata is None:
+            saved_progress = legacy_progress
+        progress = resolve_progress(
+            FLAGS.log_step_offset, FLAGS.log_token_offset, saved_progress,
+            branch=init_checkpoint_path.startswith('trainstate_params::'),
+        )
+        flags_config_dict['training_progress'] = progress.state_dict()
+        wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
+        wandb.config.update({
+            'log_time_offset_s': FLAGS.log_time_offset_s,
+            'timing_scope': 'current_process',
+            'timing_includes_first_use_compilation': True,
+        }, allow_val_change=True)
+        timing = ProcessTiming()
         
         def copy_array(x):
             return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
@@ -382,8 +499,6 @@ def main(argv):
                 save_checkpoint(train_state, ema=ema)
             else:
                 save_checkpoint(train_state)
-
-        sharded_rng = next_rng()
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
@@ -397,7 +512,36 @@ def main(argv):
             ema = jax.tree.map(copy_array, train_state.params)
 
         old_params = jax.device_get(train_state.params)
-        for step, (batch, dataset_metrics) in zip(step_counter, dataset):
+        jax.block_until_ready((train_state, sharded_rng))
+        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
+            timing.start()
+            initial_eval_metrics = []
+            initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
+            with DatasetFactory.initial_eval_iterator(eval_dataset) as initial_eval_iterator:
+                for _ in range(FLAGS.eval_steps):
+                    eval_batch, _ = next(initial_eval_iterator)
+                    initial_eval_rng, eval_metrics = sharded_eval_step(
+                        train_state.params, initial_eval_rng, eval_batch)
+                    initial_eval_metrics.append(eval_metrics)
+            initial_record = progress.record(
+                -1, **jax.device_get(average_metrics(initial_eval_metrics)))
+            jax.block_until_ready((initial_eval_rng, initial_record))
+            timing.stop_eval()
+            initial_record.update(timing.metrics())
+            history_step = (initial_record['completed_updates']
+                            if FLAGS.optimizer.accumulate_gradient_steps == 1 else start_step)
+            wandb.log(initial_record, step=history_step, commit=True)
+
+        train_iterator = iter(dataset)
+        for step in step_counter:
+            timing.start()
+            try:
+                batch, dataset_metrics = next(train_iterator)
+            except StopIteration:
+                timing.cancel()
+                break
+
+            progress.charge('solve', batch, dataset_metrics)
 
             batch = jax.tree.map(
                 lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
@@ -409,7 +553,9 @@ def main(argv):
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
-
+            applied_update = ((step + 1) % FLAGS.optimizer.accumulate_gradient_steps == 0)
+            if applied_update:
+                progress.complete_update()
             if FLAGS.weight_average:
                 alpha = FLAGS.weight_average_decay
                 # device get train_state params
@@ -418,23 +564,25 @@ def main(argv):
 
             
 
+            # Preserve the historical evaluation cadence and its RNG advances,
+            # including evaluations between accumulated optimizer updates.
             if step % FLAGS.log_freq == 0:
-                optimizer_step = step // FLAGS.optimizer.accumulate_gradient_steps
-                log_metrics = {"step": optimizer_step}
+                log_metrics = {}
+                stop_after_log = False
                 log_metrics.update(metrics)
-                # Token consumption logging
-                tokens_per_step = FLAGS.train_dataset_batch_size * seq_length * FLAGS.optimizer.accumulate_gradient_steps
-                log_metrics["total_tokens"] = tokens_per_step * (optimizer_step + 1)
                 old_params_host = jax.device_get(old_params)
                 new_params_host = jax.device_get(train_state.params)
                 update_norm = float(global_norm(jax.tree_util.tree_map(lambda x, y: x - y, new_params_host, old_params_host)))
                 log_metrics["update_norm"] = update_norm
                 log_metrics.update(dataset_metrics)
+                jax.block_until_ready((train_state, sharded_rng, metrics, log_metrics))
+                timing.stop_train_interval(completed_update=applied_update)
                 
 
                 do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
 
                 if do_eval: # eval_freq must be | by log_freq
+                    timing.start()
                     eval_iterator = iter(eval_dataset)
                     eval_metric_list = []
                     for _ in range(FLAGS.eval_steps):
@@ -449,23 +597,36 @@ def main(argv):
                         )
                         eval_metric_list.append(eval_metrics)
                     log_metrics.update(average_metrics(eval_metric_list))
+                    jax.block_until_ready((sharded_rng, log_metrics))
+                    timing.stop_eval()
                     
                     if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
-                        wandb.log(log_metrics, step=optimizer_step)
                         tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                         
-                        break
+                        stop_after_log = True
                     elif FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] >= 15:
                         print(f"Loss {log_metrics['eval_loss']} too high, stopping at step {step}")
-                        break
+                        stop_after_log = True
                     # metrics.update({"step": step})
                     # metrics = jax.device_get(metrics)
                     # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                wandb.log(log_metrics, step=optimizer_step)
+                log_metrics.update(timing.metrics())
+                log_metrics = progress.record(step, **log_metrics)
+                # Accumulation can emit several rows at one completed-update
+                # count. Use microsteps for W&B's internal index in that case;
+                # the explicit step/token metrics still describe actual progress.
+                history_step = (log_metrics['completed_updates']
+                                if FLAGS.optimizer.accumulate_gradient_steps == 1 else step + 1)
+                wandb.log(log_metrics, step=history_step, commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                if stop_after_log:
+                    break
+            else:
+                jax.block_until_ready((train_state, sharded_rng, metrics))
+                timing.stop_train_interval(completed_update=applied_update)
             
             
 
@@ -482,7 +643,13 @@ def main(argv):
                 else:
                     save_checkpoint(train_state)
 
+        # Save before the reporting-only terminal evaluation consumes RNG.
+        if FLAGS.save_model_freq > 0:
+            save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
+
+        terminal_metrics = {}
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
+            timing.start()
             eval_iterator = iter(eval_dataset)
             eval_metric_list = []
             for _ in range(FLAGS.eval_steps):
@@ -496,12 +663,14 @@ def main(argv):
                     eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
-            log_metrics.update(average_metrics(eval_metric_list))
-            log_metrics = jax.device_get(log_metrics)
-            wandb.log(log_metrics, step=optimizer_step)
-            tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
-        if FLAGS.save_model_freq > 0:
-            save_checkpoint(train_state)
+            terminal_metrics.update(jax.device_get(average_metrics(eval_metric_list)))
+            jax.block_until_ready((sharded_rng, terminal_metrics))
+            timing.stop_eval()
+        terminal_metrics.update(timing.metrics())
+        terminal_record = progress.record(
+            int(jax.device_get(train_state.step)) - 1, **terminal_metrics)
+        for name, value in terminal_record.items():
+            wandb.run.summary[f'terminal_{name}'] = value
 
     # jax.profiler.stop_trace()
     wandb.finish()

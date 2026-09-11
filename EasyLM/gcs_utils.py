@@ -23,18 +23,31 @@ def load_from_gcs(gcs_path, local_path):
     if not blobs:
         raise ValueError(f"No files found at {blob_path} in bucket {bucket_name}")
 
-    if len(blobs) == 1 and blobs[0].name == blob_path:  # Single file case
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        blobs[0].download_to_filename(local_path)
+    # Checkpoints may share a prefix with milestones, e.g. state and state_900.
+    # An exact object path is a file even when such siblings also exist,
+    # unless it is a directory marker.
+    exact_blob = next(
+        (blob for blob in blobs if blob.name == blob_path and not blob.name.endswith('/')),
+        None,
+    )
+    if exact_blob is not None:
+        os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
+        exact_blob.download_to_filename(local_path)
         print(f"Downloaded {blob_path} to {local_path}")
     else:  # Directory case
+        # GCS prefixes are lexical: "data" also matches "data_backup".
+        # Keep only descendants of this directory (or all objects at bucket root).
+        directory_prefix = blob_path.rstrip('/') + '/' if blob_path else ''
+        blobs = [blob for blob in blobs if blob.name.startswith(directory_prefix)]
+        if not blobs:
+            raise ValueError(f"No files found at {blob_path} in bucket {bucket_name}")
         if not local_path.endswith('/'):
             local_path += '/'  # Ensure local directory structure
         os.makedirs(local_path, exist_ok=True)
 
         for blob in blobs:
             if not blob.name.endswith('/'):  # Ignore "directory" markers
-                relative_path = blob.name[len(blob_path):].lstrip('/')  # Remove the prefix
+                relative_path = blob.name[len(directory_prefix):].lstrip('/')  # Remove the prefix
                 local_file_path = os.path.join(local_path, relative_path)
                 os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
                 blob.download_to_filename(local_file_path)

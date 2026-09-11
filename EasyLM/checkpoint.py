@@ -62,6 +62,7 @@ class StreamingCheckpointer(object):
             import tempfile
             tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".msgpack")
             local_path = tmp_file.name
+            tmp_file.close()
 
         # Save the train state locally
         # with mlxu.open_file(local_path, "wb") as fout:
@@ -85,6 +86,7 @@ class StreamingCheckpointer(object):
         # If the path is a GCS bucket, upload the file
         if is_gcs:
             StreamingCheckpointer.upload_to_gcs(local_path, path)
+            os.remove(local_path)
 
     @staticmethod
     def upload_to_gcs(local_path, gcs_path):

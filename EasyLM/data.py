@@ -1,5 +1,8 @@
 import time
 from functools import partial
+from copy import copy, deepcopy
+from contextlib import contextmanager
+from itertools import islice
 import json
 import base64
 from multiprocessing import Pool
@@ -40,6 +43,27 @@ class DatasetFactory(object):
             return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
         else:
             raise ValueError(f'Unknown dataset type: {config.type}')
+
+    @staticmethod
+    @contextmanager
+    def initial_eval_iterator(dataset):
+        """Evaluate without advancing the regular loader's cursor or buffers.
+
+        Share the read-only dataset/tokenizer, but isolate loader state. Raw HF
+        packing is already iterator-local; JSON cursors live on the loader and
+        the pretokenized loader additionally mutates shared packing lists.
+        """
+        isolated = copy(dataset)
+        if isinstance(dataset, OptHuggingfaceDataset):
+            isolated._token_buffer = list(dataset._token_buffer)
+            isolated._loss_mask_buffer = list(dataset._loss_mask_buffer)
+        iterator = iter(isolated)
+        try:
+            yield iterator
+        finally:
+            close = getattr(iterator, 'close', None)
+            if close is not None:
+                close()
 
     def __init__(self):
         raise ValueError('DatasetFactory is a static class and should not be instantiated.')
@@ -172,108 +196,83 @@ class HuggingfaceDataset(object):
             'dataset_total_tokens': self.config.tokens_count_at_start,
         }
 
-        # if self.config.tokens_count_at_start > 0:
-        #     print(f"Skipping {self.config.tokens_count_at_start} tokens at the start of the dataset.", flush=True)
-        #     steps_to_skip = self.config.tokens_count_at_start // (self.config.seq_length * self.config.batch_size)
-        #     self._dataset = self._dataset.skip(steps_to_skip)
-        #     self.start_steps = steps_to_skip
-        #     print(f"Skipped {steps_to_skip} steps.", flush=True)
-
+        self._start_state = dict(
+            examples_consumed=0, token_buffer=[], loss_mask_buffer=[],
+            metadata=dict(self.metadata),
+        )
+        self._live_state = deepcopy(self._start_state)
 
     def __iter__(self):
+        state = deepcopy(self._start_state)
         chunk_size = self.config.batch_size * self.config.seq_length
-        total_tokens = self.metadata['dataset_total_tokens']
-
-        tokens_to_skip = self.config.tokens_count_at_start
-        # tokens_to_skip = 0
-
-        # Iterator over the dataset
-        dataset_iterator = iter(self._dataset)
-        
-
-        # # NA: Added this to skip tokens at the start for resuming mid training
-        # while tokens_to_skip > 0:
-        #     skip_token_buffer = []
-        #     skip_loss_mask_buffer = []
-        #     try:
-        #         example = next(dataset_iterator)
-        #     except StopIteration:
-        #         # End of dataset reached before skipping desired tokens
-        #         print("Reached end of dataset while skipping tokens.")
-        #         return
-            
-        #     start_steps = 0
-        #     while len(skip_token_buffer) < chunk_size + 1:
-        #         tokens, loss_masks = self.text_processor(example)
-        #         skip_token_buffer.extend(tokens)
-        #         skip_loss_mask_buffer.extend(loss_masks)
-
-            # while len(skip_token_buffer) > chunk_size + 1:
-            #     if tokens_to_skip <= 0:
-            #         break
-            
-            #     tokens = np.array(skip_token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(
-            #                     self.config.batch_size, -1
-            #                 )
-            #     loss_masks = np.array(skip_loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(
-            #                 self.config.batch_size, -1
-            #             ),
-            #     skip_token_buffer = skip_token_buffer[chunk_size:]
-            #     skip_loss_mask_buffer = skip_loss_mask_buffer[chunk_size:]
-
-            #     tokens_to_skip -= chunk_size
-            #     start_steps += 1
-      
-        # print(f"Created iterator; Starting from step {start_steps}.", flush=True)
+        token_buffer = state['token_buffer']
+        loss_mask_buffer = state['loss_mask_buffer']
+        examples_consumed = state['examples_consumed']
+        total_tokens = state['metadata']['dataset_total_tokens']
+        dataset_iterator = islice(iter(self._dataset), examples_consumed, None)
         while True:
-            token_buffer = []
-            loss_mask_buffer = []
-
-            # if len(skip_token_buffer) != 0: # NA: Resuming mid training
-            #     token_buffer.extend(skip_token_buffer)
-            #     loss_mask_buffer.extend(skip_loss_mask_buffer)
-            #     skip_token_buffer = []
-            #     skip_loss_mask_buffer = []
-
-            for index, example in enumerate(dataset_iterator, start=self.metadata['dataset_example_index']):
+            if len(token_buffer) <= chunk_size + 1:
+                try:
+                    example = next(dataset_iterator)
+                except StopIteration:
+                    return
                 tokens, loss_masks = self.text_processor(example)
                 token_buffer.extend(tokens)
                 loss_mask_buffer.extend(loss_masks)
-                while len(token_buffer) > chunk_size + 1:
-                    total_tokens += chunk_size
-                    self.metadata = {
-                        'dataset_example_index': index,
-                        'dataset_total_tokens': total_tokens,
-                    }
-                    batch = {
-                        'input_tokens': np.array(token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(
-                            self.config.batch_size, -1
-                        ),
-                        'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=self.config.batch_token_dtype).reshape(
-                            self.config.batch_size, -1
-                        ),
-                        'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(
-                            self.config.batch_size, -1
-                        ),
-                    }
-                    if self.config.always_start_with_bos:
-                        batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
-                    yield batch, self.metadata
-                    token_buffer = token_buffer[chunk_size:]
-                    loss_mask_buffer = loss_mask_buffer[chunk_size:]
+                examples_consumed += 1
+                continue
+            total_tokens += chunk_size
+            batch = {
+                'input_tokens': np.array(token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(self.config.batch_size, -1),
+                'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=self.config.batch_token_dtype).reshape(self.config.batch_size, -1),
+                'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(self.config.batch_size, -1),
+            }
+            if self.config.always_start_with_bos:
+                batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
+            token_buffer = token_buffer[chunk_size:]
+            loss_mask_buffer = loss_mask_buffer[chunk_size:]
+            self.metadata = dict(dataset_example_index=examples_consumed - 1, dataset_total_tokens=total_tokens)
+            self._live_state = dict(examples_consumed=examples_consumed,
+                token_buffer=list(token_buffer), loss_mask_buffer=list(loss_mask_buffer),
+                metadata=dict(self.metadata))
+            yield batch, self.metadata
 
     def get_state_dict(self):
-        print(f"Saving state; Starting from step {self.metadata['dataset_example_index']}.", flush=True)
-        self.metadata = jax.device_get(self.metadata)
-        return dict(config=self.config, metadata=self.metadata)
+        return dict(packed_state_version=1, config=self.config.to_dict(),
+            text_processor_config=self.text_processor.config.to_dict(),
+            tokenizer_name=getattr(self.tokenizer, 'name_or_path', None),
+            tokenizer_vocab_size=len(self.tokenizer), **deepcopy(self._live_state))
 
-    def load_state_dict(self, state_dict):
-        if 'config' in state_dict:
-            self.config.update(mlxu.ConfigDict(state_dict['config']))
-        self.metadata = state_dict.get('metadata', self.metadata)
-        self._dataset = self._dataset.skip(self.metadata['dataset_example_index']+1)
-
-        print(f"Loaded state; Starting from step {self.metadata['dataset_example_index']}.", flush=True)
+    def load_state_dict(self, state_dict, *, allow_batch_size_change=False):
+        if state_dict.get('packed_state_version') != 1:
+            if 'config' in state_dict:
+                self.config.update(mlxu.ConfigDict(state_dict['config']))
+            self.metadata = dict(state_dict.get('metadata', self.metadata))
+            self._start_state = dict(examples_consumed=self.metadata['dataset_example_index'] + 1,
+                token_buffer=[], loss_mask_buffer=[], metadata=dict(self.metadata))
+            self._live_state = deepcopy(self._start_state)
+            return
+        matching_keys = ('path', 'name', 'split', 'streaming', 'seq_length',
+            'always_start_with_bos', 'batch_token_dtype', 'shuffle_data',
+            'shuffle_seed', 'shuffle_buffer_size')
+        if not allow_batch_size_change:
+            matching_keys += ('batch_size',)
+        saved_config = state_dict['config']
+        for key in matching_keys:
+            if saved_config.get(key) != self.config[key]:
+                raise ValueError(f'Dataset resume config mismatch for {key}: saved={saved_config.get(key)!r}, requested={self.config[key]!r}')
+        if state_dict['text_processor_config'] != self.text_processor.config.to_dict():
+            raise ValueError('Dataset resume text processor config mismatch.')
+        if (state_dict['tokenizer_name'] != getattr(self.tokenizer, 'name_or_path', None)
+                or state_dict['tokenizer_vocab_size'] != len(self.tokenizer)):
+            raise ValueError('Dataset resume tokenizer mismatch.')
+        if len(state_dict['token_buffer']) != len(state_dict['loss_mask_buffer']):
+            raise ValueError('Dataset resume token and loss-mask buffers differ in length.')
+        self._start_state = deepcopy({key: state_dict[key] for key in
+            ('examples_consumed', 'token_buffer', 'loss_mask_buffer', 'metadata')})
+        self._live_state = deepcopy(self._start_state)
+        self.metadata = dict(self._start_state['metadata'])
+        print(f"Restoring packed dataset after {self._start_state['examples_consumed']} documents; replaying the seeded shuffle may take time.", flush=True)
 
     def set_start_tokens(self, tokens):
         print(f'Dataset: setting start tokens to {tokens}')
