@@ -164,7 +164,7 @@ def configure_wandb_run(run):
 
 @dataclass
 class ProcessTiming:
-    """Process-local elapsed timing; deliberately absent from checkpoints."""
+    """Elapsed intervals with a process-local clock; CG persists cumulative counters."""
     clock: object = time.perf_counter
     train_time_s: float = 0.0
     eval_time_s: float = 0.0

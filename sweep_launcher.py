@@ -3,6 +3,8 @@ import itertools
 import os
 import re
 
+from EasyLM.cg_resume import newest as newest_cg_checkpoint
+
 from EasyLM.gcs_utils import gcs_path_exists, read_from_gcs
 
 def parse_sweep_arguments(args):
@@ -118,6 +120,8 @@ def main():
     logger_output_dir = next((arg.split('=')[1] for arg in static_flags if arg.startswith('--output_dir=')), None)
 
     print(logger_output_dir, flush=True)
+    optimizer_type = config.get('--optimizer_type', config.get('optimizer_type')) or next(
+        (arg.split('=', 1)[1] for arg in static_flags if arg.startswith('--optimizer_type=')), None)
     if logger_output_dir:
         checkpoint_path = os.path.join(logger_output_dir, job_id)
         is_gcs = checkpoint_path.startswith("gs://")
@@ -134,7 +138,20 @@ def main():
             ckpt = os.path.join(checkpoint_path, "streaming_train_state")
             dataset_path = os.path.join(checkpoint_path, "dataset.pkl")
 
-            if (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
+            if optimizer_type == 'cg':
+                cg_path = newest_cg_checkpoint(checkpoint_path)
+                if cg_path:
+                    static_flags = set_static_flag(static_flags, 'cg_resume_state', cg_path)
+                    wandb_path = os.path.join(checkpoint_path, 'wandb_id.txt')
+                    if is_gcs:
+                        wandb_id = read_from_gcs(wandb_path)
+                    else:
+                        with open(wandb_path) as stream:
+                            wandb_id = stream.read().strip()
+                    static_flags = set_static_flag(static_flags, 'wandb_run_id', wandb_id)
+                    config.pop('--cg_resume_state', None)
+                    config.pop('--wandb_run_id', None)
+            elif (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
                 print(f"Resuming from path: {ckpt}", flush=True)
                 static_flags = set_static_flag(static_flags, 'load_checkpoint', f"trainstate::{ckpt}")
 

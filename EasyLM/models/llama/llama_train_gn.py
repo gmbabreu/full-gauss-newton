@@ -17,6 +17,7 @@ import copy
 import jax
 import jax.numpy as jnp
 from jax import linearize, linear_transpose
+from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
@@ -28,6 +29,7 @@ import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
+from EasyLM import cg_resume
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -55,6 +57,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_llama_config='',
     update_llama_config='',
     load_checkpoint='',
+    cg_resume_state='',  # Internal: complete CG bundle selected by the launcher.
     load_dataset_state='',
     log_freq=50,
     log_step_offset=-1,
@@ -261,6 +264,24 @@ def main(argv):
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
 
+    cg_metadata = None
+    cg_generation = -1
+    if FLAGS.cg_resume_state:
+        if FLAGS.optimizer_type != 'cg':
+            raise ValueError('cg_resume_state requires optimizer_type=cg')
+        cg_metadata, cg_dataset, cg_marker = cg_resume.read_bundle(FLAGS.cg_resume_state)
+        cg_resume.validate_flags(cg_metadata['flags'], flags_config_dict)
+        cg_generation = cg_marker['generation']
+    if FLAGS.optimizer_type == 'cg' and (
+            FLAGS.cg_resume_state or FLAGS.save_model_freq > 0 or FLAGS.save_milestone_freq > 0):
+        if (FLAGS.train_dataset.type != 'huggingface'
+                or FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir):
+            raise ValueError('CG checkpointing requires raw HuggingFace packed data')
+        if FLAGS.eval_steps > 0 and (FLAGS.eval_freq or FLAGS.log_initial_eval):
+            if (FLAGS.eval_dataset.type != 'huggingface'
+                    or FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir):
+                raise ValueError('CG checkpointing requires restartable raw HF evaluation')
+
     log_config = mlxu.flatten_config_dict(flags_config_dict)
 
     set_random_seed(FLAGS.seed)
@@ -293,7 +314,7 @@ def main(argv):
         branch_parent_metadata = load_parent_companion('metadata')
         branch_parent_complete = load_parent_companion('complete')
 
-    if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
+    if not FLAGS.cg_resume_state and FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
         FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint, local_path=os.path.join(FLAGS.tmp_dir, 'model.ckpt'))
     if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         num_to_download = FLAGS.gcs_num_train_files_to_download # Files download around 100 MiB/s
@@ -305,7 +326,7 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-    if FLAGS.load_dataset_state.startswith('gs://'):
+    if not FLAGS.cg_resume_state and FLAGS.load_dataset_state.startswith('gs://'):
         FLAGS.load_dataset_state = load_from_gcs(
             FLAGS.load_dataset_state,
             os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl'),
@@ -313,8 +334,8 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state:
-        dataset_state = mlxu.load_pickle(FLAGS.load_dataset_state)
+    if FLAGS.load_dataset_state or FLAGS.cg_resume_state:
+        dataset_state = cg_dataset if cg_metadata is not None else mlxu.load_pickle(FLAGS.load_dataset_state)
         if dataset_state is None:
             raise ValueError('Checkpoint has no dataset state')
         if isinstance(dataset, HuggingfaceDataset):
@@ -1103,6 +1124,9 @@ def main(argv):
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
     )
+    if FLAGS.optimizer_type == 'cg':
+        cg_param_shards, cg_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
+
     checkpointer = StreamingCheckpointer(
         FLAGS.checkpointer, output_dir,
         enable=jax.process_index() == 0,
@@ -1200,6 +1224,7 @@ def main(argv):
         return total_loss, total_acc
 
     def save_checkpoint(train_state, ema=None, milestone=False):
+        nonlocal cg_generation
         step = int(jax.device_get(train_state.step))
         metadata = dict(
             step=step,
@@ -1208,6 +1233,34 @@ def main(argv):
             llama_config=llama_config.to_dict(),
             training_progress=progress.state_dict(),
         )
+        if FLAGS.optimizer_type == 'cg':
+            state = dict(params=train_state.params, step=train_state.step,
+                         cg_first_moment=cg_first_moment, cg_second_moment=cg_second_moment,
+                         cg_x0=cg_x0, cg_adam_step=cg_adam_step, sharded_rng=sharded_rng)
+            def gather_replicated(x):
+                return np.asarray(jax.device_get(x))
+
+            state_gathers = dict(params=cg_param_gathers, step=gather_fns.step,
+                cg_first_moment=cg_param_gathers, cg_second_moment=cg_param_gathers,
+                cg_x0=cg_param_gathers, cg_adam_step=gather_replicated,
+                sharded_rng=gather_replicated)
+            if FLAGS.outer_momentum_beta > 0.0:
+                state['outer_prev_update'] = outer_prev_update
+                state_gathers['outer_prev_update'] = cg_param_gathers
+            if FLAGS.weight_average:
+                state['ema'] = ema
+                state_gathers['ema'] = cg_param_gathers
+            metadata['state_dtypes'] = {key: str(value.dtype)
+                for key, value in flatten_dict(state).items()}
+            metadata['process_timing'] = dict(timing.metrics(),
+                                              _pending_update_s=timing._pending_update_s)
+            cg_generation = cg_resume.save_bundle(
+                output_dir, cg_generation, metadata, dataset_object.get_state_dict(),
+                lambda path: StreamingCheckpointer.save_train_state_to_file(
+                    state, path, state_gathers, float_dtype='fp32'),
+                enable=checkpointer.enable)
+            multihost_utils.sync_global_devices(f'cg_checkpoint_complete_{step}')
+            return
         checkpointer.save_all(
             train_state=train_state,
             gather_fns=gather_fns,
@@ -1249,7 +1302,7 @@ def main(argv):
         print(mesh)
         train_state, restored_params = None, None
         warmstart_params = None
-        if FLAGS.load_checkpoint != '':
+        if FLAGS.load_checkpoint != '' and not FLAGS.cg_resume_state:
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
@@ -1283,6 +1336,25 @@ def main(argv):
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
+        if cg_metadata is not None:
+            state_shards = dict(params=cg_param_shards, step=shard_fns.step,
+                cg_first_moment=cg_param_shards, cg_second_moment=cg_param_shards,
+                cg_x0=cg_param_shards, outer_prev_update=cg_param_shards,
+                ema=cg_param_shards)
+            cg_state_path = FLAGS.cg_resume_state
+            if cg_state_path.startswith('gs://'):
+                cg_state_path = load_from_gcs(cg_state_path, os.path.join(FLAGS.tmp_dir, 'cg_resume.msgpack'))
+            restored_cg = checkpointer.load_checkpoint(cg_state_path, shard_fns=state_shards)
+            restored_cg = unflatten_dict({key: value.astype(cg_metadata['state_dtypes'][key])
+                for key, value in flatten_dict(restored_cg).items()})
+            train_state = train_state.replace(params=restored_cg['params'], step=restored_cg['step'])
+            restored_step = int(jax.device_get(restored_cg['step']))
+            restored_adam_step = int(jax.device_get(restored_cg['cg_adam_step']))
+            if restored_step != cg_metadata['step']:
+                raise ValueError('CG state step does not match metadata')
+            if restored_adam_step != restored_step:
+                raise ValueError('CG Adam step does not match outer step')
+
         # param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
         param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
@@ -1307,12 +1379,13 @@ def main(argv):
 
         progress = resolve_progress(
             FLAGS.log_step_offset, FLAGS.log_token_offset,
-            branch=init_checkpoint_path.startswith('trainstate_params::'),
+            saved_state=(cg_metadata or {}).get('training_progress'),
+            branch=cg_metadata is None and init_checkpoint_path.startswith('trainstate_params::'),
         )
         flags_config_dict['training_progress'] = progress.state_dict()
 
         if FLAGS.wandb_run_id:
-            if FLAGS.load_checkpoint:
+            if FLAGS.load_checkpoint and not FLAGS.cg_resume_state:
                 raise ValueError('Use a new W&B run ID when replaying a checkpoint; backward history is unsupported')
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
         else:
@@ -1334,14 +1407,19 @@ def main(argv):
                 gcs_path = os.path.join(output_dir, "wandb_id.txt")
                 upload_to_gcs(local_path, gcs_path)
 
+        if cg_metadata is not None:
+            print(f'Resumed CG: step={restored_step}, cg_adam_step={restored_adam_step}, '
+                  f'dataset_total_tokens={progress.dataset_total_tokens}, '
+                  f'wandb_run_id={wandb.run.id}', flush=True)
+
         configure_wandb_run(wandb.run)
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
         wandb.config.update({
             'log_time_offset_s': FLAGS.log_time_offset_s,
-            'timing_scope': 'current_process',
+            'timing_scope': 'cumulative_processes' if FLAGS.optimizer_type == 'cg' else 'current_process',
             'timing_includes_first_use_compilation': True,
         }, allow_val_change=True)
-        timing = ProcessTiming()
+        timing = ProcessTiming(**(cg_metadata or {}).get('process_timing', {}))
 
 
         start_step = int(jax.device_get(train_state.step))
@@ -1349,7 +1427,7 @@ def main(argv):
         def copy_array(x):
             return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
 
-        if FLAGS.save_model_freq > 0:
+        if FLAGS.save_model_freq > 0 and FLAGS.optimizer_type != 'cg':
             if FLAGS.weight_average:
                 ema = jax.tree.map(copy_array, train_state.params)
                 save_checkpoint(train_state, ema=ema)
@@ -1451,12 +1529,24 @@ def main(argv):
                 train_state.params,
             )
 
+        if cg_metadata is not None:
+            cg_first_moment = restored_cg['cg_first_moment']
+            cg_second_moment = restored_cg['cg_second_moment']
+            cg_x0 = restored_cg['cg_x0']
+            cg_adam_step = jax.device_put(restored_cg['cg_adam_step'])
+            sharded_rng = jax.device_put(restored_cg['sharded_rng'])
+            if FLAGS.outer_momentum_beta > 0.0:
+                outer_prev_update = restored_cg['outer_prev_update']
+            if FLAGS.weight_average:
+                ema = restored_cg['ema']
+            del restored_cg
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
 
         jax.block_until_ready((train_state, inner_state, sharded_rng))
-        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
+        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0 and cg_metadata is None:
             timing.start()
             initial_eval_metrics = []
             initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
@@ -1473,7 +1563,12 @@ def main(argv):
             initial_record.update(timing.metrics())
             wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
 
+        if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_metadata is None:
+            progress.dataset_total_tokens = dataset_object.get_state_dict()['metadata']['dataset_total_tokens']
+            save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
+        cg_checkpoint_safe = True
         for step in step_counter:
+            cg_checkpoint_safe = False
             timing.start()
             k = FLAGS.train_batch_growth_interval
             solve_batch_size = FLAGS.train_dataset_batch_size
@@ -1883,6 +1978,7 @@ def main(argv):
                         outer_params_before, train_state.params, dir, effective_step_size))
                 del outer_params_before
        
+            cg_checkpoint_safe = True
             progress.complete_update()
             live_results = [train_state, inner_state, sharded_rng, metrics]
             if FLAGS.optimizer_type == 'cg':
@@ -1961,6 +2057,11 @@ def main(argv):
                 if inner_diagnostic_rows:
                     log_metrics['inner_diagnostics'] = wandb.Table(
                         data=[[row] for row in inner_diagnostic_rows], columns=['metrics'])
+                # Evaluation has consumed RNG; commit CG state before publishing the row.
+                if FLAGS.optimizer_type == 'cg' and (
+                        (FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0)
+                        or (FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0)):
+                    save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                 if stop_after_log:
@@ -1968,19 +2069,23 @@ def main(argv):
             
             
 
-            if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
-                if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
-                    save_checkpoint(train_state, ema=ema, milestone=True)
-                else:
-                    save_checkpoint(train_state, milestone=True)
-            elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
-                if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
-                    save_checkpoint(train_state, ema=ema)
-                else:
-                    save_checkpoint(train_state)
+            if FLAGS.optimizer_type != 'cg':
+                if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
+                    if FLAGS.weight_average:
+                        ema = jax.device_get(ema)
+                        save_checkpoint(train_state, ema=ema, milestone=True)
+                    else:
+                        save_checkpoint(train_state, milestone=True)
+                elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
+                    if FLAGS.weight_average:
+                        ema = jax.device_get(ema)
+                        save_checkpoint(train_state, ema=ema)
+                    else:
+                        save_checkpoint(train_state)
 
+        # Save before terminal evaluation consumes RNG, and never save a partial solve.
+        if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_checkpoint_safe:
+            save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
         terminal_metrics = {}
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
             timing.start()
@@ -2007,7 +2112,7 @@ def main(argv):
             progress.phase_completed_updates - 1, **terminal_metrics)
         for name, value in terminal_record.items():
             wandb.run.summary[f'terminal_{name}'] = value
-        if FLAGS.save_model_freq > 0:
+        if FLAGS.save_model_freq > 0 and FLAGS.optimizer_type != 'cg':
             save_checkpoint(train_state)
 
     wandb.finish()
