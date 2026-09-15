@@ -1687,7 +1687,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                         **({
                             "raw_dir_norm": float(jax.device_get(raw_dir_norm)),
                             "momentum_dir_norm": dir_norm,
@@ -1785,7 +1785,7 @@ def main(argv):
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                     }, step=step)
                 if FLAGS.weight_average:
                     alpha = FLAGS.weight_average_decay
@@ -1847,7 +1847,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                         }, step=step)
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
