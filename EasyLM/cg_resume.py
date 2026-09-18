@@ -1,12 +1,48 @@
 """Durable two-slot CG bundles. The marker is the sole commit record."""
 import hashlib
 import json
+import math
+import shutil
 import os
 import pickle
 import re
 import tempfile
 import uuid
 from contextlib import contextmanager
+
+
+DATA_CONSUMPTION_VERSION = 2
+
+
+def validate_consumption(metadata):
+    if metadata.get('data_consumption_version') != DATA_CONSUMPTION_VERSION:
+        raise ValueError('CG checkpoint uses the old discarded-fetch data order; '
+                         'use its original code revision for exact continuation, '
+                         'or start a new experiment.')
+
+
+def batch_lambda(batch_size, denominator):
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise ValueError('Batch lambda denominator must be finite and positive')
+    value = batch_size / denominator
+    if not math.isfinite(value) or not 0 < value <= 1:
+        raise ValueError('Actual solve batch / denominator must be in (0, 1]')
+    return value
+
+
+def validate_batch_lambda(denominator, optimizer_type, final, ramp_steps,
+                          matrix_norms, max_batch):
+    if not math.isfinite(denominator) or denominator < 0:
+        raise ValueError('cg_lambda_batch_denominator must be finite and nonnegative')
+    if denominator == 0:
+        return
+    if optimizer_type != 'cg':
+        raise ValueError('Batch lambda requires optimizer_type=cg')
+    if final != -1 or ramp_steps != 0:
+        raise ValueError('Batch lambda cannot be combined with a lambda ramp')
+    if matrix_norms:
+        raise ValueError('Batch lambda requires cg_log_matrix_norms=False')
+    batch_lambda(max_batch, denominator)
 
 
 def paths(state_path):
@@ -92,7 +128,7 @@ def newest(directory):
         try:
             _, _, marker = read_bundle(path)
             valid.append((marker['generation'], path))
-        except (OSError, ValueError, KeyError, TypeError, EOFError, pickle.UnpicklingError):
+        except (FileNotFoundError, ValueError, KeyError, TypeError, EOFError, pickle.UnpicklingError):
             continue
         except Exception as error:
             # A missing GCS object is equivalent to a missing local slot.
@@ -150,3 +186,51 @@ def save_bundle(directory, previous, metadata, dataset, write_state, *, enable=T
                       dataset=hashlib.sha256(dataset_bytes).hexdigest()))
     durable_write(p['complete'], json.dumps(marker).encode())
     return generation
+
+
+def retain_milestone(directory, generation, step, *, enable=True):
+    """Copy a committed rolling bundle; no extra distributed gathers are needed.
+
+    The caller synchronizes all hosts after this writer-only operation. Existing
+    valid milestones are immutable, while interrupted copies may be retried.
+    """
+    if not enable:
+        return
+    source = paths(os.path.join(directory, f'cg_state_{generation % 2}'))
+    target = paths(os.path.join(directory, 'milestones', f'step_{step}', 'cg_state_0'))
+    if newest(os.path.dirname(target['state'])) is not None:
+        return
+    read_bundle(source['state'])
+    durable_write(target['complete'], b'{"complete": false}')
+    for name in ('state', 'metadata', 'dataset'):
+        if source[name].startswith('gs://'):
+            src = blob(source[name])
+            dst = blob(target[name])
+            src.bucket.copy_blob(src, dst.bucket, new_name=dst.name)
+        else:
+            with reader(source[name]) as src, open(target[name], 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+    with reader(source['complete']) as stream:
+        durable_write(target['complete'], stream.read())
+
+
+def resolve_resume(directory, explicit='', *, exists=False, requested=False):
+    """Resolve a CG checkpoint without turning failed recovery into a fresh run."""
+    if explicit:
+        metadata, _, _ = read_bundle(explicit)
+        validate_consumption(metadata)
+        return explicit
+    if not exists:
+        if requested:
+            raise ValueError(f'Requested CG experiment does not exist: {directory}')
+        return None
+    selected = newest(directory)
+    if selected is None:
+        raise ValueError(f'No valid CG rolling bundle in {directory}. Restore a bundle, '
+                         'select a milestone with --cg_resume_state, or use a new '
+                         'experiment ID for an intentional fresh run.')
+    metadata, _, _ = read_bundle(selected)
+    validate_consumption(metadata)
+    return selected

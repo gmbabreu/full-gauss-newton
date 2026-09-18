@@ -144,6 +144,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_interpolation_lambda=1.0,
+    cg_lambda_batch_denominator=0.0,  # Positive: global solve sequences / denominator.
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
@@ -245,6 +246,12 @@ def main(argv):
         raise ValueError("outer decay requires non-adaptive Muon-GN and weight_average=False")
     if FLAGS.train_batch_growth_interval < 0:
         raise ValueError("train_batch_growth_interval must be nonnegative")
+    cg_resume.validate_batch_lambda(
+        FLAGS.cg_lambda_batch_denominator, FLAGS.optimizer_type,
+        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps, FLAGS.cg_log_matrix_norms,
+        max(FLAGS.train_dataset_batch_size,
+            FLAGS.train_batch_max if FLAGS.train_batch_growth_interval > 0 else 0,
+            FLAGS.train_dataset.huggingface_dataset.batch_size))
     lambda_schedule_enabled = (
         FLAGS.cg_lambda_final != -1.0 or FLAGS.cg_lambda_ramp_steps != 0)
     if FLAGS.optimizer_type != 'cg' and lambda_schedule_enabled:
@@ -270,6 +277,7 @@ def main(argv):
         if FLAGS.optimizer_type != 'cg':
             raise ValueError('cg_resume_state requires optimizer_type=cg')
         cg_metadata, cg_dataset, cg_marker = cg_resume.read_bundle(FLAGS.cg_resume_state)
+        cg_resume.validate_consumption(cg_metadata)
         cg_resume.validate_flags(cg_metadata['flags'], flags_config_dict)
         cg_generation = cg_marker['generation']
     if FLAGS.optimizer_type == 'cg' and (
@@ -1232,6 +1240,7 @@ def main(argv):
             flags=flags_config_dict,
             llama_config=llama_config.to_dict(),
             training_progress=progress.state_dict(),
+            data_consumption_version=cg_resume.DATA_CONSUMPTION_VERSION,
         )
         if FLAGS.optimizer_type == 'cg':
             state = dict(params=train_state.params, step=train_state.step,
@@ -1259,6 +1268,9 @@ def main(argv):
                 lambda path: StreamingCheckpointer.save_train_state_to_file(
                     state, path, state_gathers, float_dtype='fp32'),
                 enable=checkpointer.enable)
+            if milestone:
+                cg_resume.retain_milestone(
+                    output_dir, cg_generation, step, enable=checkpointer.enable)
             multihost_utils.sync_global_devices(f'cg_checkpoint_complete_{step}')
             return
         checkpointer.save_all(
@@ -1605,8 +1617,7 @@ def main(argv):
                     )
 
 
-            if FLAGS.single_batch_inner:
-                single_batch_, single_dataset_metrics_ = pull_training_batch('skipped')
+            # Fetch only the solve batch below; no unused advance of the data cursor.
         
             # ------------------------------------------------------------------
             # Shared helpers, factored out of the original inline linesearch code
@@ -1699,7 +1710,10 @@ def main(argv):
                     batch_
                 )
                 scheduled_lambda = FLAGS.cg_interpolation_lambda
-                if FLAGS.cg_lambda_final != -1.0:
+                if FLAGS.cg_lambda_batch_denominator > 0:
+                    scheduled_lambda = cg_resume.batch_lambda(
+                        batch_['input_tokens'].shape[0], FLAGS.cg_lambda_batch_denominator)
+                elif FLAGS.cg_lambda_final != -1.0:
                     fraction = min(max(step / FLAGS.cg_lambda_ramp_steps, 0.0), 1.0)
                     scheduled_lambda += fraction * (
                         FLAGS.cg_lambda_final - FLAGS.cg_interpolation_lambda)
@@ -2061,7 +2075,10 @@ def main(argv):
                 if FLAGS.optimizer_type == 'cg' and (
                         (FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0)
                         or (FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0)):
-                    save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
+                    save_checkpoint(
+                        train_state, ema=ema if FLAGS.weight_average else None,
+                        milestone=(FLAGS.save_milestone_freq > 0
+                                   and (step + 1) % FLAGS.save_milestone_freq == 0))
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                 if stop_after_log:

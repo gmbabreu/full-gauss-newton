@@ -3,9 +3,8 @@ import itertools
 import os
 import re
 
-from EasyLM.cg_resume import newest as newest_cg_checkpoint
+from EasyLM.cg_resume import resolve_resume
 
-from EasyLM.gcs_utils import gcs_path_exists, read_from_gcs
 
 def parse_sweep_arguments(args):
     sweep_flags = {}
@@ -47,6 +46,15 @@ def set_static_flag(static_flags, flag, value):
     static_flags = [arg for arg in static_flags if not arg.startswith(f'--{flag}=')]
     static_flags.append(f"--{flag}={value}")
     return static_flags
+
+def selected_value(config, static_flags, name):
+    for key in ('--' + name, name):
+        if key in config:
+            return config[key]
+    prefix = '--' + name + '='
+    return next((arg[len(prefix):] for arg in reversed(static_flags)
+                 if arg.startswith(prefix)), None)
+
 
 def get_latest_checkpoint(directory_path):
     """
@@ -91,6 +99,7 @@ def get_latest_checkpoint(directory_path):
 
 
 def main():
+    from EasyLM.gcs_utils import gcs_path_exists, read_from_gcs
     args = sys.argv[1:]
 
     program, resume_from, sweep_flags, static_flags = parse_sweep_arguments(args)
@@ -111,47 +120,54 @@ def main():
     combinations = generate_combinations(sweep_flags)
     config = select_configuration(combinations, job_index)
 
-    train_dataset_batch_size = config.get('train_dataset_batch_size') or next((arg.split('=')[1] for arg in static_flags if arg.startswith('--train_dataset_batch_size=')), None)
+    train_dataset_batch_size = selected_value(config, static_flags, 'train_dataset_batch_size')
 
     if not train_dataset_batch_size:
         raise ValueError("train_dataset_batch_size not specified. Use --train_dataset_batch_size=<batch_size> to specify the batch size.")
 
     # check if logger.output_dir + job_id exists and if so, set load_checkpoint to "trainstate::logger.output_dir + job_id"
-    logger_output_dir = next((arg.split('=')[1] for arg in static_flags if arg.startswith('--output_dir=')), None)
+    logger_output_dir = selected_value(config, static_flags, 'output_dir')
 
     print(logger_output_dir, flush=True)
-    optimizer_type = config.get('--optimizer_type', config.get('optimizer_type')) or next(
-        (arg.split('=', 1)[1] for arg in static_flags if arg.startswith('--optimizer_type=')), None)
+    optimizer_type = selected_value(config, static_flags, 'optimizer_type')
     if logger_output_dir:
         checkpoint_path = os.path.join(logger_output_dir, job_id)
         is_gcs = checkpoint_path.startswith("gs://")
 
         print(f"Checking for checkpoint at {checkpoint_path}", flush=True)
         print(f"Is GCS: {is_gcs}", flush=True)
-        if is_gcs:
-            print('Path exists:', gcs_path_exists(checkpoint_path), flush=True)
-
-        # Check for existence based on storage type
-        if (is_gcs and gcs_path_exists(checkpoint_path)) or (not is_gcs and os.path.exists(checkpoint_path)):
-            print(f"Checkpoint exists: {checkpoint_path}", flush=True)
-       
-            ckpt = os.path.join(checkpoint_path, "streaming_train_state")
-            dataset_path = os.path.join(checkpoint_path, "dataset.pkl")
-
-            if optimizer_type == 'cg':
-                cg_path = newest_cg_checkpoint(checkpoint_path)
-                if cg_path:
-                    static_flags = set_static_flag(static_flags, 'cg_resume_state', cg_path)
+        # A trailing slash avoids matching another experiment's lexical prefix.
+        exists = (gcs_path_exists(checkpoint_path.rstrip('/') + '/') if is_gcs
+                  else os.path.exists(checkpoint_path))
+        if optimizer_type == 'cg':
+            explicit = selected_value(config, static_flags, 'cg_resume_state') or ''
+            cg_path = resolve_resume(checkpoint_path, explicit, exists=exists,
+                                     requested=bool(resume_from))
+            if cg_path:
+                static_flags = set_static_flag(static_flags, 'cg_resume_state', cg_path)
+                for key in ('cg_resume_state', '--cg_resume_state'):
+                    config.pop(key, None)
+                # Explicit branches may choose their own logging identity. Automatic
+                # recovery retains the existing experiment's W&B identity.
+                if not explicit:
                     wandb_path = os.path.join(checkpoint_path, 'wandb_id.txt')
                     if is_gcs:
                         wandb_id = read_from_gcs(wandb_path)
                     else:
                         with open(wandb_path) as stream:
                             wandb_id = stream.read().strip()
+                    if not wandb_id:
+                        raise ValueError(f'Missing W&B identity for CG recovery: {checkpoint_path}')
                     static_flags = set_static_flag(static_flags, 'wandb_run_id', wandb_id)
-                    config.pop('--cg_resume_state', None)
-                    config.pop('--wandb_run_id', None)
-            elif (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
+                    for key in ('wandb_run_id', '--wandb_run_id'):
+                        config.pop(key, None)
+        elif exists:
+            print(f"Checkpoint exists: {checkpoint_path}", flush=True)
+
+            ckpt = os.path.join(checkpoint_path, "streaming_train_state")
+            dataset_path = os.path.join(checkpoint_path, "dataset.pkl")
+
+            if (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
                 print(f"Resuming from path: {ckpt}", flush=True)
                 static_flags = set_static_flag(static_flags, 'load_checkpoint', f"trainstate::{ckpt}")
 
