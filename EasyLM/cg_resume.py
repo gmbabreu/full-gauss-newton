@@ -143,7 +143,20 @@ def validate_flags(saved, current):
         'wandb_project', 'wandb_entity', 'output_dir', 'tmp_dir', 'experiment_id',
         'notes', 'logger', 'log_all_worker', 'save_model_freq', 'save_milestone_freq',
         'checkpointer', 'param_count', 'param_count_nonembed', 'training_progress',
-        'log_time_offset_s'}
+        'log_time_offset_s', 'condition_log', 'condition_every',
+        'condition_top_maxiter', 'condition_inverse_maxiter',
+        'condition_inner_cg_maxiter', 'condition_inner_cg_tol',
+        'condition_num_starts', 'condition_agreement_tol',
+        'condition_eigen_residual_tol', 'condition_shifts',
+        'condition_trace_probes',
+        # False was observational; True is explicitly rejected below.
+        'cg_log_matrix_norms', 'cg_matrix_norm_frobenius_probes',
+        'cg_matrix_norm_power_iters'}
+    # This obsolete diagnostic modified effective lambda, so accepting one of
+    # its checkpoints would violate exact-resume semantics.
+    if saved.get('cg_log_matrix_norms', False):
+        raise ValueError('Cannot exactly resume cg_log_matrix_norms=True: the '
+                         'legacy diagnostic changed the training trajectory')
     changed = sorted(k for k in set(saved) | set(current)
                      if k not in ignored and saved.get(k) != current.get(k))
     if changed:

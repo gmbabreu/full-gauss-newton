@@ -25,6 +25,14 @@ def save(directory, generation, step):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_condition_flags_are_reporting_only_but_legacy_rescaling_rejected(self):
+        saved = {'optimizer_type': 'cg', 'condition_log': False,
+                 'condition_trace_probes': 4, 'cg_log_matrix_norms': False}
+        current = dict(saved, condition_log=True, condition_trace_probes=8)
+        cg.validate_flags(saved, current)
+        with self.assertRaisesRegex(ValueError, 'changed the training trajectory'):
+            cg.validate_flags(dict(saved, cg_log_matrix_norms=True), current)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
