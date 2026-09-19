@@ -17,6 +17,7 @@ import copy
 import jax
 import jax.numpy as jnp
 from jax import linearize, linear_transpose
+from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
@@ -28,6 +29,7 @@ import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
+from EasyLM import cg_resume
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -55,6 +57,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_llama_config='',
     update_llama_config='',
     load_checkpoint='',
+    cg_resume_state='',  # Internal: complete CG bundle selected by the launcher.
     load_dataset_state='',
     log_freq=50,
     log_step_offset=-1,
@@ -70,6 +73,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_loop_iter=100,
     tokenizer='openlm-research/open_llama_3b_v2',
     train_dataset_batch_size=8,
+    train_batch_growth_interval=0,
+    train_batch_growth_increment=16,
+    train_batch_max=1024,
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
@@ -138,11 +144,45 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
     cg_interpolation_lambda=1.0,
+    cg_lambda_batch_denominator=0.0,  # Positive: global solve sequences / denominator.
+    cg_lambda_final=-1.0,
+    cg_lambda_ramp_steps=0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
     cg_log_matrix_norms=False,
     cg_matrix_norm_frobenius_probes=4,
     cg_matrix_norm_power_iters=8,
 )
+
+def microbatch_groups(batch_size, n_requested, data_shards):
+    if batch_size <= 0 or data_shards <= 0 or batch_size % data_shards:
+        raise ValueError('Batch must be positive and divisible by data shards')
+    if n_requested <= 0:
+        raise ValueError('Microbatch count must be positive')
+    local_batch = batch_size // data_shards
+    n_actual = min(n_requested, local_batch)
+    q, r = divmod(local_batch, n_actual)
+    groups = (
+        (0, r, data_shards * (q + 1)),
+        (r * data_shards * (q + 1), n_actual - r, data_shards * q),
+    )
+    return n_actual, tuple(group for group in groups if group[1] > 0)
+
+
+def weighted_microbatch_sum(batch, groups, contribution_fn, zero):
+    batch_size = batch['input_tokens'].shape[0]
+    total = zero
+    for offset, count, mb_size in groups:
+        def body(i, carry):
+            start = offset + i * mb_size
+            mb = jax.tree.map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, start, mb_size, axis=0),
+                batch,
+            )
+            value = contribution_fn(mb)
+            return jax.tree.map(
+                lambda acc, x: acc + (mb_size / batch_size) * x, carry, value)
+        total = jax.lax.fori_loop(0, count, body, total)
+    return total
 
 def get_gpu_memory():
     try:
@@ -204,10 +244,51 @@ def main(argv):
         or FLAGS.adaptive_inner_loop or FLAGS.weight_average
     ):
         raise ValueError("outer decay requires non-adaptive Muon-GN and weight_average=False")
+    if FLAGS.train_batch_growth_interval < 0:
+        raise ValueError("train_batch_growth_interval must be nonnegative")
+    cg_resume.validate_batch_lambda(
+        FLAGS.cg_lambda_batch_denominator, FLAGS.optimizer_type,
+        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps, FLAGS.cg_log_matrix_norms,
+        max(FLAGS.train_dataset_batch_size,
+            FLAGS.train_batch_max if FLAGS.train_batch_growth_interval > 0 else 0,
+            FLAGS.train_dataset.huggingface_dataset.batch_size))
+    lambda_schedule_enabled = (
+        FLAGS.cg_lambda_final != -1.0 or FLAGS.cg_lambda_ramp_steps != 0)
+    if FLAGS.optimizer_type != 'cg' and lambda_schedule_enabled:
+        raise ValueError("CG lambda scheduling is only available for optimizer_type='cg'")
+    if FLAGS.optimizer_type == 'cg':
+        if not 0.0 <= FLAGS.cg_interpolation_lambda <= 1.0:
+            raise ValueError("cg_interpolation_lambda must be in [0, 1]")
+        if FLAGS.cg_lambda_final != -1.0:
+            if not 0.0 <= FLAGS.cg_lambda_final <= 1.0:
+                raise ValueError("cg_lambda_final must be in [0, 1]")
+            if FLAGS.cg_lambda_ramp_steps <= 0:
+                raise ValueError("cg_lambda_ramp_steps must be positive when a final lambda is set")
+        elif FLAGS.cg_lambda_ramp_steps != 0:
+            raise ValueError("cg_lambda_ramp_steps requires cg_lambda_final")
 
     output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
+
+    cg_metadata = None
+    cg_generation = -1
+    if FLAGS.cg_resume_state:
+        if FLAGS.optimizer_type != 'cg':
+            raise ValueError('cg_resume_state requires optimizer_type=cg')
+        cg_metadata, cg_dataset, cg_marker = cg_resume.read_bundle(FLAGS.cg_resume_state)
+        cg_resume.validate_consumption(cg_metadata)
+        cg_resume.validate_flags(cg_metadata['flags'], flags_config_dict)
+        cg_generation = cg_marker['generation']
+    if FLAGS.optimizer_type == 'cg' and (
+            FLAGS.cg_resume_state or FLAGS.save_model_freq > 0 or FLAGS.save_milestone_freq > 0):
+        if (FLAGS.train_dataset.type != 'huggingface'
+                or FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir):
+            raise ValueError('CG checkpointing requires raw HuggingFace packed data')
+        if FLAGS.eval_steps > 0 and (FLAGS.eval_freq or FLAGS.log_initial_eval):
+            if (FLAGS.eval_dataset.type != 'huggingface'
+                    or FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir):
+                raise ValueError('CG checkpointing requires restartable raw HF evaluation')
 
     log_config = mlxu.flatten_config_dict(flags_config_dict)
 
@@ -241,7 +322,7 @@ def main(argv):
         branch_parent_metadata = load_parent_companion('metadata')
         branch_parent_complete = load_parent_companion('complete')
 
-    if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
+    if not FLAGS.cg_resume_state and FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
         FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint, local_path=os.path.join(FLAGS.tmp_dir, 'model.ckpt'))
     if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         num_to_download = FLAGS.gcs_num_train_files_to_download # Files download around 100 MiB/s
@@ -253,7 +334,7 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-    if FLAGS.load_dataset_state.startswith('gs://'):
+    if not FLAGS.cg_resume_state and FLAGS.load_dataset_state.startswith('gs://'):
         FLAGS.load_dataset_state = load_from_gcs(
             FLAGS.load_dataset_state,
             os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl'),
@@ -261,8 +342,8 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state:
-        dataset_state = mlxu.load_pickle(FLAGS.load_dataset_state)
+    if FLAGS.load_dataset_state or FLAGS.cg_resume_state:
+        dataset_state = cg_dataset if cg_metadata is not None else mlxu.load_pickle(FLAGS.load_dataset_state)
         if dataset_state is None:
             raise ValueError('Checkpoint has no dataset state')
         if isinstance(dataset, HuggingfaceDataset):
@@ -661,86 +742,32 @@ def main(argv):
         rng,
         batch,
         wd,
+        scheduled_lambda,
     ):
         rng_generator = JaxRNG(rng)
         batch_ = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
 
-        # ── compute b_param = ∇_theta L = J^T (∇_f L) (the parameter-space gradient) ──
-        # Split the batch into equal microbatches. Each microbatch loss is
-        # mean-normalized internally, so averaging their J^T ∇_f L contributions
-        # recovers the full-batch parameter-space gradient.
-        n_micro = FLAGS.cg_n_micro
-
+        # Partition by per-device rows. Unequal groups have distinct static slice
+        # sizes, while every global slice remains evenly data-sharded.
         batch_size = batch_['input_tokens'].shape[0]
-        assert batch_size % n_micro == 0
-        mb_size = batch_size // n_micro
+        _, groups = microbatch_groups(batch_size, FLAGS.cg_n_micro, data_shards)
 
-        def b_param_body(i, carry):
-            # Slice the i-th microbatch out of the full batch.
-            start = i * mb_size
-            input_mb = jax.lax.dynamic_slice_in_dim(
-                batch_['input_tokens'], start, mb_size, axis=0
-            )
-            target_mb = jax.lax.dynamic_slice_in_dim(
-                batch_['target_tokens'], start, mb_size, axis=0
-            )
-            mask_mb = jax.lax.dynamic_slice_in_dim(
-                batch_['loss_masks'], start, mb_size, axis=0
-            )
-
+        def gradient_contribution(mb):
             def f_mb(p):
-                # Run the model on the microbatch to get logits.
-                # deterministic=True is safe because dropout/FCM are disabled in this config,
-                # and avoids mutating JaxRNG inside the traced fori_loop.
-                out = model.apply(
-                    p,
-                    input_mb,
-                    deterministic=True,
-                )
-                return out.logits
+                return model.apply(p, mb['input_tokens'], deterministic=True).logits
 
             def scalar_loss_mb(logits):
-                loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                    logits,
-                    target_mb,
-                    params0,
-                    params0,
-                    mask_mb,
-                    weight_decay=wd,
-                )
-                return loss
+                return cross_entropy_loss_and_accuracy_with_weight_decay(
+                    logits, mb['target_tokens'], params0, params0,
+                    mb['loss_masks'], weight_decay=wd)[0]
 
-            # Linearize the model at params0: this gives the current logits and a JVP
-            # function for applying the parameter-space Jacobian.
             logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+            g0_mb = jax.grad(scalar_loss_mb)(logits0_mb)
+            return linear_transpose(jvp_fn_mb, params0)(g0_mb)[0]
 
-            # Compute the logit-space loss gradient (∇_f L), then apply J^T to obtain the
-            # parameter-space gradient contribution for this microbatch.
-            grad_Ly_mb = jax.grad(scalar_loss_mb)
-            g0_mb = grad_Ly_mb(logits0_mb)
-            jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
-            (b_mb,) = jt_fn_mb(g0_mb)
-
-            # Accumulate into the running sum. Division by n_micro happens after
-            # the loop to keep the carry parameter-sized (not scaled-parameter-sized).
-            return jax.tree_util.tree_map(
-                lambda accumulated, contribution: accumulated + contribution,
-                carry,
-                b_mb,
-            )
-        # Apply jax loop
-        b_param_sum = jax.lax.fori_loop(
-            0,
-            n_micro,
-            b_param_body,
-            jax.tree_util.tree_map(jnp.zeros_like, params0),
-        )
-        # Average: each microbatch loss is mean-normalized over mb_size, so
-        # averaging n_micro microbatch gradients recovers the full-batch gradient.
-        b_param = jax.tree_util.tree_map(
-            lambda b: b / n_micro,
-            b_param_sum,
-        )
+        b_param = weighted_microbatch_sum(
+            batch_, groups, gradient_contribution,
+            jax.tree.map(jnp.zeros_like, params0))
 
         # ── Adam EMA updates ──────────────────────────────────────────
         #
@@ -785,10 +812,7 @@ def main(argv):
         
         adam_eps = jnp.asarray(1e-8, dtype=jnp.float32)
 
-        interpolation_lambda = jnp.asarray(
-            FLAGS.cg_interpolation_lambda,
-            dtype=jnp.float32,
-        )
+        interpolation_lambda = jnp.asarray(scheduled_lambda, dtype=jnp.float32)
 
         # Protect against division by zero at the first warmup step.
         safe_adam_lr = jnp.maximum(
@@ -824,83 +848,27 @@ def main(argv):
             )
 
         def apply_G(v):
-            """
-            Apply the raw GN operator G(v), accumulating microbatches with a
-            parameter-sized lax.fori_loop carry.
-            """
-
-            def gn_body(i, carry):
-                # Slice microbatch i from the full batch.
-                start = i * mb_size
-                input_mb = jax.lax.dynamic_slice_in_dim(
-                    batch_['input_tokens'], start, mb_size, axis=0
-                )
-                target_mb = jax.lax.dynamic_slice_in_dim(
-                    batch_['target_tokens'], start, mb_size, axis=0
-                )
-                mask_mb = jax.lax.dynamic_slice_in_dim(
-                    batch_['loss_masks'], start, mb_size, axis=0
-                )
-
+            """Apply the weighted full-batch Gauss--Newton operator."""
+            def curvature_contribution(mb):
                 def f_mb(p):
-                    # Run the model on the microbatch to get logits.
-                    # deterministic=True is safe because dropout/FCM are disabled in this config,
-                    # and avoids mutating JaxRNG inside the traced fori_loop
-                    out = model.apply(
-                        p,
-                        input_mb,
-                        deterministic=True,
-                    )
-                    return out.logits
+                    return model.apply(p, mb['input_tokens'], deterministic=True).logits
 
                 def scalar_loss_mb(logits):
-                    loss, _ = cross_entropy_loss_and_accuracy_with_weight_decay(
-                        logits,
-                        target_mb,
-                        params0,
-                        params0,
-                        mask_mb,
-                        weight_decay=wd,
-                    )
-                    return loss
+                    return cross_entropy_loss_and_accuracy_with_weight_decay(
+                        logits, mb['target_tokens'], params0, params0,
+                        mb['loss_masks'], weight_decay=wd)[0]
 
-                # Linearize the model at params0 to obtain J_mb and the current logits.
                 logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
-                grad_Ly_mb = jax.grad(scalar_loss_mb)
+                grad_loss = jax.grad(scalar_loss_mb)
                 jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
-
-                # Compute the GN-vector product J^T H J v:
-                #   J v        -> forward-mode JVP
-                #   H(J v)     -> Hessian-vector product in logit space
-                #   J^T H J v  -> transpose JVP
                 logits_v_mb = jvp_fn_mb(v)
-                _, Hv_mb = jax.jvp(
-                    grad_Ly_mb,
-                    (logits0_mb,),
-                    (logits_v_mb,),
-                )
-                (Gv_mb,) = jt_fn_mb(Hv_mb)
+                _, hv_mb = jax.jvp(grad_loss, (logits0_mb,), (logits_v_mb,))
+                return jt_fn_mb(hv_mb)[0]
 
-                return jax.tree_util.tree_map(
-                    lambda accumulated, contribution: accumulated + contribution,
-                    carry,
-                    Gv_mb,
-                )
-            # Apply microbatch loop
-            gn_sum = jax.lax.fori_loop(
-                0,
-                n_micro,
-                gn_body,
-                jax.tree_util.tree_map(jnp.zeros_like, params0),
-            )
-            # Average the mean-normalized microbatch GN contributions to recover
-            # the full-batch GN-vector product.
-            Gv_param = jax.tree_util.tree_map(
-                lambda x: x / n_micro,
-                gn_sum,
-            )
-            return Gv_param
-        
+            return weighted_microbatch_sum(
+                batch_, groups, curvature_contribution,
+                jax.tree.map(jnp.zeros_like, params0))
+
         matrix_norm_metrics = {}
         if FLAGS.cg_log_matrix_norms:
             assert FLAGS.cg_matrix_norm_frobenius_probes >= 1
@@ -1019,7 +987,7 @@ def main(argv):
             )
 
             interpolation_lambda = jnp.asarray(
-                lambda_balance_spec*FLAGS.cg_interpolation_lambda,
+                lambda_balance_spec * scheduled_lambda,
                 dtype=jnp.float32,
             )
             matrix_norm_metrics = {
@@ -1130,6 +1098,13 @@ def main(argv):
             'accuracy': jnp.int32(0),
             'perplexity': jnp.float32(0.0),
             'adam_step': new_adam_step,
+            'cg_lambda_scheduled': scheduled_lambda,
+            'cg_lambda_effective': interpolation_lambda,
+            'cg_relative_damping': jnp.where(
+                interpolation_lambda > 0.0,
+                (1.0 - interpolation_lambda) /
+                (safe_adam_lr * interpolation_lambda),
+                jnp.asarray(jnp.nan, dtype=jnp.float32)),
             **matrix_norm_metrics,
         }
 
@@ -1157,6 +1132,9 @@ def main(argv):
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
     )
+    if FLAGS.optimizer_type == 'cg':
+        cg_param_shards, cg_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
+
     checkpointer = StreamingCheckpointer(
         FLAGS.checkpointer, output_dir,
         enable=jax.process_index() == 0,
@@ -1204,6 +1182,7 @@ def main(argv):
                 PS(),                          # rng
                 batch_partition,               # batch
                 PS(),                          # wd
+                PS(),                          # scheduled_lambda
             ),
             
             out_shardings=(
@@ -1233,30 +1212,27 @@ def main(argv):
         loss; averaging recovers the full-batch loss for equal-sized splits.
         Keeps per-evaluation peak tensor size proportional to mb_size,
         not the full batch -- same principle as CG microbatching."""
+        batch_size = batch['input_tokens'].shape[0]
+        _, groups = microbatch_groups(batch_size, n_micro, data_shards)
         if n_micro == 1:
             loss, acc = parallel_loss_fn(params, batch, rng)
             return float(jax.device_get(loss)), float(jax.device_get(acc))
-        batch_size = batch['input_tokens'].shape[0]
-        assert batch_size % n_micro == 0, (
-            f"Linesearch batch size {batch_size} must be divisible by cg_n_micro={n_micro}"
-        )
-        mb_size = batch_size // n_micro
         total_loss = 0.0
         total_acc  = 0.0
         rng_key = rng
-        for i in range(n_micro):
-            rng_key, subrng = jax.random.split(rng_key)
-            mb = {
-                'input_tokens':  batch['input_tokens'][i*mb_size:(i+1)*mb_size],
-                'target_tokens': batch['target_tokens'][i*mb_size:(i+1)*mb_size],
-                'loss_masks':    batch['loss_masks'][i*mb_size:(i+1)*mb_size],
-            }
-            loss, acc = parallel_loss_fn(params, mb, subrng)
-            total_loss += float(jax.device_get(loss))
-            total_acc  += float(jax.device_get(acc))
-        return total_loss / n_micro, total_acc / n_micro
+        for offset, count, mb_size in groups:
+            for i in range(count):
+                rng_key, subrng = jax.random.split(rng_key)
+                start = offset + i * mb_size
+                mb = jax.tree.map(lambda x: x[start:start + mb_size], batch)
+                loss, acc = parallel_loss_fn(params, mb, subrng)
+                weight = mb_size / batch_size
+                total_loss += weight * float(jax.device_get(loss))
+                total_acc += weight * float(jax.device_get(acc))
+        return total_loss, total_acc
 
     def save_checkpoint(train_state, ema=None, milestone=False):
+        nonlocal cg_generation
         step = int(jax.device_get(train_state.step))
         metadata = dict(
             step=step,
@@ -1264,7 +1240,39 @@ def main(argv):
             flags=flags_config_dict,
             llama_config=llama_config.to_dict(),
             training_progress=progress.state_dict(),
+            data_consumption_version=cg_resume.DATA_CONSUMPTION_VERSION,
         )
+        if FLAGS.optimizer_type == 'cg':
+            state = dict(params=train_state.params, step=train_state.step,
+                         cg_first_moment=cg_first_moment, cg_second_moment=cg_second_moment,
+                         cg_x0=cg_x0, cg_adam_step=cg_adam_step, sharded_rng=sharded_rng)
+            def gather_replicated(x):
+                return np.asarray(jax.device_get(x))
+
+            state_gathers = dict(params=cg_param_gathers, step=gather_fns.step,
+                cg_first_moment=cg_param_gathers, cg_second_moment=cg_param_gathers,
+                cg_x0=cg_param_gathers, cg_adam_step=gather_replicated,
+                sharded_rng=gather_replicated)
+            if FLAGS.outer_momentum_beta > 0.0:
+                state['outer_prev_update'] = outer_prev_update
+                state_gathers['outer_prev_update'] = cg_param_gathers
+            if FLAGS.weight_average:
+                state['ema'] = ema
+                state_gathers['ema'] = cg_param_gathers
+            metadata['state_dtypes'] = {key: str(value.dtype)
+                for key, value in flatten_dict(state).items()}
+            metadata['process_timing'] = dict(timing.metrics(),
+                                              _pending_update_s=timing._pending_update_s)
+            cg_generation = cg_resume.save_bundle(
+                output_dir, cg_generation, metadata, dataset_object.get_state_dict(),
+                lambda path: StreamingCheckpointer.save_train_state_to_file(
+                    state, path, state_gathers, float_dtype='fp32'),
+                enable=checkpointer.enable)
+            if milestone:
+                cg_resume.retain_milestone(
+                    output_dir, cg_generation, step, enable=checkpointer.enable)
+            multihost_utils.sync_global_devices(f'cg_checkpoint_complete_{step}')
+            return
         checkpointer.save_all(
             train_state=train_state,
             gather_fns=gather_fns,
@@ -1285,6 +1293,20 @@ def main(argv):
 
 
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
+    data_shards = int(mesh.shape['dp'] * mesh.shape['fsdp'])
+    if FLAGS.train_batch_growth_interval > 0:
+        if not isinstance(dataset, HuggingfaceDataset):
+            raise ValueError("Batch growth requires the raw HuggingfaceDataset loader")
+        start = FLAGS.train_dataset_batch_size
+        if dataset.config.batch_size != start:
+            raise ValueError("Loader and launch initial batch sizes must match")
+        if start <= 0 or FLAGS.train_batch_growth_increment <= 0:
+            raise ValueError("Initial batch size and growth increment must be positive")
+        if FLAGS.train_batch_max < start:
+            raise ValueError("train_batch_max must be at least the initial batch size")
+        if any(value % data_shards for value in (
+                start, FLAGS.train_batch_growth_increment, FLAGS.train_batch_max)):
+            raise ValueError("Batch start, increment, and cap must be divisible by data shards")
     print(f"Mesh axes names: {mesh.axis_names}")
     print(f"Mesh shape: {mesh.shape}")
 
@@ -1292,7 +1314,7 @@ def main(argv):
         print(mesh)
         train_state, restored_params = None, None
         warmstart_params = None
-        if FLAGS.load_checkpoint != '':
+        if FLAGS.load_checkpoint != '' and not FLAGS.cg_resume_state:
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
@@ -1326,6 +1348,25 @@ def main(argv):
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
+        if cg_metadata is not None:
+            state_shards = dict(params=cg_param_shards, step=shard_fns.step,
+                cg_first_moment=cg_param_shards, cg_second_moment=cg_param_shards,
+                cg_x0=cg_param_shards, outer_prev_update=cg_param_shards,
+                ema=cg_param_shards)
+            cg_state_path = FLAGS.cg_resume_state
+            if cg_state_path.startswith('gs://'):
+                cg_state_path = load_from_gcs(cg_state_path, os.path.join(FLAGS.tmp_dir, 'cg_resume.msgpack'))
+            restored_cg = checkpointer.load_checkpoint(cg_state_path, shard_fns=state_shards)
+            restored_cg = unflatten_dict({key: value.astype(cg_metadata['state_dtypes'][key])
+                for key, value in flatten_dict(restored_cg).items()})
+            train_state = train_state.replace(params=restored_cg['params'], step=restored_cg['step'])
+            restored_step = int(jax.device_get(restored_cg['step']))
+            restored_adam_step = int(jax.device_get(restored_cg['cg_adam_step']))
+            if restored_step != cg_metadata['step']:
+                raise ValueError('CG state step does not match metadata')
+            if restored_adam_step != restored_step:
+                raise ValueError('CG Adam step does not match outer step')
+
         # param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
         param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
@@ -1350,12 +1391,13 @@ def main(argv):
 
         progress = resolve_progress(
             FLAGS.log_step_offset, FLAGS.log_token_offset,
-            branch=init_checkpoint_path.startswith('trainstate_params::'),
+            saved_state=(cg_metadata or {}).get('training_progress'),
+            branch=cg_metadata is None and init_checkpoint_path.startswith('trainstate_params::'),
         )
         flags_config_dict['training_progress'] = progress.state_dict()
 
         if FLAGS.wandb_run_id:
-            if FLAGS.load_checkpoint:
+            if FLAGS.load_checkpoint and not FLAGS.cg_resume_state:
                 raise ValueError('Use a new W&B run ID when replaying a checkpoint; backward history is unsupported')
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
         else:
@@ -1377,14 +1419,19 @@ def main(argv):
                 gcs_path = os.path.join(output_dir, "wandb_id.txt")
                 upload_to_gcs(local_path, gcs_path)
 
+        if cg_metadata is not None:
+            print(f'Resumed CG: step={restored_step}, cg_adam_step={restored_adam_step}, '
+                  f'dataset_total_tokens={progress.dataset_total_tokens}, '
+                  f'wandb_run_id={wandb.run.id}', flush=True)
+
         configure_wandb_run(wandb.run)
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
         wandb.config.update({
             'log_time_offset_s': FLAGS.log_time_offset_s,
-            'timing_scope': 'current_process',
+            'timing_scope': 'cumulative_processes' if FLAGS.optimizer_type == 'cg' else 'current_process',
             'timing_includes_first_use_compilation': True,
         }, allow_val_change=True)
-        timing = ProcessTiming()
+        timing = ProcessTiming(**(cg_metadata or {}).get('process_timing', {}))
 
 
         start_step = int(jax.device_get(train_state.step))
@@ -1392,7 +1439,7 @@ def main(argv):
         def copy_array(x):
             return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
 
-        if FLAGS.save_model_freq > 0:
+        if FLAGS.save_model_freq > 0 and FLAGS.optimizer_type != 'cg':
             if FLAGS.weight_average:
                 ema = jax.tree.map(copy_array, train_state.params)
                 save_checkpoint(train_state, ema=ema)
@@ -1403,8 +1450,8 @@ def main(argv):
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
-        assert FLAGS.train_dataset_batch_size % mesh.shape['dp'] == 0, \
-            "Batch size must be divisible by the number of devices in 'dp'."
+        assert FLAGS.train_dataset_batch_size % data_shards == 0, \
+            "Batch size must be divisible by the data-sharding mesh size."
         
         
         
@@ -1416,9 +1463,22 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset_object = dataset
         dataset = iter(dataset_object)
+        actual_solve_batch_size = None
+        solve_batch_size = FLAGS.train_dataset_batch_size
 
         def pull_training_batch(role):
-            batch, metadata = next(dataset)
+            nonlocal actual_solve_batch_size
+            if FLAGS.train_batch_growth_interval > 0 and role == 'solve':
+                previous_batch_size = dataset_object.config.batch_size
+                try:
+                    dataset_object.config.batch_size = solve_batch_size
+                    batch, metadata = next(dataset)
+                finally:
+                    dataset_object.config.batch_size = previous_batch_size
+            else:
+                batch, metadata = next(dataset)
+            if role == 'solve':
+                actual_solve_batch_size = int(batch['input_tokens'].shape[0])
             progress.charge(role, batch, metadata)
             return batch, metadata
 
@@ -1481,12 +1541,24 @@ def main(argv):
                 train_state.params,
             )
 
+        if cg_metadata is not None:
+            cg_first_moment = restored_cg['cg_first_moment']
+            cg_second_moment = restored_cg['cg_second_moment']
+            cg_x0 = restored_cg['cg_x0']
+            cg_adam_step = jax.device_put(restored_cg['cg_adam_step'])
+            sharded_rng = jax.device_put(restored_cg['sharded_rng'])
+            if FLAGS.outer_momentum_beta > 0.0:
+                outer_prev_update = restored_cg['outer_prev_update']
+            if FLAGS.weight_average:
+                ema = restored_cg['ema']
+            del restored_cg
+
         if warmstart_params is not None and not FLAGS.reset_start:
             print('Using warmstart params')
             inner_state = inner_state.replace(params=warmstart_params)
 
         jax.block_until_ready((train_state, inner_state, sharded_rng))
-        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0:
+        if FLAGS.log_initial_eval and FLAGS.eval_steps > 0 and cg_metadata is None:
             timing.start()
             initial_eval_metrics = []
             initial_eval_rng = jax.tree.map(lambda x: x.copy(), sharded_rng)
@@ -1503,8 +1575,22 @@ def main(argv):
             initial_record.update(timing.metrics())
             wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
 
+        if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_metadata is None:
+            progress.dataset_total_tokens = dataset_object.get_state_dict()['metadata']['dataset_total_tokens']
+            save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
+        cg_checkpoint_safe = True
         for step in step_counter:
+            cg_checkpoint_safe = False
             timing.start()
+            k = FLAGS.train_batch_growth_interval
+            solve_batch_size = FLAGS.train_dataset_batch_size
+            if k > 0:
+                solve_batch_size = min(
+                    FLAGS.train_batch_max,
+                    FLAGS.train_dataset_batch_size
+                    + FLAGS.train_batch_growth_increment * (step // k),
+                )
+            actual_solve_batch_size = None
             pending_record = {}
             inner_diagnostic_rows = []
 
@@ -1531,8 +1617,7 @@ def main(argv):
                     )
 
 
-            if FLAGS.single_batch_inner:
-                single_batch_, single_dataset_metrics_ = pull_training_batch('skipped')
+            # Fetch only the solve batch below; no unused advance of the data cursor.
         
             # ------------------------------------------------------------------
             # Shared helpers, factored out of the original inline linesearch code
@@ -1624,6 +1709,14 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
+                scheduled_lambda = FLAGS.cg_interpolation_lambda
+                if FLAGS.cg_lambda_batch_denominator > 0:
+                    scheduled_lambda = cg_resume.batch_lambda(
+                        batch_['input_tokens'].shape[0], FLAGS.cg_lambda_batch_denominator)
+                elif FLAGS.cg_lambda_final != -1.0:
+                    fraction = min(max(step / FLAGS.cg_lambda_ramp_steps, 0.0), 1.0)
+                    scheduled_lambda += fraction * (
+                        FLAGS.cg_lambda_final - FLAGS.cg_interpolation_lambda)
                 (
                     candidate_params,
                     cg_first_moment,
@@ -1642,6 +1735,7 @@ def main(argv):
                     sharded_rng,
                     batch,
                     FLAGS.inner_loop_wd,
+                    jnp.asarray(scheduled_lambda, dtype=jnp.float32),
                 )
                 
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
@@ -1702,7 +1796,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                         **({
                             "raw_dir_norm": float(jax.device_get(raw_dir_norm)),
                             "momentum_dir_norm": dir_norm,
@@ -1800,7 +1894,7 @@ def main(argv):
                         "chosen_inner_checkpoint": best_checkpoint,
                         "step_size": best_step_size,
                         "global_step": step,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                     }, step=step)
                 if FLAGS.weight_average:
                     alpha = FLAGS.weight_average_decay
@@ -1862,7 +1956,7 @@ def main(argv):
                         "global_step": step,
                         "scaled_step_norm": effective_step_size * dir_norm,
                         "dir_norm": dir_norm,
-                        "ls_baseline_loss": baseline_loss,
+                        "loss": baseline_loss,
                         }, step=step)
                     for (_step_size, _loss) in losses:
                         tag = f"{_step_size:.4f}"
@@ -1898,6 +1992,7 @@ def main(argv):
                         outer_params_before, train_state.params, dir, effective_step_size))
                 del outer_params_before
        
+            cg_checkpoint_safe = True
             progress.complete_update()
             live_results = [train_state, inner_state, sharded_rng, metrics]
             if FLAGS.optimizer_type == 'cg':
@@ -1905,15 +2000,37 @@ def main(argv):
                                      cg_x0, cg_adam_step))
             jax.block_until_ready(live_results)
             timing.stop_train_interval(completed_update=True)
-            if step % FLAGS.log_freq == 0:
+            defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
+            if FLAGS.optimizer_type == 'cg':
+                n_actual, groups = microbatch_groups(
+                    actual_solve_batch_size, FLAGS.cg_n_micro, data_shards)
+                local_sizes = [mb_size // data_shards
+                               for _, count, mb_size in groups for _ in range(count)]
+                defer_wandb({
+                    'cg_n_micro_requested': FLAGS.cg_n_micro,
+                    'cg_n_micro': n_actual,
+                    'cg_microbatch_per_device_min': min(local_sizes),
+                    'cg_microbatch_per_device_max': max(local_sizes),
+                    'cg_lambda_scheduled': cg_metrics['cg_lambda_scheduled'],
+                    'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
+                    'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
+                    'cg_relative_damping': cg_metrics['cg_relative_damping'],
+                    **({'cg_relative_damping': None} if scheduled_lambda == 0.0 else {}),
+                }, step=step)
+            should_log = (
+                step % FLAGS.log_freq == 0
+                or FLAGS.train_batch_growth_interval > 0
+                or FLAGS.optimizer_type == 'cg')
+            if should_log:
                 log_metrics = {}
                 stop_after_log = False
-                log_metrics.update(get_tpu_metrics())
-                log_metrics.update(metrics)
-                log_metrics["param_norm"] = global_norm(train_state.params)
+                if step % FLAGS.log_freq == 0:
+                    log_metrics.update(get_tpu_metrics())
+                    log_metrics.update(metrics)
+                    log_metrics["param_norm"] = global_norm(train_state.params)
                 # log_metrics.update(dataset_metrics)
 
-                do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
+                do_eval = step % FLAGS.log_freq == 0 and FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
 
                 if do_eval: # eval_freq must be | by log_freq
                     timing.start()
@@ -1954,6 +2071,14 @@ def main(argv):
                 if inner_diagnostic_rows:
                     log_metrics['inner_diagnostics'] = wandb.Table(
                         data=[[row] for row in inner_diagnostic_rows], columns=['metrics'])
+                # Evaluation has consumed RNG; commit CG state before publishing the row.
+                if FLAGS.optimizer_type == 'cg' and (
+                        (FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0)
+                        or (FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0)):
+                    save_checkpoint(
+                        train_state, ema=ema if FLAGS.weight_average else None,
+                        milestone=(FLAGS.save_milestone_freq > 0
+                                   and (step + 1) % FLAGS.save_milestone_freq == 0))
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
                 if stop_after_log:
@@ -1961,19 +2086,23 @@ def main(argv):
             
             
 
-            if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
-                if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
-                    save_checkpoint(train_state, ema=ema, milestone=True)
-                else:
-                    save_checkpoint(train_state, milestone=True)
-            elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
-                if FLAGS.weight_average:
-                    ema = jax.device_get(ema)
-                    save_checkpoint(train_state, ema=ema)
-                else:
-                    save_checkpoint(train_state)
+            if FLAGS.optimizer_type != 'cg':
+                if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
+                    if FLAGS.weight_average:
+                        ema = jax.device_get(ema)
+                        save_checkpoint(train_state, ema=ema, milestone=True)
+                    else:
+                        save_checkpoint(train_state, milestone=True)
+                elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
+                    if FLAGS.weight_average:
+                        ema = jax.device_get(ema)
+                        save_checkpoint(train_state, ema=ema)
+                    else:
+                        save_checkpoint(train_state)
 
+        # Save before terminal evaluation consumes RNG, and never save a partial solve.
+        if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_checkpoint_safe:
+            save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
         terminal_metrics = {}
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
             timing.start()
@@ -2000,7 +2129,7 @@ def main(argv):
             progress.phase_completed_updates - 1, **terminal_metrics)
         for name, value in terminal_record.items():
             wandb.run.summary[f'terminal_{name}'] = value
-        if FLAGS.save_model_freq > 0:
+        if FLAGS.save_model_freq > 0 and FLAGS.optimizer_type != 'cg':
             save_checkpoint(train_state)
 
     wandb.finish()

@@ -204,13 +204,14 @@ class HuggingfaceDataset(object):
 
     def __iter__(self):
         state = deepcopy(self._start_state)
-        chunk_size = self.config.batch_size * self.config.seq_length
         token_buffer = state['token_buffer']
         loss_mask_buffer = state['loss_mask_buffer']
         examples_consumed = state['examples_consumed']
         total_tokens = state['metadata']['dataset_total_tokens']
         dataset_iterator = islice(iter(self._dataset), examples_consumed, None)
         while True:
+            batch_size = int(self.config.batch_size)
+            chunk_size = batch_size * self.config.seq_length
             if len(token_buffer) <= chunk_size + 1:
                 try:
                     example = next(dataset_iterator)
@@ -223,9 +224,9 @@ class HuggingfaceDataset(object):
                 continue
             total_tokens += chunk_size
             batch = {
-                'input_tokens': np.array(token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(self.config.batch_size, -1),
-                'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=self.config.batch_token_dtype).reshape(self.config.batch_size, -1),
-                'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(self.config.batch_size, -1),
+                'input_tokens': np.array(token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(batch_size, self.config.seq_length),
+                'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=self.config.batch_token_dtype).reshape(batch_size, self.config.seq_length),
+                'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(batch_size, self.config.seq_length),
             }
             if self.config.always_start_with_bos:
                 batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
