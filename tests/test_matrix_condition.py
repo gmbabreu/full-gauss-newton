@@ -54,26 +54,16 @@ class MatrixConditionTest(unittest.TestCase):
         self.assertEqual(endpoint.iterations, 8)
         self.assertFalse(endpoint.resolved)
 
-    def test_calibration_does_extra_work_and_failure_is_preserved(self):
-        matrix = jnp.diag(jnp.array([1., 2., 10.]))
-        plain = mc.condition_diagnostic(lambda x: matrix @ x, jnp.ones(3),
-                                        **self.options(inverse_maxiter=4))
-        calibrated = mc.condition_diagnostic(lambda x: matrix @ x, jnp.ones(3),
-            **self.options(inverse_maxiter=4, calibrate=True, residual_tol=1e-12))
-        self.assertGreater(calibrated['operator_matvecs'], plain['operator_matvecs'])
-        self.assertFalse(calibrated['resolved'])
-        self.assertIn('calibration_failed', calibrated['failure_reasons'])
-
-    def test_product_count_includes_bound_rayleigh_products(self):
+    def test_product_count_reuses_endpoint_rayleigh_products(self):
         report = mc.condition_diagnostic(lambda x: x, jnp.ones(3), **self.options())
         self.assertEqual(report['operator_matvecs'],
             report['top']['operator_matvecs']
-            + report['bottom']['operator_matvecs'] + 2)
+            + report['bottom']['operator_matvecs'])
 
     def test_reversed_endpoints_are_rejected(self):
-        top = mc.Endpoint(1., 0., True, 3, 1, rayleigh_agreement=True,
+        top = mc.Endpoint(1., 1., 0., True, 3, 1, rayleigh_agreement=True,
                           starts_agree=True, vector=jnp.ones(2))
-        bottom = mc.Endpoint(2., 0., True, 3, 1, rayleigh_agreement=True,
+        bottom = mc.Endpoint(2., 2., 0., True, 3, 1, rayleigh_agreement=True,
                              starts_agree=True, vector=jnp.ones(2))
         with mock.patch.object(mc, 'power_iteration', return_value=top), \
              mock.patch.object(mc, 'inverse_iteration', return_value=bottom):
@@ -82,28 +72,36 @@ class MatrixConditionTest(unittest.TestCase):
         self.assertIsNone(report['condition_est'])
         self.assertIn('endpoint_order', report['failure_reasons'])
 
-    def test_calibration_status_is_independent_per_operator(self):
-        calls = []
-        def fake_condition(_operator, _template, **kwargs):
-            calls.append(kwargs)
-            return dict(lambda_max_est=1., operator_matvecs=0, inner_solves=0,
-                        calibration_attempted=kwargs['calibrate'],
-                        calibration_status=('passed' if kwargs['calibrate']
-                                            else 'previously_passed'))
-        with mock.patch.object(mc, 'condition_diagnostic', side_effect=fake_condition):
-            result = mc.gauss_newton_diagnostics(lambda x: x, jnp.ones(2),
-                shifts=(1e-2, 1e-4),
-                calibrate_by_operator={'G': True, 'condition_shift_1e-2': True})
-        self.assertEqual(result['G']['calibration_status'], 'previously_passed')
-        self.assertEqual(result['shifted']['condition_shift_1e-2']
-                         ['calibration_status'], 'previously_passed')
-        self.assertTrue(result['shifted']['condition_shift_1e-4']
-                        ['calibration_attempted'])
+    def test_shifted_estimates_are_algebraic_and_require_raw_endpoints(self):
+        report = mc.gauss_newton_diagnostics(lambda x: x, jnp.ones(2),
+                                              shifts=(1e-2,), **self.options())
+        shifted = report['shifted']['condition_shift_1e-2']
+        self.assertTrue(shifted['derived_from_raw_G'])
+        self.assertEqual(shifted['operator_matvecs'], 0)
+        unresolved = mc.gauss_newton_diagnostics(
+            lambda x: jnp.zeros_like(x), jnp.ones(2), shifts=(1e-2,),
+            **self.options())
+        self.assertEqual(unresolved['shifted'], {})
 
-    def test_condition_reuses_one_compiled_pcg_callable(self):
+    def test_condition_compiles_one_power_and_one_pcg_callable(self):
         with mock.patch.object(jax, 'jit', wraps=jax.jit) as jit:
             mc.condition_diagnostic(lambda x: x, jnp.ones(3), **self.options())
-        self.assertEqual(jit.call_count, 1)
+        self.assertEqual(jit.call_count, 2)
+
+    def test_power_uses_one_product_per_iteration(self):
+        endpoint = mc.power_iteration(lambda x: x, jnp.ones(3), maxiter=8)
+        self.assertEqual(endpoint.operator_matvecs, endpoint.iterations * 2)
+
+    def test_identity_dominated_preconditioned_max_uses_b_scale(self):
+        b = jnp.diag(jnp.array([1., .001]))
+        c = 100.
+        report = mc.preconditioned_condition_diagnostic(
+            lambda x: b @ x, lambda x: c * x + b @ x, jnp.ones(2), c,
+            **self.options())
+        self.assertTrue(report['resolved'])
+        self.assertAlmostEqual(report['lambda_max_est'], 101., delta=.01)
+        self.assertGreaterEqual(report['operator_matvecs'],
+                                report['top']['operator_matvecs'] + 1)
 
     def test_exhaustive_rademacher_trace_identities(self):
         matrix = np.array([[2., .5], [.5, 3.]])

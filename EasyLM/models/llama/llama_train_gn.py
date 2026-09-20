@@ -153,9 +153,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     # cadence and never alter the solve operator or effective lambda.
     condition_log=False,
     condition_every=50,
-    condition_top_maxiter=64,
-    condition_inverse_maxiter=20,
-    condition_inner_cg_maxiter=512,
+    condition_top_maxiter=24,
+    condition_inverse_maxiter=6,
+    condition_inner_cg_maxiter=32,
     condition_inner_cg_tol=1e-5,
     condition_num_starts=2,
     condition_agreement_tol=0.05,
@@ -1419,22 +1419,18 @@ def main(argv):
             progress.charge(role, batch, metadata)
             return batch, metadata
 
-        # Calibration is operator-specific: a successful shifted solve must not
-        # hide an unresolved raw G (or vice versa) on later measurement steps.
-        condition_calibrated = {}
         condition_pcg_solvers = {}
+        condition_power_solvers = {}
 
         def flatten_condition(prefix, report):
             """Select logger-safe scalar records; vectors never leave the module."""
             names = ('lambda_max_est', 'lambda_max_residual', 'lambda_min_est',
                      'lambda_min_residual', 'condition_est',
                      'condition_rayleigh_lower_bound_est', 'resolved',
-                     'inner_solves', 'operator_matvecs', 'seconds',
-                     'calibration_attempted', 'calibration_status',
-                     'calibration_agreement', 'mu',
-                     'lambda_min_lower_bound')
-            result = {f'condition/{prefix}/{name}': report.get(name)
-                      for name in names}
+                     'inner_solves', 'operator_matvecs', 'seconds', 'mu',
+                     'lambda_min_lower_bound', 'derived_from_raw_G')
+            result = {f'condition/{prefix}/{name}': report[name]
+                      for name in names if report.get(name) is not None}
             result[f'condition/{prefix}/failure_reasons'] = ','.join(
                 report.get('failure_reasons', ()))
             return result
@@ -1442,7 +1438,6 @@ def main(argv):
         def run_condition_diagnostics(params, solve_batch, *, cg_diagonal=None,
                                       effective_lambda=None, safe_adam_lr=None):
             """Host controller over explicitly sharded immutable Gv kernels."""
-            nonlocal condition_calibrated
             started = timeit.default_timer()
             key = jax.random.fold_in(jax.random.PRNGKey(0x434f4e44), step)
             def apply_g(vector, diagnostic_params, diagnostic_batch, *unused):
@@ -1454,19 +1449,11 @@ def main(argv):
                 condition_pcg_solvers['G'] = matrix_condition.make_pcg_solver(
                     apply_g, maxiter=FLAGS.condition_inner_cg_maxiter,
                     tolerance=FLAGS.condition_inner_cg_tol)
-            for relative in tuple(float(value) for value in
-                                  FLAGS.condition_shifts.split(',')):
-                name = f'condition_shift_{relative:.0e}'.replace('e-0', 'e-')
-                def dynamic_shifted(vector, diagnostic_params,
-                                    diagnostic_batch, mu):
-                    return matrix_condition.tree_add(
-                        apply_g(vector, diagnostic_params, diagnostic_batch),
-                        vector, alpha=mu)
-                if name not in condition_pcg_solvers:
-                    condition_pcg_solvers[name] = matrix_condition.make_pcg_solver(
-                        dynamic_shifted,
-                        maxiter=FLAGS.condition_inner_cg_maxiter,
-                        tolerance=FLAGS.condition_inner_cg_tol)
+            if 'G' not in condition_power_solvers:
+                condition_power_solvers['G'] = matrix_condition.make_power_solver(
+                    apply_g, maxiter=FLAGS.condition_top_maxiter,
+                    agreement_tol=FLAGS.condition_agreement_tol,
+                    residual_tol=FLAGS.condition_eigen_residual_tol)
             options = dict(top_maxiter=FLAGS.condition_top_maxiter,
                 inverse_maxiter=FLAGS.condition_inverse_maxiter,
                 inner_maxiter=FLAGS.condition_inner_cg_maxiter,
@@ -1474,27 +1461,23 @@ def main(argv):
                 num_starts=FLAGS.condition_num_starts,
                 agreement_tol=FLAGS.condition_agreement_tol,
                 residual_tol=FLAGS.condition_eigen_residual_tol, key=key)
-            g_reports = matrix_condition.gauss_newton_diagnostics(
-                apply_g, params,
-                shifts=tuple(float(value) for value in
-                             FLAGS.condition_shifts.split(',')),
-                calibrate_by_operator=condition_calibrated,
-                compiled_solver_by_operator=condition_pcg_solvers,
+            print('[condition] G: start', flush=True)
+            g_reports = matrix_condition.gauss_newton_diagnostics(apply_g, params,
+                shifts=tuple(float(value) for value in FLAGS.condition_shifts.split(',')),
+                compiled_solver=condition_pcg_solvers['G'],
+                compiled_power_solver=condition_power_solvers['G'],
                 operator_args=g_operator_args, **options)
+            print('[condition] G: end ' + str({name: g_reports['G'][name]
+                for name in ('lambda_max_est', 'lambda_min_est',
+                             'condition_est', 'resolved')}), flush=True)
             metrics_out = flatten_condition('G', g_reports['G'])
             total_products = g_reports['G']['operator_matvecs']
             total_inner = g_reports['G']['inner_solves']
-            if (g_reports['G']['calibration_attempted']
-                    and g_reports['G']['calibration_status'] == 'passed'):
-                condition_calibrated['G'] = True
             for shift_name, report in g_reports['shifted'].items():
                 metrics_out.update(flatten_condition(
                     f'G_{shift_name.removeprefix("condition_")}', report))
                 total_products += report['operator_matvecs']
                 total_inner += report['inner_solves']
-                if (report['calibration_attempted']
-                        and report['calibration_status'] == 'passed'):
-                    condition_calibrated[shift_name] = True
 
             apply_a_from_g = None
             if cg_diagonal is not None:
@@ -1510,6 +1493,15 @@ def main(argv):
                     return jax.tree.map(
                         lambda g, v, d: interpolation * g + coefficient * d * v,
                         gv, vector, diagonal)
+                def apply_b(vector, diagnostic_params, diagnostic_batch,
+                            diagonal, interpolation, _learning_rate):
+                    scaled = jax.tree.map(
+                        lambda value, d: value / jnp.sqrt(d), vector, diagonal)
+                    g_scaled = apply_g(
+                        scaled, diagnostic_params, diagnostic_batch)
+                    return jax.tree.map(
+                        lambda value, d: interpolation * value / jnp.sqrt(d),
+                        g_scaled, diagonal)
                 a_operator_args = (params, solve_batch, cg_diagonal,
                                    effective_lambda, safe_adam_lr)
                 apply_p = matrix_condition.symmetric_diagonal_operator(
@@ -1528,24 +1520,37 @@ def main(argv):
                         matrix_condition.make_pcg_solver(
                             apply_p, maxiter=FLAGS.condition_inner_cg_maxiter,
                             tolerance=FLAGS.condition_inner_cg_tol)
+                if 'A' not in condition_power_solvers:
+                    condition_power_solvers['A'] = matrix_condition.make_power_solver(
+                        apply_a, maxiter=FLAGS.condition_top_maxiter,
+                        agreement_tol=FLAGS.condition_agreement_tol,
+                        residual_tol=FLAGS.condition_eigen_residual_tol)
+                if 'A_preconditioned_B' not in condition_power_solvers:
+                    condition_power_solvers['A_preconditioned_B'] = \
+                        matrix_condition.make_power_solver(
+                            apply_b, maxiter=FLAGS.condition_top_maxiter,
+                            agreement_tol=FLAGS.condition_agreement_tol,
+                            residual_tol=FLAGS.condition_eigen_residual_tol)
+                print('[condition] A: start', flush=True)
                 a_report = matrix_condition.condition_diagnostic(apply_a, params,
                     preconditioner=inverse_diagonal,
                     operator_args=a_operator_args,
                     compiled_solver=condition_pcg_solvers['A'],
-                    calibrate=not condition_calibrated.get('A', False),
-                    calibrated=condition_calibrated.get('A', False), **options)
-                p_report = matrix_condition.condition_diagnostic(apply_p, params,
+                    compiled_power_solver=condition_power_solvers['A'], **options)
+                print('[condition] A: end ' + str({name: a_report[name]
+                    for name in ('lambda_max_est', 'lambda_min_est',
+                                 'condition_est', 'resolved')}), flush=True)
+                print('[condition] A_preconditioned: start', flush=True)
+                p_report = matrix_condition.preconditioned_condition_diagnostic(
+                    apply_b, apply_p, params, c,
                     operator_args=a_operator_args,
                     compiled_solver=condition_pcg_solvers['A_preconditioned'],
-                    calibrate=not condition_calibrated.get(
-                        'A_preconditioned', False),
-                    calibrated=condition_calibrated.get(
-                        'A_preconditioned', False), **options)
-                for operator_name, report in (
-                        ('A', a_report), ('A_preconditioned', p_report)):
-                    if (report['calibration_attempted']
-                            and report['calibration_status'] == 'passed'):
-                        condition_calibrated[operator_name] = True
+                    compiled_power_solver=condition_power_solvers[
+                        'A_preconditioned_B'],
+                    effective_lambda=effective_lambda, **options)
+                print('[condition] A_preconditioned: end ' + str({name: p_report[name]
+                    for name in ('lambda_max_est', 'lambda_min_est',
+                                 'condition_est', 'resolved')}), flush=True)
                 metrics_out.update(flatten_condition('A', a_report))
                 metrics_out.update(flatten_condition('A_preconditioned', p_report))
                 metrics_out.update({f'condition/{name}': value for name, value in
@@ -1568,8 +1573,12 @@ def main(argv):
                 metrics_out.update({f'condition/{operator_name}/{name}': value
                                     for name, value in summary.items()})
             metrics_out['condition/operator_matvecs'] = total_products
+            metrics_out['condition/gn_products'] = total_products
             metrics_out['condition/inner_solves'] = total_inner
             metrics_out['condition/seconds'] = timeit.default_timer() - started
+            print('[condition] total: ' + str({
+                'seconds': metrics_out['condition/seconds'],
+                'gn_products': total_products}), flush=True)
             return metrics_out
 
         muon_matrix_mask = unflatten_dict({

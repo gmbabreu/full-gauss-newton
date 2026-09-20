@@ -49,6 +49,15 @@ probes are used by default for trace and trace-square plug-in estimates and roug
 sample standard errors. The same `Gz` product is reused for `A`; no preconditioned
 trace estimate is attempted.
 
+The bounded defaults are 24 power steps, 6 inverse steps, 32 iterations per
+nested PCG solve, two independent starts, and four trace probes. There is no
+automatic doubled-budget calibration. Shifted-G endpoints are derived by adding
+the requested shift to accepted raw-G endpoints; they launch no extra solves and
+remain unresolved when either raw endpoint is unresolved. For the symmetric CG
+operator, the largest endpoint is found from
+`B=lambda*D^-1/2*G*D^-1/2` and then shifted by the known identity coefficient.
+This avoids misleading early convergence when `P=cI+B` is identity dominated.
+
 The diagnostic controls, including `condition_trace_probes`, may change on exact
 resume. A legacy checkpoint with `cg_log_matrix_norms=True` is rejected because
 that old logging path changed effective lambda and therefore the trajectory.

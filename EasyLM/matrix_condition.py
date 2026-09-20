@@ -53,6 +53,7 @@ def random_rademacher_pytree(key, template):
 @dataclass
 class Endpoint:
     value_est: float | None
+    rayleigh_quotient: float | None
     residual: float | None
     resolved: bool
     iterations: int
@@ -120,47 +121,91 @@ def _endpoint(candidates, matvecs, inner_solves, agreement_tol, residual_tol,
     if not starts_agree: reasons.append('starts_disagree')
     if require_inner and not all_inner: reasons.append('inner_pcg_failed')
     resolved = not reasons
-    valid = [item for item in candidates if item['value'] is not None]
+    valid = [item for item in candidates if item['value'] is not None
+             and math.isfinite(item['value'])]
     chosen = min(valid, key=lambda item: item['residual'] if item['residual'] is not None
                  else math.inf) if valid else candidates[0]
-    return Endpoint(chosen['value'] if resolved else None, chosen['residual'], resolved,
+    return Endpoint(chosen['value'] if resolved else None, chosen['value'],
+                    chosen['residual'], resolved,
                     max(item['iterations'] for item in candidates), matvecs,
                     inner_solves, all_inner, chosen['agreement'], starts_agree,
                     tuple(reasons), chosen['vector'])
 
 
-def power_iteration(operator, template, *, key=jax.random.PRNGKey(0), maxiter=64,
-                    miniter=0, agreement_tol=.05, residual_tol=.05, num_starts=2,
-                    operator_args=()):
-    candidates, matvecs = [], 0
+def make_power_solver(operator, *, maxiter=24, agreement_tol=.05,
+                      residual_tol=.05):
+    """Compile a one-product-per-iteration power loop."""
+    def solve(initial_vector, *operator_args):
+        history = jnp.full((3,), jnp.nan, jnp.float32)
+        state = (jnp.int32(0), initial_vector, initial_vector, history,
+                 jnp.float32(jnp.nan), jnp.float32(jnp.nan),
+                 jnp.bool_(True), jnp.bool_(False))
+
+        def cond(value):
+            iteration, _, _, _, _, _, valid, converged = value
+            return (iteration < maxiter) & valid & ~converged
+
+        def body(value):
+            iteration, vector, _, history, _, _, valid, _ = value
+            product = operator(vector, *operator_args)
+            vv = tree_dot(vector, vector)
+            product_norm = tree_norm(product)
+            theta = tree_dot(vector, product) / jnp.where(vv > 0, vv, 1.)
+            residual_tree = tree_add(product, vector, alpha=-theta)
+            denominator = jnp.maximum(jnp.abs(theta) * jnp.sqrt(vv),
+                jnp.finfo(jnp.float32).eps * product_norm)
+            residual = tree_norm(residual_tree) / jnp.where(
+                denominator > 0, denominator, 1.)
+            valid = (valid & jnp.isfinite(vv) & (vv > 0)
+                     & jnp.isfinite(product_norm) & (product_norm > 0)
+                     & jnp.isfinite(theta) & jnp.isfinite(residual)
+                     & (denominator > 0))
+            history = jnp.roll(history, -1).at[-1].set(theta)
+            scale = jnp.maximum(jnp.max(jnp.abs(history)), jnp.float32(1e-30))
+            agreement = ((iteration + 1) >= 3) & jnp.all(jnp.isfinite(history)) \
+                & ((jnp.max(history) - jnp.min(history)) / scale <= agreement_tol)
+            converged = valid & agreement & (residual <= residual_tol)
+            next_vector = jax.tree.map(
+                lambda leaf: leaf / jnp.where(product_norm > 0, product_norm, 1.),
+                product)
+            return (iteration + 1, next_vector, vector, history, theta,
+                    residual, valid, converged)
+
+        return jax.lax.while_loop(cond, body, state)
+    return jax.jit(solve)
+
+
+def power_iteration(operator, template, *, key=jax.random.PRNGKey(0), maxiter=24,
+                    agreement_tol=.05, residual_tol=.05, num_starts=2,
+                    operator_args=(), compiled_solver=None):
+    candidates = []
+    compiled_solver = compiled_solver or make_power_solver(
+        operator, maxiter=maxiter, agreement_tol=agreement_tol,
+        residual_tol=residual_tol)
     for start in range(num_starts):
         vector = random_unit_pytree(jax.random.fold_in(key, start), template)
-        history, converged, value, residual = [], False, None, None
-        for iteration in range(1, maxiter + 1):
-            if vector is None: break
-            product = operator(vector, *operator_args); matvecs += 1
-            norm = float(tree_norm(product))
-            if not math.isfinite(norm) or norm <= 0: break
-            vector = tree_scale(1 / norm, product)
-            value, residual = eigenpair_residual(
-                operator, vector, operator_args); matvecs += 1
-            if value is None: break
-            history.append(value)
-            converged = (iteration >= miniter and _last_three_agree(history, agreement_tol)
-                         and residual is not None and math.isfinite(residual)
-                         and residual <= residual_tol)
-            if converged: break
+        if vector is None:
+            candidates.append(dict(value=None, residual=None, vector=None,
+                converged=False, iterations=0, agreement=False, inner_ok=True))
+            continue
+        iteration, _, evaluated_vector, history, value, residual, valid, converged = \
+            compiled_solver(vector, *operator_args)
+        iteration, value, residual = int(iteration), float(value), float(residual)
+        valid, converged = bool(valid), bool(converged)
+        history = np.asarray(jax.device_get(history), dtype=np.float64).tolist()
         candidates.append(dict(value=value, residual=residual, vector=vector,
-            converged=converged, iterations=iteration, agreement=_last_three_agree(
-                history, agreement_tol), inner_ok=True))
-    return _endpoint(candidates, matvecs, 0, agreement_tol, residual_tol, False)
+            converged=valid and converged, iterations=iteration,
+            agreement=_last_three_agree(history, agreement_tol), inner_ok=True))
+        candidates[-1]['vector'] = evaluated_vector
+    return _endpoint(candidates, sum(item['iterations'] for item in candidates),
+                     0, agreement_tol, residual_tol, False)
 
 
 def make_pcg_solver(operator, *, preconditioner=None, maxiter=512,
                     tolerance=1e-5):
     """Compile one reusable diagnostic PCG kernel.
 
-    The returned callable is reused by every start and the calibration pass.
+    The returned callable is reused by every independent inverse-iteration start.
     Array-valued state belongs in ``rhs`` (and in explicit arguments of the
     supplied operator), rather than in this controller's Python loop.
     """
@@ -273,62 +318,97 @@ def condition_diagnostic(operator, template, **kwargs):
     seed = kwargs.get('key', jax.random.PRNGKey(0))
     operator_args = kwargs.get('operator_args', ())
     top = power_iteration(operator, template, key=seed,
-        maxiter=kwargs.get('top_maxiter', 64), operator_args=operator_args,
+        maxiter=kwargs.get('top_maxiter', 24), operator_args=operator_args,
+        compiled_solver=kwargs.get('compiled_power_solver'),
         **common)
-    inverse_args = dict(inner_maxiter=kwargs.get('inner_maxiter', 512),
+    inverse_args = dict(inner_maxiter=kwargs.get('inner_maxiter', 32),
         inner_tol=kwargs.get('inner_tol', 1e-5),
         preconditioner=kwargs.get('preconditioner'), **common)
-    inverse_budget = kwargs.get('inverse_maxiter', 20)
+    inverse_budget = kwargs.get('inverse_maxiter', 6)
     inverse_key = jax.random.fold_in(seed, 9176)
     compiled_solver = kwargs.get('compiled_solver') or make_pcg_solver(
         operator, preconditioner=kwargs.get('preconditioner'),
-        maxiter=kwargs.get('inner_maxiter', 512),
+        maxiter=kwargs.get('inner_maxiter', 32),
         tolerance=kwargs.get('inner_tol', 1e-5))
     bottom = inverse_iteration(operator, template, key=inverse_key,
         maxiter=inverse_budget, compiled_solver=compiled_solver,
         operator_args=operator_args, **inverse_args)
-    calibration, calibration_ok = None, True
-    if kwargs.get('calibrate', False):
-        # miniter forces genuinely additional work rather than identical early exit.
-        calibration = inverse_iteration(operator, template, key=inverse_key,
-            maxiter=2 * inverse_budget, miniter=inverse_budget + 1,
-            compiled_solver=compiled_solver, operator_args=operator_args,
-            **inverse_args)
-        calibration_ok = (bottom.resolved and calibration.resolved
-            and abs(bottom.value_est - calibration.value_est)
-                <= kwargs.get('agreement_tol', .05)
-                   * max(abs(calibration.value_est), 1e-30))
     order_ok = (top.value_est is not None and bottom.value_est is not None
         and 0 < bottom.value_est <= top.value_est)
     reasons = list(top.failure_reasons) + list(bottom.failure_reasons)
     if not order_ok: reasons.append('endpoint_order')
-    if not calibration_ok: reasons.append('calibration_failed')
-    resolved = top.resolved and bottom.resolved and order_ok and calibration_ok
+    resolved = top.resolved and bottom.resolved and order_ok
     rayleigh_bound = None
-    rayleigh_products = 0
-    if top.vector is not None and bottom.vector is not None:
-        q_hi, _ = eigenpair_residual(operator, top.vector, operator_args)
-        q_lo, _ = eigenpair_residual(operator, bottom.vector, operator_args)
-        rayleigh_products = 2
-        if q_hi is not None and q_lo is not None and q_hi > 0 and q_lo > 0:
-            rayleigh_bound = max(q_hi, q_lo) / min(q_hi, q_lo)
+    q_hi, q_lo = top.rayleigh_quotient, bottom.rayleigh_quotient
+    if q_hi is not None and q_lo is not None and q_hi > 0 and q_lo > 0:
+        rayleigh_bound = max(q_hi, q_lo) / min(q_hi, q_lo)
     return dict(lambda_max_est=top.value_est, lambda_max_residual=top.residual,
         lambda_min_est=bottom.value_est, lambda_min_residual=bottom.residual,
         condition_est=(top.value_est / bottom.value_est if resolved else None),
         condition_rayleigh_lower_bound_est=rayleigh_bound, resolved=resolved,
         failure_reasons=tuple(dict.fromkeys(reasons)), top=top.metrics(),
-        bottom=bottom.metrics(), calibration=(calibration.metrics() if calibration else None),
-        calibration_attempted=calibration is not None,
-        calibration_status=('passed' if calibration is not None and calibration_ok
-                            else 'unresolved' if calibration is not None
-                            else 'previously_passed' if kwargs.get('calibrated', False)
-                            else 'not_attempted'),
-        calibration_agreement=calibration_ok,
-        inner_solves=bottom.inner_solves + (calibration.inner_solves if calibration else 0),
-        operator_matvecs=top.operator_matvecs + bottom.operator_matvecs
-            + (calibration.operator_matvecs if calibration else 0)
-            + rayleigh_products,
+        bottom=bottom.metrics(), inner_solves=bottom.inner_solves,
+        operator_matvecs=top.operator_matvecs + bottom.operator_matvecs,
         seconds=time.monotonic() - started)
+
+
+def preconditioned_condition_diagnostic(apply_b, apply_p, template, c, **kwargs):
+    """Estimate P=cI+B, using B (not identity-dominated P) for its maximum."""
+    started = time.monotonic()
+    if c > 0 and kwargs.get('effective_lambda') == 0:
+        return dict(lambda_max_est=c, lambda_min_est=c, condition_est=1.,
+            resolved=True, lambda_max_residual=0., lambda_min_residual=0.,
+            condition_rayleigh_lower_bound_est=1., failure_reasons=(),
+            inner_solves=0, operator_matvecs=0, seconds=time.monotonic() - started,
+            top={'special_case': 'P=cI'}, bottom={'special_case': 'P=cI'})
+    common = {name: kwargs[name] for name in
+              ('agreement_tol', 'residual_tol', 'num_starts') if name in kwargs}
+    key = kwargs.get('key', jax.random.PRNGKey(0))
+    operator_args = kwargs.get('operator_args', ())
+    top_b = power_iteration(apply_b, template, key=key,
+        maxiter=kwargs.get('top_maxiter', 24), operator_args=operator_args,
+        compiled_solver=kwargs.get('compiled_power_solver'), **common)
+    p_max, p_max_residual, p_top_rayleigh = None, None, None
+    extra_products = 0
+    if top_b.vector is not None:
+        p_top_rayleigh, p_max_residual = eigenpair_residual(
+            apply_p, top_b.vector, operator_args)
+        extra_products = 1
+        if (top_b.resolved and p_top_rayleigh is not None
+                and p_max_residual is not None
+                and p_max_residual <= kwargs.get('residual_tol', .05)):
+            p_max = c + top_b.value_est
+    pcg_solver = kwargs.get('compiled_solver') or make_pcg_solver(
+        apply_p, preconditioner=kwargs.get('preconditioner'),
+        maxiter=kwargs.get('inner_maxiter', 32),
+        tolerance=kwargs.get('inner_tol', 1e-5))
+    bottom = inverse_iteration(apply_p, template,
+        key=jax.random.fold_in(key, 9176),
+        maxiter=kwargs.get('inverse_maxiter', 6),
+        inner_maxiter=kwargs.get('inner_maxiter', 32),
+        inner_tol=kwargs.get('inner_tol', 1e-5),
+        preconditioner=kwargs.get('preconditioner'), compiled_solver=pcg_solver,
+        operator_args=operator_args, **common)
+    order_ok = p_max is not None and bottom.value_est is not None \
+        and 0 < bottom.value_est <= p_max
+    reasons = list(top_b.failure_reasons) + list(bottom.failure_reasons)
+    if p_max is None and top_b.resolved: reasons.append('P_max_residual')
+    if not order_ok: reasons.append('endpoint_order')
+    resolved = p_max is not None and bottom.resolved and order_ok
+    lower = None
+    if (p_top_rayleigh is not None and bottom.rayleigh_quotient is not None
+            and p_top_rayleigh > 0 and bottom.rayleigh_quotient > 0):
+        lower = max(p_top_rayleigh, bottom.rayleigh_quotient) / min(
+            p_top_rayleigh, bottom.rayleigh_quotient)
+    return dict(lambda_max_est=p_max, lambda_min_est=bottom.value_est,
+        condition_est=(p_max / bottom.value_est if resolved else None),
+        resolved=resolved, lambda_max_residual=p_max_residual,
+        lambda_min_residual=bottom.residual,
+        condition_rayleigh_lower_bound_est=lower,
+        failure_reasons=tuple(dict.fromkeys(reasons)), top=top_b.metrics(),
+        bottom=bottom.metrics(), inner_solves=bottom.inner_solves,
+        operator_matvecs=top_b.operator_matvecs + bottom.operator_matvecs
+            + extra_products, seconds=time.monotonic() - started)
 
 
 def shifted_operator(operator, shift):
@@ -390,30 +470,22 @@ def probe_operators(apply_g, template, *, num_probes=4,
 
 
 def gauss_newton_diagnostics(operator, template, *, shifts=(1e-2, 1e-4), **kwargs):
-    """Raw G plus explicitly shifted estimates; no singularity inference."""
-    calibration = kwargs.pop('calibrate_by_operator', None)
-    solvers = kwargs.pop('compiled_solver_by_operator', None)
-    raw_kwargs = dict(kwargs, calibrate=(not calibration.get('G', False)
-        if calibration is not None else kwargs.get('calibrate', False)),
-        calibrated=(calibration.get('G', False) if calibration is not None else False),
-        compiled_solver=(solvers.get('G') if solvers is not None else None))
-    raw = condition_diagnostic(operator, template, **raw_kwargs)
+    """Raw G plus algebraically derived shifts of accepted raw endpoints."""
+    raw = condition_diagnostic(operator, template, **kwargs)
     output = {'G': raw, 'shifted': {}}
     if raw['lambda_max_est'] is None: return output
     for relative in shifts:
         mu = relative * raw['lambda_max_est']
         name = f'condition_shift_{relative:.0e}'.replace('e-0', 'e-')
-        base_args = kwargs.get('operator_args', ())
-        def dynamic_shifted(vector, *args):
-            return tree_add(operator(vector, *args[:-1]), vector,
-                            alpha=args[-1])
-        shifted_kwargs = dict(kwargs, calibrate=(not calibration.get(name, False)
-            if calibration is not None else kwargs.get('calibrate', False)),
-            calibrated=(calibration.get(name, False) if calibration is not None else False),
-            compiled_solver=(solvers.get(name) if solvers is not None else None),
-            operator_args=base_args + (mu,))
-        shifted = condition_diagnostic(
-            dynamic_shifted, template, **shifted_kwargs)
-        shifted.update(mu=mu, lambda_min_lower_bound=mu)
+        shifted_min = (raw['lambda_min_est'] + mu
+                       if raw['lambda_min_est'] is not None else None)
+        shifted_max = raw['lambda_max_est'] + mu
+        resolved = raw['resolved'] and shifted_min is not None
+        shifted = dict(lambda_max_est=shifted_max,
+            lambda_min_est=shifted_min,
+            condition_est=(shifted_max / shifted_min if resolved else None),
+            resolved=resolved, mu=mu, lambda_min_lower_bound=mu,
+            derived_from_raw_G=True, operator_matvecs=0, inner_solves=0,
+            failure_reasons=raw['failure_reasons'] if not resolved else ())
         output['shifted'][name] = shifted
     return output
