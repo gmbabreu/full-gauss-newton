@@ -18,7 +18,7 @@ For lambda equal to actual global solve-batch sequences divided by 10240:
 --cg_lambda_batch_denominator=10240
 --cg_lambda_final=-1
 --cg_lambda_ramp_steps=0
---cg_log_matrix_norms=False
+--condition_log=False
 ```
 
 This gives 0.025 at batch 256, 0.1 at 1024, and 0.2 at 2048, before device or
@@ -30,6 +30,64 @@ performed. The LR schedule remains update-based; this rule does not eliminate
 all coupling between batch schedules and token-budget comparisons, or guarantee
 training stability. Set the denominator to zero AND disable the old ramp when
 requesting constant lambda.
+
+## Condition diagnostics
+
+`--condition_log=True` measures the frozen operator every
+`condition_every` outer updates. CG reports `G`, the actual damped `A`, and the
+symmetric `D^-1/2 A D^-1/2`; Muon-GN reports the first already-fetched inner
+batch's `G`. Diagnostics neither fetch data nor consume training RNG, and their
+matrix products are excluded from solve-token accounting. Dropout and FCM must
+be disabled for Muon diagnostics.
+
+Maximum-eigenvalue values use the `_est` suffix because agreement and residual
+checks do not certify global extremality. Failed checks retain residuals,
+counters, and failure reasons but withhold `lambda_max_est`. Four unnormalised Rademacher
+probes are used by default for trace and trace-square plug-in estimates and rough
+sample standard errors. The same `Gz` product is reused for `A`; no preconditioned
+trace estimate is attempted.
+
+The bounded defaults are 24 power steps, two independent starts, and four trace
+probes. Routine diagnostics intentionally estimate maxima only. For the symmetric CG
+operator, the maximum is found from
+`B=lambda*D^-1/2*G*D^-1/2` and then shifted by the known identity coefficient.
+This avoids misleading early convergence when `P=cI+B` is identity dominated.
+`spectral_concentration_est=n*lambda_max_est/trace_est` and
+`damping_condition_proxy=p_lambda_max_est/c` are descriptive proxies, not
+certified condition bounds.
+
+### CPU-resident top-100 spectrum
+
+`--spectrum_log=True` enables a separate, infrequent thick-restarted block
+Rayleigh--Ritz estimate of raw `G`. Its FP32 basis and restart destination stay
+on CPU; projection coefficients and the small eigendecomposition use FP64. A
+preflight includes both basis buffers, active blocks, projection/transfer
+workspace, cgroup-aware available memory, and an 8 GiB reserve. At 150M
+parameters, the two 160-vector buffers alone are about 179 GiB. The diagnostic
+refuses unsupported multi-host runs and insufficient host memory; this is not a
+claim that a real measurement will fit or converge.
+
+The restart preserves `GQ=QH+FC` and, for `U=QY`, the residual coupling in
+`GU=UTheta+FCY`; it does not drop coupling to force a three-term recurrence.
+All GN products are sequential and use the same frozen batch and microbatch
+weighting as routine diagnostics. Candidate values, residuals, and failure
+details are logged in one small W&B table, while accepted ranks 1, 10, and 100
+are scalar metrics only after stability and residual checks pass.
+
+Suggested validation commands (run on a host with JAX and sufficient RAM):
+
+```bash
+PYTHONPATH=. python -m unittest tests.test_matrix_condition tests.test_matrix_spectrum -v
+# One frozen measurement with the trial budget:
+python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_every=1
+# Independent seed and larger-budget repeats:
+python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_seed=1
+python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_max_gn_products=1200
+```
+
+The diagnostic controls, including `condition_trace_probes`, may change on exact
+resume. A legacy checkpoint with `cg_log_matrix_norms=True` is rejected because
+that old logging path changed effective lambda and therefore the trajectory.
 
 ## Data order and compatibility
 
