@@ -149,6 +149,10 @@ def validate_flags(saved, current):
         'condition_num_starts', 'condition_agreement_tol',
         'condition_eigen_residual_tol', 'condition_shifts',
         'condition_trace_probes',
+        'spectrum_log', 'spectrum_every', 'spectrum_top_k',
+        'spectrum_block_size', 'spectrum_max_basis', 'spectrum_restart_keep',
+        'spectrum_max_gn_products', 'spectrum_residual_tol',
+        'spectrum_stability_tol', 'spectrum_seed',
         # False was observational; True is explicitly rejected below.
         'cg_log_matrix_norms', 'cg_matrix_norm_frobenius_probes',
         'cg_matrix_norm_power_iters'}

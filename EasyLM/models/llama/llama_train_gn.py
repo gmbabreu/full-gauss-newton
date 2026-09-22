@@ -30,7 +30,7 @@ import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
-from EasyLM import cg_resume, matrix_condition
+from EasyLM import cg_resume, matrix_condition, matrix_spectrum
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -154,14 +154,20 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     condition_log=False,
     condition_every=50,
     condition_top_maxiter=24,
-    condition_inverse_maxiter=6,
-    condition_inner_cg_maxiter=32,
-    condition_inner_cg_tol=1e-5,
     condition_num_starts=2,
     condition_agreement_tol=0.05,
     condition_eigen_residual_tol=0.05,
-    condition_shifts='1e-2,1e-4',
     condition_trace_probes=4,
+    spectrum_log=False,
+    spectrum_every=500,
+    spectrum_top_k=100,
+    spectrum_block_size=4,
+    spectrum_max_basis=160,
+    spectrum_restart_keep=120,
+    spectrum_max_gn_products=600,
+    spectrum_residual_tol=0.01,
+    spectrum_stability_tol=0.02,
+    spectrum_seed=0,
 )
 
 def microbatch_groups(batch_size, n_requested, data_shards):
@@ -248,26 +254,26 @@ def get_tpu_metrics():
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
-    if FLAGS.condition_log:
+    if FLAGS.condition_log or FLAGS.spectrum_log:
         if FLAGS.optimizer_type not in ('cg', 'muon') or (
                 FLAGS.optimizer_type == 'muon' and not FLAGS.gauss_newton):
             raise ValueError('Condition diagnostics support CG and Muon-GN only')
-        if FLAGS.condition_every <= 0 or FLAGS.condition_top_maxiter < 3 \
-                or FLAGS.condition_inverse_maxiter < 3 \
-                or FLAGS.condition_inner_cg_maxiter <= 0 \
+        if FLAGS.condition_log and (FLAGS.condition_every <= 0 or FLAGS.condition_top_maxiter < 3 \
                 or FLAGS.condition_num_starts < 2 \
-                or FLAGS.condition_trace_probes < 2:
+                or FLAGS.condition_trace_probes < 2):
             raise ValueError('Condition diagnostics require positive budgets, '
                              'at least three outer iterations, and two starts')
-        if not 0 < FLAGS.condition_inner_cg_tol < 1:
-            raise ValueError('condition_inner_cg_tol must be in (0, 1)')
         if not 0 < FLAGS.condition_agreement_tol < 1 \
                 or not 0 < FLAGS.condition_eigen_residual_tol < 1:
             raise ValueError('Condition validation tolerances must be in (0, 1)')
-        shifts = [float(value) for value in FLAGS.condition_shifts.split(',')]
-        if not shifts or any(not math.isfinite(value) or value <= 0
-                             for value in shifts):
-            raise ValueError('condition_shifts must be positive finite ratios')
+        if FLAGS.spectrum_log:
+            if jax.process_count() != 1:
+                raise ValueError('spectrum diagnostics currently support single-host execution only')
+            if not (0 < FLAGS.spectrum_top_k <= FLAGS.spectrum_restart_keep
+                    < FLAGS.spectrum_max_basis):
+                raise ValueError('invalid spectrum top-k/restart/basis settings')
+            if FLAGS.spectrum_every <= 0 or FLAGS.spectrum_block_size <= 0:
+                raise ValueError('spectrum cadence and block size must be positive')
 
     if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
         raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")
@@ -403,7 +409,7 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    if FLAGS.condition_log and FLAGS.optimizer_type == 'muon':
+    if (FLAGS.condition_log or FLAGS.spectrum_log) and FLAGS.optimizer_type == 'muon':
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
@@ -1063,6 +1069,8 @@ def main(argv):
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
     )
+    diagnostic_param_shards, _ = make_shard_and_gather_fns(
+        train_state_partition.params)
     if FLAGS.optimizer_type == 'cg':
         cg_param_shards, cg_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
 
@@ -1419,23 +1427,20 @@ def main(argv):
             progress.charge(role, batch, metadata)
             return batch, metadata
 
-        condition_pcg_solvers = {}
         condition_power_solvers = {}
 
         def flatten_condition(prefix, report):
             """Select logger-safe scalar records; vectors never leave the module."""
-            names = ('lambda_max_est', 'lambda_max_residual', 'lambda_min_est',
-                     'lambda_min_residual', 'condition_est',
-                     'condition_rayleigh_lower_bound_est', 'resolved',
-                     'inner_solves', 'operator_matvecs', 'seconds', 'mu',
-                     'lambda_min_lower_bound', 'derived_from_raw_G')
+            names = ('lambda_max_est', 'lambda_max_residual', 'resolved',
+                     'operator_matvecs', 'seconds', 'damping_condition_proxy')
             result = {f'condition/{prefix}/{name}': report[name]
                       for name in names if report.get(name) is not None}
             result[f'condition/{prefix}/failure_reasons'] = ','.join(
                 report.get('failure_reasons', ()))
             return result
 
-        def run_condition_diagnostics(params, solve_batch, *, cg_diagonal=None,
+        def run_condition_diagnostics(params, solve_batch, *, do_condition,
+                                      do_spectrum, cg_diagonal=None,
                                       effective_lambda=None, safe_adam_lr=None):
             """Host controller over explicitly sharded immutable Gv kernels."""
             started = timeit.default_timer()
@@ -1445,39 +1450,87 @@ def main(argv):
                     diagnostic_params, diagnostic_batch, vector,
                     FLAGS.inner_loop_wd)
             g_operator_args = (params, solve_batch)
-            if 'G' not in condition_pcg_solvers:
-                condition_pcg_solvers['G'] = matrix_condition.make_pcg_solver(
-                    apply_g, maxiter=FLAGS.condition_inner_cg_maxiter,
-                    tolerance=FLAGS.condition_inner_cg_tol)
+            metrics_out = {}
+            spectrum_max = None
+            if do_spectrum:
+                leaves, structure = jax.tree.flatten(params)
+                shapes = [leaf.shape for leaf in leaves]
+                sizes = [leaf.size for leaf in leaves]
+                dimension = sum(sizes)
+                def cpu_apply(flat_vector):
+                    offset, vector_leaves = 0, []
+                    for shape, size, leaf in zip(shapes, sizes, leaves):
+                        vector_leaves.append(flat_vector[offset:offset + size].reshape(
+                            shape).astype(np.float32, copy=False))
+                        offset += size
+                    vector_tree = jax.tree.unflatten(structure, vector_leaves)
+                    vector_tree = jax.tree.map(
+                        lambda value, shard: shard(value),
+                        vector_tree, diagnostic_param_shards)
+                    product = sharded_condition_apply_g(
+                        params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
+                    jax.block_until_ready(product)
+                    host = jax.device_get(product)
+                    result = np.concatenate([
+                        np.asarray(leaf, np.float32).reshape(-1)
+                        for leaf in jax.tree.leaves(host)])
+                    del vector_tree, product, host
+                    return result
+                print('[spectrum] G top-100: start', flush=True)
+                spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
+                    cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
+                    block_size=FLAGS.spectrum_block_size,
+                    max_basis=FLAGS.spectrum_max_basis,
+                    restart_keep=FLAGS.spectrum_restart_keep,
+                    max_products=FLAGS.spectrum_max_gn_products,
+                    residual_tol=FLAGS.spectrum_residual_tol,
+                    stability_tol=FLAGS.spectrum_stability_tol,
+                    seed=FLAGS.spectrum_seed,
+                    progress=lambda done, total: print(
+                        f'[spectrum] G products {done}/{total}', flush=True))
+                metrics_out.update({f'spectrum/G/{name}': value
+                                    for name, value in spectrum_scalars.items()
+                                    if value is not None})
+                failure_text = ','.join(spectrum_table['failure_reasons'])
+                rows = [[index + 1, value,
+                         spectrum_table['residuals'][index]
+                         if index < len(spectrum_table['residuals']) else None,
+                         spectrum_table['direct_residuals'].get(index + 1),
+                         spectrum_scalars['accepted'], failure_text]
+                        for index, value in enumerate(spectrum_table['values'])]
+                metrics_out['spectrum/G/candidates'] = wandb.Table(
+                    columns=['rank', 'value', 'ritz_residual', 'direct_residual',
+                             'accepted', 'failure_reasons'], data=rows)
+                metrics_out['spectrum/G/failure_reasons'] = ','.join(
+                    spectrum_table['failure_reasons'])
+                if spectrum_scalars['accepted']:
+                    spectrum_max = spectrum_scalars['lambda_1_est']
+                print('[spectrum] G top-100: end ' + str(spectrum_scalars), flush=True)
+            if not do_condition:
+                metrics_out['spectrum/G/seconds_total'] = timeit.default_timer() - started
+                return metrics_out
             if 'G' not in condition_power_solvers:
                 condition_power_solvers['G'] = matrix_condition.make_power_solver(
                     apply_g, maxiter=FLAGS.condition_top_maxiter,
                     agreement_tol=FLAGS.condition_agreement_tol,
                     residual_tol=FLAGS.condition_eigen_residual_tol)
             options = dict(top_maxiter=FLAGS.condition_top_maxiter,
-                inverse_maxiter=FLAGS.condition_inverse_maxiter,
-                inner_maxiter=FLAGS.condition_inner_cg_maxiter,
-                inner_tol=FLAGS.condition_inner_cg_tol,
                 num_starts=FLAGS.condition_num_starts,
                 agreement_tol=FLAGS.condition_agreement_tol,
                 residual_tol=FLAGS.condition_eigen_residual_tol, key=key)
             print('[condition] G: start', flush=True)
-            g_reports = matrix_condition.gauss_newton_diagnostics(apply_g, params,
-                shifts=tuple(float(value) for value in FLAGS.condition_shifts.split(',')),
-                compiled_solver=condition_pcg_solvers['G'],
-                compiled_power_solver=condition_power_solvers['G'],
-                operator_args=g_operator_args, **options)
-            print('[condition] G: end ' + str({name: g_reports['G'][name]
-                for name in ('lambda_max_est', 'lambda_min_est',
-                             'condition_est', 'resolved')}), flush=True)
-            metrics_out = flatten_condition('G', g_reports['G'])
-            total_products = g_reports['G']['operator_matvecs']
-            total_inner = g_reports['G']['inner_solves']
-            for shift_name, report in g_reports['shifted'].items():
-                metrics_out.update(flatten_condition(
-                    f'G_{shift_name.removeprefix("condition_")}', report))
-                total_products += report['operator_matvecs']
-                total_inner += report['inner_solves']
+            if spectrum_max is None:
+                g_report = matrix_condition.condition_diagnostic(apply_g, params,
+                    compiled_power_solver=condition_power_solvers['G'],
+                    operator_args=g_operator_args, **options)
+            else:
+                g_report = dict(lambda_max_est=spectrum_max,
+                    lambda_max_residual=None, resolved=True, failure_reasons=(),
+                    operator_matvecs=0, seconds=0., top={'source': 'spectrum'})
+            print('[condition] G: end ' + str({name: g_report[name]
+                for name in ('lambda_max_est', 'resolved')}), flush=True)
+            metrics_out.update(flatten_condition('G', g_report))
+            total_products = g_report['operator_matvecs']
 
             apply_a_from_g = None
             if cg_diagonal is not None:
@@ -1506,20 +1559,6 @@ def main(argv):
                                    effective_lambda, safe_adam_lr)
                 apply_p = matrix_condition.symmetric_diagonal_operator(
                     apply_a, lambda *args: args[2])
-                def inverse_diagonal(residual, _params, _batch, diagonal,
-                                     _interpolation, _learning_rate):
-                    return jax.tree.map(lambda value, d: value / d,
-                                        residual, diagonal)
-                if 'A' not in condition_pcg_solvers:
-                    condition_pcg_solvers['A'] = matrix_condition.make_pcg_solver(
-                        apply_a, preconditioner=inverse_diagonal,
-                        maxiter=FLAGS.condition_inner_cg_maxiter,
-                        tolerance=FLAGS.condition_inner_cg_tol)
-                if 'A_preconditioned' not in condition_pcg_solvers:
-                    condition_pcg_solvers['A_preconditioned'] = \
-                        matrix_condition.make_pcg_solver(
-                            apply_p, maxiter=FLAGS.condition_inner_cg_maxiter,
-                            tolerance=FLAGS.condition_inner_cg_tol)
                 if 'A' not in condition_power_solvers:
                     condition_power_solvers['A'] = matrix_condition.make_power_solver(
                         apply_a, maxiter=FLAGS.condition_top_maxiter,
@@ -1533,31 +1572,25 @@ def main(argv):
                             residual_tol=FLAGS.condition_eigen_residual_tol)
                 print('[condition] A: start', flush=True)
                 a_report = matrix_condition.condition_diagnostic(apply_a, params,
-                    preconditioner=inverse_diagonal,
                     operator_args=a_operator_args,
-                    compiled_solver=condition_pcg_solvers['A'],
                     compiled_power_solver=condition_power_solvers['A'], **options)
                 print('[condition] A: end ' + str({name: a_report[name]
-                    for name in ('lambda_max_est', 'lambda_min_est',
-                                 'condition_est', 'resolved')}), flush=True)
+                    for name in ('lambda_max_est', 'resolved')}), flush=True)
                 print('[condition] A_preconditioned: start', flush=True)
                 p_report = matrix_condition.preconditioned_condition_diagnostic(
                     apply_b, apply_p, params, c,
                     operator_args=a_operator_args,
-                    compiled_solver=condition_pcg_solvers['A_preconditioned'],
                     compiled_power_solver=condition_power_solvers[
                         'A_preconditioned_B'],
                     effective_lambda=effective_lambda, **options)
                 print('[condition] A_preconditioned: end ' + str({name: p_report[name]
-                    for name in ('lambda_max_est', 'lambda_min_est',
-                                 'condition_est', 'resolved')}), flush=True)
+                    for name in ('lambda_max_est', 'resolved')}), flush=True)
                 metrics_out.update(flatten_condition('A', a_report))
                 metrics_out.update(flatten_condition('A_preconditioned', p_report))
                 metrics_out.update({f'condition/{name}': value for name, value in
                     matrix_condition.structural_lower_bounds(
                         effective_lambda, safe_adam_lr, cg_diagonal).items()})
                 total_products += a_report['operator_matvecs'] + p_report['operator_matvecs']
-                total_inner += a_report['inner_solves'] + p_report['inner_solves']
 
             # A uses the same Gz as G and therefore adds no GN products.
             probe_samples = matrix_condition.probe_operators(
@@ -1567,14 +1600,15 @@ def main(argv):
                 apply_a_from_g=apply_a_from_g)
             total_products += FLAGS.condition_trace_probes
             for operator_name, samples in probe_samples.items():
-                top = (g_reports['G']['lambda_max_est'] if operator_name == 'G'
+                top = (g_report['lambda_max_est'] if operator_name == 'G'
                        else a_report['lambda_max_est'])
-                summary = matrix_condition.summarize_probe_samples(*samples, top)
+                dimension = sum(leaf.size for leaf in jax.tree.leaves(params))
+                summary = matrix_condition.summarize_probe_samples(
+                    *samples, top, dimension=dimension)
                 metrics_out.update({f'condition/{operator_name}/{name}': value
                                     for name, value in summary.items()})
             metrics_out['condition/operator_matvecs'] = total_products
             metrics_out['condition/gn_products'] = total_products
-            metrics_out['condition/inner_solves'] = total_inner
             metrics_out['condition/seconds'] = timeit.default_timer() - started
             print('[condition] total: ' + str({
                 'seconds': metrics_out['condition/seconds'],
@@ -1836,14 +1870,18 @@ def main(argv):
                     FLAGS.inner_loop_wd,
                     jnp.asarray(scheduled_lambda, dtype=jnp.float32),
                 )
-                if FLAGS.condition_log and step % FLAGS.condition_every == 0:
+                do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                do_spectrum = FLAGS.spectrum_log and step % FLAGS.spectrum_every == 0
+                if do_condition or do_spectrum:
                     beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
                         jax.device_get(cg_adam_step))
                     adam_diagonal = jax.tree.map(
                         lambda moment: jnp.sqrt(moment / beta2_correction) + 1e-8,
                         cg_second_moment)
                     condition_metrics = run_condition_diagnostics(
-                        train_state.params, batch, cg_diagonal=adam_diagonal,
+                        train_state.params, batch, do_condition=do_condition,
+                        do_spectrum=do_spectrum,
+                        cg_diagonal=adam_diagonal if do_condition else None,
                         effective_lambda=float(jax.device_get(
                             cg_metrics['cg_lambda_effective'])),
                         safe_adam_lr=max(float(jax.device_get(
@@ -1949,12 +1987,14 @@ def main(argv):
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
                         )
-                        if (i == 0 and FLAGS.condition_log
-                                and step % FLAGS.condition_every == 0):
+                        do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                        do_spectrum = FLAGS.spectrum_log and step % FLAGS.spectrum_every == 0
+                        if i == 0 and (do_condition or do_spectrum):
                             # Deterministic diagnostic of the first already-fetched
                             # Muon solve batch; training RNG and cursor are untouched.
                             condition_metrics = run_condition_diagnostics(
-                                train_state.params, batch)
+                                train_state.params, batch,
+                                do_condition=do_condition, do_spectrum=do_spectrum)
                             defer_wandb(condition_metrics, step=step)
                         # is_last_step deliberately always False here -- see explanation
                         inner_state, sharded_rng, metrics = sharded_train_step(
@@ -2031,10 +2071,12 @@ def main(argv):
                         lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                         batch_
                     )
-                    if (i == 0 and FLAGS.condition_log
-                            and step % FLAGS.condition_every == 0):
+                    do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                    do_spectrum = FLAGS.spectrum_log and step % FLAGS.spectrum_every == 0
+                    if i == 0 and (do_condition or do_spectrum):
                         condition_metrics = run_condition_diagnostics(
-                            train_state.params, batch)
+                            train_state.params, batch,
+                            do_condition=do_condition, do_spectrum=do_spectrum)
                         defer_wandb(condition_metrics, step=step)
                     is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
                     inner_state, sharded_rng, metrics = sharded_train_step(
@@ -2146,7 +2188,9 @@ def main(argv):
                 or FLAGS.train_batch_growth_interval > 0
                 or FLAGS.optimizer_type == 'cg'
                 or (FLAGS.condition_log
-                    and step % FLAGS.condition_every == 0))
+                    and step % FLAGS.condition_every == 0)
+                or (FLAGS.spectrum_log
+                    and step % FLAGS.spectrum_every == 0))
             if should_log:
                 log_metrics = {}
                 stop_after_log = False
@@ -2181,7 +2225,9 @@ def main(argv):
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
                         defer_wandb(log_metrics)
-                        tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                        console_metrics = {k: v for k, v in log_metrics.items()
+                            if not k.startswith(('condition/', 'spectrum/'))}
+                        tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                         
                         stop_after_log = True
                     elif FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] >= 15:
@@ -2206,7 +2252,9 @@ def main(argv):
                         milestone=(FLAGS.save_milestone_freq > 0
                                    and (step + 1) % FLAGS.save_milestone_freq == 0))
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
-                tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                console_metrics = {k: v for k, v in log_metrics.items()
+                    if not k.startswith(('condition/', 'spectrum/'))}
+                tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                 if stop_after_log:
                     break
             
