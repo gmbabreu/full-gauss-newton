@@ -154,3 +154,38 @@ examples. The next batch and numerical state are compared with uninterrupted
 execution across a batch-growth boundary. This is not a full LLaMA trainer test.
 Real TPU multi-host execution, GCS credentials/network failures, and W&B recovery
 remain untested here.
+
+## Reset-start memory validation status
+
+An AdamW GN run has failed at outer update 1 while allocating a program after a
+successful update 0 with `reset_start=True`.  Retention of the previous inner
+optimizer state is a hypothesis, not a confirmed root cause.  The trainer now
+releases the synchronization-only result list immediately after its barrier and
+drops both train-state references to the completed inner optimizer slots before
+initializing their replacement.  CPU tests establish reset-state semantic
+equivalence only; they do not
+establish a TPU memory reduction or rule out condition diagnostics.
+
+For user-operated TPU validation, start from the original batch-600 command and
+keep all learning-rate and schedule arguments, especially the original
+`--total_steps`: it determines schedule decay (and, depending on `--lr_sched`,
+the per-outer-step schedule construction).  Do not shorten it to three.  First
+run with:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=False --spectrum_log=False
+```
+
+Observe completion of outer updates 0, 1, and 2, then stop the run manually (or
+use the existing job controller) after the third update.  Repeat from a fresh
+run/checkpoint with the original condition cadence restored, for example:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=True --spectrum_log=False
+```
+
+Again exercise at least updates 0 through 2.  Record peak HBM and whether the
+allocation failure recurs in each run; until this is done, the memory-lifetime
+explanation remains unverified.

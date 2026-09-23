@@ -38,7 +38,8 @@ from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, tree_dot, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
-    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState
+    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay,
+    CustomTrainState, create_reset_train_state,
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
@@ -1768,9 +1769,37 @@ def main(argv):
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
 
             if FLAGS.reset_start:
-                inner_state = inner_state.replace(
-                    params=train_state.params,
-                    opt_state=tayl_solver.init(train_state.params)
+                # Drop the obsolete slots before allocating their replacement.
+                # Params and warm-start buffers may be shared, so retain their
+                # references normally rather than deleting device buffers.
+                inner_step = inner_state.step
+                inner_apply_fn = inner_state.apply_fn
+                inner_tx = inner_state.tx
+                inner_warmstart_params = inner_state.warmstart_params
+                outer_step = train_state.step
+                outer_apply_fn = train_state.apply_fn
+                outer_params = train_state.params
+                outer_tx = train_state.tx
+                outer_warmstart_params = train_state.warmstart_params
+                # The completed inner optimizer slots are also referenced by
+                # train_state for checkpointing.  Neither reference is needed
+                # after a reset, and both must go before tx.init allocates.
+                del inner_state, train_state
+                inner_state = create_reset_train_state(
+                    CustomTrainState,
+                    step=inner_step,
+                    apply_fn=inner_apply_fn,
+                    params=outer_params,
+                    tx=inner_tx,
+                    warmstart_params=inner_warmstart_params,
+                )
+                train_state = CustomTrainState(
+                    step=outer_step,
+                    apply_fn=outer_apply_fn,
+                    params=outer_params,
+                    tx=outer_tx,
+                    opt_state=inner_state.opt_state,
+                    warmstart_params=outer_warmstart_params,
                 )
 
                 if FLAGS.optimizer_type == "cg":
@@ -2198,6 +2227,7 @@ def main(argv):
                 live_results.extend((cg_first_moment, cg_second_moment,
                                      cg_x0, cg_adam_step))
             jax.block_until_ready(live_results)
+            del live_results
             timing.stop_train_interval(completed_update=True)
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
