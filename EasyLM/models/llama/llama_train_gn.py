@@ -170,6 +170,13 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     spectrum_seed=0,
 )
 
+
+def supports_condition_diagnostics(optimizer_type, gauss_newton):
+    """Whether the selected solver exposes the frozen Gauss--Newton operator."""
+    return optimizer_type == 'cg' or (
+        gauss_newton and optimizer_type in ('adamw', 'muon'))
+
+
 def microbatch_groups(batch_size, n_requested, data_shards):
     if batch_size <= 0 or data_shards <= 0 or batch_size % data_shards:
         raise ValueError('Batch must be positive and divisible by data shards')
@@ -255,9 +262,10 @@ def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.condition_log or FLAGS.spectrum_log:
-        if FLAGS.optimizer_type not in ('cg', 'muon') or (
-                FLAGS.optimizer_type == 'muon' and not FLAGS.gauss_newton):
-            raise ValueError('Condition diagnostics support CG and Muon-GN only')
+        if not supports_condition_diagnostics(
+                FLAGS.optimizer_type, FLAGS.gauss_newton):
+            raise ValueError(
+                'Condition diagnostics support CG, Adam-GN, and Muon-GN only')
         if FLAGS.condition_log and (FLAGS.condition_every <= 0 or FLAGS.condition_top_maxiter < 3 \
                 or FLAGS.condition_num_starts < 2 \
                 or FLAGS.condition_trace_probes < 2):
@@ -409,14 +417,15 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    if (FLAGS.condition_log or FLAGS.spectrum_log) and FLAGS.optimizer_type == 'muon':
+    if ((FLAGS.condition_log or FLAGS.spectrum_log)
+            and FLAGS.optimizer_type in ('adamw', 'muon')):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
         enabled = [name for name in stochastic
                    if float(getattr(llama_config, name, 0.0)) != 0.0]
         if enabled:
-            raise ValueError('Muon condition diagnostics require dropout/FCM '
+            raise ValueError('Gauss-Newton condition diagnostics require dropout/FCM '
                              'disabled: ' + ', '.join(enabled))
 
     model = FlaxLLaMAForCausalLMModule(
@@ -1029,9 +1038,10 @@ def main(argv):
     def condition_apply_g(params0, batch, vector, wd):
         """Deterministic full-parameter Gv on the frozen diagnostic batch.
 
-        For Muon with multiple inner batches this intentionally describes the
-        first solve batch only. Weight decay is constant with respect to logits
-        and therefore is not part of this Gauss--Newton operator.
+        For non-CG solvers with multiple inner batches this intentionally
+        describes the first solve batch only. Weight decay is constant with
+        respect to logits and therefore is not part of this Gauss--Newton
+        operator.
         """
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         _, groups = microbatch_groups(
