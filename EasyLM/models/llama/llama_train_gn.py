@@ -1463,11 +1463,14 @@ def main(argv):
             metrics_out = {}
             spectrum_max = None
             if do_spectrum:
+                spectrum_started = timeit.default_timer()
+                spectrum_transfer_seconds = dict(upload=0., compute=0., download=0.)
                 leaves, structure = jax.tree.flatten(params)
                 shapes = [leaf.shape for leaf in leaves]
                 sizes = [leaf.size for leaf in leaves]
                 dimension = sum(sizes)
                 def cpu_apply(flat_vector):
+                    boundary = timeit.default_timer()
                     offset, vector_leaves = 0, []
                     for shape, size, leaf in zip(shapes, sizes, leaves):
                         vector_leaves.append(flat_vector[offset:offset + size].reshape(
@@ -1477,16 +1480,25 @@ def main(argv):
                     vector_tree = jax.tree.map(
                         lambda value, shard: shard(value),
                         vector_tree, diagnostic_param_shards)
+                    jax.block_until_ready(vector_tree)
+                    spectrum_transfer_seconds['upload'] += (
+                        timeit.default_timer() - boundary)
+                    boundary = timeit.default_timer()
                     product = sharded_condition_apply_g(
                         params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
                     jax.block_until_ready(product)
+                    spectrum_transfer_seconds['compute'] += (
+                        timeit.default_timer() - boundary)
+                    boundary = timeit.default_timer()
                     host = jax.device_get(product)
                     result = np.concatenate([
                         np.asarray(leaf, np.float32).reshape(-1)
                         for leaf in jax.tree.leaves(host)])
+                    spectrum_transfer_seconds['download'] += (
+                        timeit.default_timer() - boundary)
                     del vector_tree, product, host
                     return result
-                print('[spectrum] G top-100: start', flush=True)
+                print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
                 spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
                     cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
                     block_size=FLAGS.spectrum_block_size,
@@ -1497,7 +1509,15 @@ def main(argv):
                     stability_tol=FLAGS.spectrum_stability_tol,
                     seed=FLAGS.spectrum_seed,
                     progress=lambda done, total: print(
-                        f'[spectrum] G products {done}/{total}', flush=True))
+                        f'[spectrum] G products {done}/{total}; '
+                        f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
+                        f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
+                        f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
+                        f'download={spectrum_transfer_seconds["download"]:.1f}s',
+                        flush=True))
+                spectrum_scalars.update({
+                    f'seconds_{name}': value
+                    for name, value in spectrum_transfer_seconds.items()})
                 metrics_out.update({f'spectrum/G/{name}': value
                                     for name, value in spectrum_scalars.items()
                                     if value is not None})
@@ -1515,7 +1535,8 @@ def main(argv):
                     spectrum_table['failure_reasons'])
                 if spectrum_scalars['accepted']:
                     spectrum_max = spectrum_scalars['lambda_1_est']
-                print('[spectrum] G top-100: end ' + str(spectrum_scalars), flush=True)
+                print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: end ' +
+                      str(spectrum_scalars), flush=True)
             if not do_condition:
                 metrics_out['spectrum/G/seconds_total'] = timeit.default_timer() - started
                 return metrics_out
