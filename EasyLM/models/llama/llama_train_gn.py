@@ -1332,7 +1332,7 @@ def main(argv):
         # Memory breakdown diagnostic
         param_mem_gb = param_count * 4 / 1e9  # fp32 = 4 bytes
         optimizer_mem_gb = param_count * 4 * 2 / 1e9  # muon: ~2x params for momentum
-        hbm_info = jax.devices()[0].memory_stats()
+        hbm_info = jax.local_devices()[0].memory_stats()
         total_hbm_gb = hbm_info.get("bytes_limit", 0) / 1e9
         used_hbm_gb = hbm_info.get("bytes_in_use", 0) / 1e9
         print(f"\n=== Memory Breakdown ===")
