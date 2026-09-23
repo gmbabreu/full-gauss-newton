@@ -154,3 +154,58 @@ examples. The next batch and numerical state are compared with uninterrupted
 execution across a batch-growth boundary. This is not a full LLaMA trainer test.
 Real TPU multi-host execution, GCS credentials/network failures, and W&B recovery
 remain untested here.
+
+## Reset-start memory validation status
+
+An AdamW GN run has failed at outer update 1 while allocating a program after a
+successful update 0 with `reset_start=True`.  Retention of the previous inner
+optimizer state is a hypothesis, not a confirmed root cause.  The trainer now
+releases the synchronization-only result list immediately after its barrier and
+drops the old `inner_state` container before initializing its replacement.  The
+outer `train_state` and its optimizer state remain unchanged, matching the old
+reset semantics.  A CPU semantic-equivalence regression has been written; its
+successful execution status must be reported separately from its presence.
+Neither that test nor this reference-lifetime change establishes a TPU memory
+reduction or rules out condition diagnostics.
+
+The outer optimizer state was audited separately and is deliberately not
+replaced during reset.  From reset until the outer-state replacement, condition
+diagnostics consume parameters only, the CG path uses its separate moment and
+warm-start values, and no checkpoint is written.  Recovery occurs before the
+loop.  At the end of the update, the existing outer-state replacement records
+the completed inner optimizer state before any regular or milestone checkpoint.
+The reset initializes slots with the same `tayl_solver` object used to construct
+`inner_state.tx`; this preserves AdamW/Muon initialization and the inert CG
+placeholder initialization.
+
+The reset regression uses the production reset helper with `CustomTrainState`
+and Optax AdamW, including nonzero moments and counters, Python-integer steps,
+both state-container results, and a subsequent update.  In the repository's
+minimal local shell it has been written but not successfully executed because
+JAX, Flax, Optax, and NumPy are absent; creation of an isolated environment was
+also blocked by unavailable package-network access.  Syntax and dependency-free
+tests are not substitutes for this pending CPU execution.
+
+For user-operated TPU validation, start from the original batch-600 command and
+keep all learning-rate and schedule arguments, especially the original
+`--total_steps`: it determines schedule decay (and, depending on `--lr_sched`,
+the per-outer-step schedule construction).  Do not shorten it to three.  First
+run with:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=False --spectrum_log=False
+```
+
+Observe completion of outer updates 0, 1, and 2, then stop the run manually (or
+use the existing job controller) after the third update.  Repeat from a fresh
+run/checkpoint with the original condition cadence restored, for example:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=True --spectrum_log=False
+```
+
+Again exercise at least updates 0 through 2.  Record peak HBM and whether the
+allocation failure recurs in each run; until this is done, the memory-lifetime
+explanation remains unverified.

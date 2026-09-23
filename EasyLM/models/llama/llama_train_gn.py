@@ -38,7 +38,8 @@ from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, tree_dot, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
-    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState
+    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay,
+    CustomTrainState, reset_train_states,
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
@@ -1463,11 +1464,14 @@ def main(argv):
             metrics_out = {}
             spectrum_max = None
             if do_spectrum:
+                spectrum_started = timeit.default_timer()
+                spectrum_transfer_seconds = dict(upload=0., compute=0., download=0.)
                 leaves, structure = jax.tree.flatten(params)
                 shapes = [leaf.shape for leaf in leaves]
                 sizes = [leaf.size for leaf in leaves]
                 dimension = sum(sizes)
                 def cpu_apply(flat_vector):
+                    boundary = timeit.default_timer()
                     offset, vector_leaves = 0, []
                     for shape, size, leaf in zip(shapes, sizes, leaves):
                         vector_leaves.append(flat_vector[offset:offset + size].reshape(
@@ -1477,16 +1481,25 @@ def main(argv):
                     vector_tree = jax.tree.map(
                         lambda value, shard: shard(value),
                         vector_tree, diagnostic_param_shards)
+                    jax.block_until_ready(vector_tree)
+                    spectrum_transfer_seconds['upload'] += (
+                        timeit.default_timer() - boundary)
+                    boundary = timeit.default_timer()
                     product = sharded_condition_apply_g(
                         params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
                     jax.block_until_ready(product)
+                    spectrum_transfer_seconds['compute'] += (
+                        timeit.default_timer() - boundary)
+                    boundary = timeit.default_timer()
                     host = jax.device_get(product)
                     result = np.concatenate([
                         np.asarray(leaf, np.float32).reshape(-1)
                         for leaf in jax.tree.leaves(host)])
+                    spectrum_transfer_seconds['download'] += (
+                        timeit.default_timer() - boundary)
                     del vector_tree, product, host
                     return result
-                print('[spectrum] G top-100: start', flush=True)
+                print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
                 spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
                     cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
                     block_size=FLAGS.spectrum_block_size,
@@ -1497,7 +1510,15 @@ def main(argv):
                     stability_tol=FLAGS.spectrum_stability_tol,
                     seed=FLAGS.spectrum_seed,
                     progress=lambda done, total: print(
-                        f'[spectrum] G products {done}/{total}', flush=True))
+                        f'[spectrum] G products {done}/{total}; '
+                        f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
+                        f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
+                        f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
+                        f'download={spectrum_transfer_seconds["download"]:.1f}s',
+                        flush=True))
+                spectrum_scalars.update({
+                    f'seconds_{name}': value
+                    for name, value in spectrum_transfer_seconds.items()})
                 metrics_out.update({f'spectrum/G/{name}': value
                                     for name, value in spectrum_scalars.items()
                                     if value is not None})
@@ -1515,7 +1536,8 @@ def main(argv):
                     spectrum_table['failure_reasons'])
                 if spectrum_scalars['accepted']:
                     spectrum_max = spectrum_scalars['lambda_1_est']
-                print('[spectrum] G top-100: end ' + str(spectrum_scalars), flush=True)
+                print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: end ' +
+                      str(spectrum_scalars), flush=True)
             if not do_condition:
                 metrics_out['spectrum/G/seconds_total'] = timeit.default_timer() - started
                 return metrics_out
@@ -1747,9 +1769,24 @@ def main(argv):
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
 
             if FLAGS.reset_start:
-                inner_state = inner_state.replace(
-                    params=train_state.params,
-                    opt_state=tayl_solver.init(train_state.params)
+                # Drop the obsolete slots before allocating their replacement.
+                # Params and warm-start buffers may be shared, so retain their
+                # references normally rather than deleting device buffers.
+                inner_step = inner_state.step
+                inner_apply_fn = inner_state.apply_fn
+                inner_tx = inner_state.tx
+                inner_warmstart_params = inner_state.warmstart_params
+                outer_params = train_state.params
+                del inner_state
+                train_state, inner_state = reset_train_states(
+                    True, train_state, None,
+                    state_type=CustomTrainState,
+                    step=inner_step,
+                    apply_fn=inner_apply_fn,
+                    params=outer_params,
+                    tx=inner_tx,
+                    warmstart_params=inner_warmstart_params,
+                    optimizer=tayl_solver,
                 )
 
                 if FLAGS.optimizer_type == "cg":
@@ -1758,6 +1795,9 @@ def main(argv):
                         jnp.zeros_like,
                         train_state.params,
                     )
+            else:
+                train_state, inner_state = reset_train_states(
+                    False, train_state, inner_state)
 
 
             # Fetch only the solve batch below; no unused advance of the data cursor.
@@ -2177,6 +2217,7 @@ def main(argv):
                 live_results.extend((cg_first_moment, cg_second_moment,
                                      cg_x0, cg_adam_step))
             jax.block_until_ready(live_results)
+            del live_results
             timing.stop_train_interval(completed_update=True)
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':

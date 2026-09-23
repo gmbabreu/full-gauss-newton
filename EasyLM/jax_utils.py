@@ -29,6 +29,23 @@ from flax.training.train_state import TrainState
 class CustomTrainState(TrainState):
     """ A simple extension of TrainState that adds a warmstart_params field. """
     warmstart_params: Any = None
+
+
+def reset_train_states(reset_start, train_state, inner_state, *, state_type=None,
+                       step=None, apply_fn=None, params=None, tx=None,
+                       warmstart_params=None, optimizer=None):
+    """Return unchanged states or reconstruct the inner state from saved fields."""
+    if not reset_start:
+        return train_state, inner_state
+    inner_state = state_type(
+        step=step,
+        apply_fn=apply_fn,
+        params=params,
+        tx=tx,
+        opt_state=optimizer.init(params),
+        warmstart_params=warmstart_params,
+    )
+    return train_state, inner_state
     
 class JaxRNG(object):
     """ A convenient stateful Jax RNG wrapper. Can be used to wrap RNG inside
