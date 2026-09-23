@@ -1,4 +1,5 @@
 """CPU recovery tests; run with python -m unittest discover -s tests -v."""
+import ast
 import io
 import json
 import os
@@ -9,6 +10,20 @@ from unittest.mock import patch
 
 from EasyLM import cg_resume as cg
 from sweep_launcher import selected_value
+
+
+TRAINER = (Path(__file__).resolve().parents[1]
+           / 'EasyLM/models/llama/llama_train_gn.py')
+
+
+def trainer_function(name):
+    tree = ast.parse(TRAINER.read_text())
+    node = next(item for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(
+        ast.Module(body=[node], type_ignores=[])), str(TRAINER), 'exec'), namespace)
+    return namespace[name]
 
 
 def snapshot(step):
@@ -25,6 +40,15 @@ def save(directory, generation, step):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_condition_diagnostic_solver_support(self):
+        supported = trainer_function('supports_condition_diagnostics')
+        self.assertTrue(supported('cg', False))
+        self.assertTrue(supported('adamw', True))
+        self.assertTrue(supported('muon', True))
+        self.assertFalse(supported('adamw', False))
+        self.assertFalse(supported('muon', False))
+        self.assertFalse(supported('unknown', True))
+
     def test_condition_flags_are_reporting_only_but_legacy_rescaling_rejected(self):
         saved = {'optimizer_type': 'cg', 'condition_log': False,
                  'condition_trace_probes': 4, 'cg_log_matrix_norms': False}
