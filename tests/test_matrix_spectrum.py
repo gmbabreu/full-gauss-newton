@@ -7,6 +7,27 @@ from EasyLM import matrix_spectrum as ms
 
 
 class MatrixSpectrumTest(unittest.TestCase):
+    def test_batched_residual_directions_match_explicit_residuals(self):
+        rng = np.random.default_rng(12)
+        q = np.linalg.qr(rng.normal(size=(53, 8)))[0].T.astype(np.float32)
+        matrix = rng.normal(size=(53, 53))
+        matrix = matrix.T @ matrix
+        gq = (q @ matrix).astype(np.float32)
+        values, vectors = np.linalg.eigh(q.astype(np.float64) @ gq.T)
+        # Nonconsecutive, deliberately reordered ranks; uneven coordinate chunks.
+        for wanted in ([6, 2, 7, 4], [3]):
+            coefficients = vectors[:, wanted]
+            selected = values[wanted]
+            expected = np.stack([
+                gq.astype(np.float64).T @ coefficients[:, i]
+                - value * (q.astype(np.float64).T @ coefficients[:, i])
+                for i, value in enumerate(selected)])
+            for chunk in (7, 100):
+                actual = ms._residual_directions(
+                    q, gq, coefficients, selected, chunk=chunk)
+                self.assertEqual(actual.dtype, np.float32)
+                np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
     def test_memory_preflight_counts_two_basis_buffers(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             report = ms.memory_preflight(1000, 160, 4, reserve_bytes=0)

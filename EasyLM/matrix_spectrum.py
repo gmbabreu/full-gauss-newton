@@ -102,6 +102,18 @@ def _transform_in_place(buffer, count, coefficients, *, chunk=1 << 20):
         buffer[:keep, start:stop] = transformed.astype(np.float32)
 
 
+def _residual_directions(q, gq, coefficients, values, *, chunk=1 << 20):
+    """Form an ordered block of Ritz residuals with one basis scan per chunk."""
+    directions = np.empty((len(values), q.shape[1]), np.float32)
+    for start in range(0, q.shape[1], chunk):
+        stop = min(q.shape[1], start + chunk)
+        image = coefficients.T @ gq[:, start:stop].astype(np.float64)
+        ritz = coefficients.T @ q[:, start:stop].astype(np.float64)
+        image -= values[:, None] * ritz
+        directions[:, start:stop] = image
+    return directions
+
+
 def _small_projection(q, gq, count, *, chunk=1 << 20):
     projection = np.zeros((count, count), np.float64)
     for start in range(0, q.shape[1], chunk):
@@ -223,16 +235,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
         wanted = np.argsort(candidate_residuals)[
             -min(block_size, take):
         ][::-1]
-        residual_directions = []
-        for index in wanted:
-            direction = np.zeros(dimension, np.float32)
-            for offset in range(0, dimension, 1 << 20):
-                end = min(dimension, offset + (1 << 20))
-                direction[offset:end] = (
-                    vectors[:, index] @ gq[:count, offset:end]
-                    - candidate_values[index]
-                    * (vectors[:, index] @ q[:count, offset:end]))
-            residual_directions.append(direction)
+        residual_directions = _residual_directions(
+            q[:count], gq[:count], vectors[:, wanted], candidate_values[wanted])
         timings['expansion'] += time.monotonic() - timer
 
         if count + len(residual_directions) > max_basis:
