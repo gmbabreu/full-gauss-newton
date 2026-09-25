@@ -130,7 +130,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     outer_momentum_beta=0.0,
     armijo_linesearch=False,
     adaptive_inner_loop=False,
-    armijo_alpha=0.5,
+    armijo_alpha=1,
     armijo_beta=0.5,
     armijo_init_step=1.0,
 
@@ -150,10 +150,11 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
+
     # Observational spectral diagnostics.  They run only at the requested
     # cadence and never alter the solve operator or effective lambda.
     condition_log=False,
-    condition_every=50,
+    condition_every=100,
     condition_top_maxiter=24,
     condition_inner_cg_maxiter=100,
     condition_inner_cg_tol=1e-3,
@@ -162,7 +163,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     condition_eigen_residual_tol=0.05,
     spectrum_top_k=100,
     spectrum_block_size=4,
-    spectrum_max_basis=160,
+    spectrum_max_basis=600,
     spectrum_restart_keep=120,
     spectrum_max_gn_products=600,
     spectrum_residual_tol=0.01,
