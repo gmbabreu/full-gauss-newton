@@ -65,10 +65,10 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertIn('product_budget_exhausted', table['failure_reasons'])
 
     def test_top100_exceeds_basis_capacity_and_restarts(self):
-        # A repeated leading eigenspace requires more independent directions
-        # than fit alongside the trailing space in the 160-vector basis.
-        diagonal = np.ones(192, np.float32)
-        diagonal[:100] = 2.
+        diagonal = np.concatenate((
+            np.linspace(10., 9., 100),
+            np.linspace(4., .1, 92),
+        )).astype(np.float32)
         calls = 0
         def apply(vector):
             nonlocal calls
@@ -80,13 +80,17 @@ class MatrixSpectrumTest(unittest.TestCase):
                 restart_keep=120, max_products=600,
                 residual_tol=.01, stability_tol=.02, seed=11)
         self.assertTrue(scalars['accepted'], table)
-        np.testing.assert_allclose(table['values'][:100], 2., rtol=.01, atol=.01)
+        np.testing.assert_allclose(table['values'][:100], diagonal[:100], rtol=.01)
         self.assertGreater(table['restart_count'], 0)
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 600)
-        self.assertAlmostEqual(scalars['top100_condition_est'], 1., delta=.01)
+        self.assertAlmostEqual(
+            scalars['top100_condition_est'], diagonal[0] / diagonal[99],
+            delta=.01)
+        self.assertEqual(set(table['direct_residuals']), {1, *range(10, 101, 10)})
         for rank in range(10, 101, 10):
-            self.assertAlmostEqual(scalars[f'lambda_{rank}_est'], 2., delta=.01)
+            self.assertAlmostEqual(
+                scalars[f'lambda_{rank}_est'], diagonal[rank - 1], delta=.01)
 
     def test_top10_condition_and_timings(self):
         diagonal = np.concatenate((
@@ -134,7 +138,7 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertTrue(scalars['accepted'], table)
         self.assertGreater(scalars['restart_count'], 0)
         np.testing.assert_allclose(table['values'], diagonal[:25], rtol=1e-4)
-        self.assertEqual(set(table['direct_residuals']), set(range(1, 26)))
+        self.assertEqual(set(table['direct_residuals']), {1, 10, 20, 25})
         for rank in (1, 10, 20, 25):
             self.assertAlmostEqual(scalars[f'lambda_{rank}_est'], diagonal[rank-1], places=3)
         self.assertIsNone(scalars['lambda_100_est'])

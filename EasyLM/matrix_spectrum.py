@@ -2,8 +2,8 @@
 
 Only Q is stored. The small symmetric recurrence matrix becomes an arrowhead
 at thick restart; the retained coupling is beta * Y[-1, :keep]. Residuals from
-this recurrence screen convergence, and fresh products validate every wanted
-Ritz pair before any eigenvalue is published as accepted.
+this recurrence screen convergence, and fresh products validate every Ritz
+value published as a scalar metric.
 """
 import math
 import os
@@ -108,7 +108,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
     """Leading algebraic eigenvalues of a fixed symmetric PSD operator.
 
     block_size is the small projected-eigensolve cadence. max_products includes
-    fresh validation of all top_k pairs. Failure never publishes scalar values.
+    fresh validation of all published ranks. Failure never publishes scalars.
     """
     if not 0 < top_k <= restart_keep < max_basis or dimension < top_k:
         raise ValueError('require 0 < top_k <= restart_keep < max_basis and dimension >= top_k')
@@ -121,7 +121,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
     started, rng = time.monotonic(), np.random.default_rng(seed)
     q = np.empty((max_basis, dimension), np.float32)
     h = np.zeros((max_basis, max_basis), np.float64)
-    expansion_budget = max_products - top_k
+    validation_ranks = tuple(sorted({1, top_k, *range(10, top_k + 1, 10)}))
+    expansion_budget = max_products - len(validation_ranks)
     count = products = restart_count = 0
     previous = None
     stable = accepted = False
@@ -164,9 +165,13 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
         timer = time.monotonic()
         image_norm = _norm(w)
         # Three-term recurrence except for the first step after thick restart.
-        nonzero = np.flatnonzero(h[:count, count])
-        for index in nonzero:
-            w -= np.float32(h[index, count]) * q[index]
+        coupling = h[:count, count]
+        nonzero = np.flatnonzero(coupling)
+        if len(nonzero) == 1:
+            index = nonzero[0]
+            w -= np.float32(coupling[index]) * q[index]
+        elif len(nonzero) > 1:
+            w -= coupling.astype(np.float32) @ q[:count]
         alpha = float(np.einsum('i,i->', next_vector, w, dtype=np.float64))
         h[count, count] = alpha
         w -= np.float32(alpha) * next_vector
@@ -235,14 +240,15 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
             accepted = False
             failure.append('invalid_orthonormal_basis')
         else:
-            # Batched reconstruction; never retain all top_k parameter vectors.
-            for start in range(0, top_k, block_size):
+            # Batched reconstruction of only the scalar ranks we publish.
+            for start in range(0, len(validation_ranks), block_size):
                 timer = time.monotonic()
-                stop = min(top_k, start + block_size)
-                u = np.empty((stop - start, dimension), np.float32)
-                _transform_chunked(q[:count], vectors[:, start:stop], u)
+                ranks = validation_ranks[start:start + block_size]
+                indices = np.asarray(ranks, dtype=np.int64) - 1
+                u = np.empty((len(ranks), dimension), np.float32)
+                _transform_chunked(q[:count], vectors[:, indices], u)
                 timings['validation'] += time.monotonic() - timer
-                for index, vector in enumerate(u, start):
+                for rank, index, vector in zip(ranks, indices, u):
                     try:
                         image = apply(vector)
                     except ValueError as error:
@@ -252,7 +258,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
                     norm = _norm(vector)
                     residual = _norm(image - np.float32(candidate_values[index]) * vector) / max(
                         abs(candidate_values[index]) * norm, np.finfo(np.float64).eps)
-                    direct[index + 1] = residual
+                    direct[rank] = residual
                     accepted &= math.isfinite(residual) and residual <= residual_tol
                     timings['validation'] += time.monotonic() - timer
                 if failure: break

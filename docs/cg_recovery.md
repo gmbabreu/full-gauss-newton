@@ -99,11 +99,12 @@ expansion solver and stored `GQ` buffer have been removed.
 `spectrum_block_size` now controls the projected-eigensolve cadence and the
 bounded validation reconstruction batch (not a block Lanczos recurrence).
 Recurrence residuals screen convergence, together with the existing eigenvalue
-stability tolerance. Before acceptance, a full Gram check and **fresh direct
-residual checks of all top-k eigenpairs** guard against recurrence drift and
-lost orthogonality. Consequently `spectrum_max_gn_products=600` reserves 100
-products for final validation when `spectrum_top_k=100`. This budget includes
-all spectrum operator calls; PCG endpoint work remains separate.
+stability tolerance. Before acceptance, a full Gram check and fresh direct
+residual checks of every scalar rank that will be published (1, 10, 20, ...,
+top-k) guard against recurrence drift and lost orthogonality. Consequently
+`spectrum_max_gn_products=600` reserves 11 products for final validation when
+`spectrum_top_k=100`. This budget includes all spectrum operator calls; PCG
+endpoint work remains separate.
 
 All products use the same frozen parameters, batch and microbatch weighting.
 Candidate values and failure details remain in the W&B table. Accepted scalar
@@ -117,7 +118,11 @@ Lanczos still uses Rayleigh--Ritz on a small recurrence matrix. Its advantage
 here is avoiding repeated full-basis projection/residual reconstruction and
 storing only one basis, not making the small eigensolve faster. Direct residuals
 are not a proof that no larger eigenvalue was missed; independent-seed and
-larger-budget repeats remain useful controls. TPU-host speedup must be measured.
+larger-budget repeats remain useful controls. As a single-vector method, this
+estimator also does not guarantee recovery of the full multiplicity of an
+exactly repeated leading eigenvalue; the stochastic GN spectrum is expected to
+be generic, but multiplicity-sensitive studies require a block method. TPU-host
+speedup must be measured.
 
 Suggested validation commands (run on a host with JAX and sufficient RAM):
 
