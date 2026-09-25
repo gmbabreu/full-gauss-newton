@@ -1,4 +1,4 @@
-"""Maximum-eigenvalue and trace diagnostics for symmetric PSD operators."""
+"""Spectral endpoint and trace diagnostics for symmetric PSD operators."""
 from dataclasses import dataclass, fields
 import math
 import time
@@ -112,6 +112,75 @@ def make_power_solver(operator, *, maxiter=24, agreement_tol=.05,
     return jax.jit(solve)
 
 
+def make_inverse_solver(operator, *, maxiter=24, inner_maxiter=100,
+                        inner_tol=1e-3, agreement_tol=.05, residual_tol=.05,
+                        preconditioner=None):
+    """Compile inverse iteration with counted PCG and true solve residuals.
+
+    This estimates the minimum of the original SPD operator. The diagonal
+    preconditioner accelerates each solve without changing that eigenproblem.
+    """
+    def solve(initial_vector, *args):
+        def precondition(value):
+            return value if preconditioner is None else preconditioner(value, *args)
+
+        def body(state):
+            iteration, vector, _, history, _, _, _, _, products = state
+            zero = jax.tree.map(jnp.zeros_like, vector)
+            z = precondition(vector)
+            rz = tree_dot(vector, z)
+            target = inner_tol ** 2 * tree_dot(vector, vector)
+            inner = (jnp.int32(0), zero, vector, z, rz, jnp.bool_(True))
+
+            def inner_cond(state):
+                i, _, r, _, _, valid = state
+                return (i < inner_maxiter) & valid & (tree_dot(r, r) > target)
+
+            def inner_body(state):
+                i, x, r, p, rz, valid = state
+                ap = operator(p, *args)
+                pap = tree_dot(p, ap)
+                valid &= jnp.isfinite(pap) & (pap > 0) & jnp.isfinite(rz) & (rz > 0)
+                alpha = jnp.where(valid, rz / jnp.where(pap > 0, pap, 1.), 0.)
+                x = tree_add(x, p, alpha=alpha)
+                r = tree_add(r, ap, alpha=-alpha)
+                z = precondition(r)
+                next_rz = tree_dot(r, z)
+                beta = next_rz / jnp.where(rz > 0, rz, 1.)
+                p = tree_add(z, p, alpha=beta)
+                valid &= jnp.isfinite(next_rz) & (next_rz >= 0)
+                return i + 1, x, r, p, next_rz, valid
+
+            inner_iterations, y, _, _, _, valid = jax.lax.while_loop(
+                inner_cond, inner_body, inner)
+            ay = operator(y, *args)
+            solve_r = tree_add(ay, vector, alpha=-1.)
+            # Check the true residual, not just the PCG recurrence residual.
+            valid &= tree_dot(solve_r, solve_r) <= target
+            length = tree_norm(y)
+            q = jax.tree.map(lambda v: v / jnp.where(length > 0, length, 1.), y)
+            theta = tree_dot(y, ay) / jnp.where(length > 0, length ** 2, 1.)
+            denominator = jnp.abs(theta) * length
+            residual = tree_norm(tree_add(ay, y, alpha=-theta)) / jnp.where(
+                denominator > 0, denominator, 1.)
+            valid &= (jnp.isfinite(length) & (length > 0) & jnp.isfinite(theta)
+                      & (theta > 0) & jnp.isfinite(residual))
+            history = jnp.roll(history, -1).at[-1].set(theta)
+            scale = jnp.maximum(jnp.max(jnp.abs(history)), jnp.float32(1e-30))
+            agreement = ((iteration + 1) >= 3) & jnp.all(jnp.isfinite(history)) \
+                & ((jnp.max(history) - jnp.min(history)) / scale <= agreement_tol)
+            converged = valid & agreement & (residual <= residual_tol)
+            return (iteration + 1, q, q, history, theta, residual, valid,
+                    converged, products + inner_iterations + 1)
+
+        state = (jnp.int32(0), initial_vector, initial_vector,
+                 jnp.full((3,), jnp.nan, jnp.float32), jnp.float32(jnp.nan),
+                 jnp.float32(jnp.nan), jnp.bool_(True), jnp.bool_(False), jnp.int32(0))
+        return jax.lax.while_loop(
+            lambda s: (s[0] < maxiter) & s[6] & ~s[7], body, state)
+    return jax.jit(solve)
+
+
 def power_iteration(operator, template, *, key=jax.random.PRNGKey(0), maxiter=24,
                     agreement_tol=.05, residual_tol=.05, num_starts=2,
                     operator_args=(), compiled_solver=None):
@@ -121,16 +190,18 @@ def power_iteration(operator, template, *, key=jax.random.PRNGKey(0), maxiter=24
     for start in range(num_starts):
         vector = random_unit_pytree(jax.random.fold_in(key, start), template)
         if vector is None:
-            candidates.append((None, None, None, 0, False, False))
+            candidates.append((None, None, None, 0, False, False, 0))
             continue
-        iteration, _, evaluated, history, theta, residual, valid, converged = \
-            solver(vector, *operator_args)
+        result = solver(vector, *operator_args)
+        iteration, _, evaluated, history, theta, residual, valid, converged = result[:8]
+        products = result[8] if len(result) > 8 else iteration
         history = np.asarray(jax.device_get(history), dtype=np.float64)
         agreement = bool(np.all(np.isfinite(history)) and
             (history.max() - history.min()) /
             max(float(np.max(np.abs(history))), 1e-30) <= agreement_tol)
         candidates.append((float(theta), float(residual), evaluated,
-                           int(iteration), bool(valid) and bool(converged), agreement))
+                           int(iteration), bool(valid) and bool(converged), agreement,
+                           int(products)))
     values = [item[0] for item in candidates]
     finite = all(value is not None and math.isfinite(value) for value in values)
     scale = max([abs(value) for value in values if value is not None] + [1e-30])
@@ -147,7 +218,7 @@ def power_iteration(operator, template, *, key=jax.random.PRNGKey(0), maxiter=24
     chosen = min(valid_candidates, key=lambda item: item[1]
                  if item[1] is not None else math.inf) if valid_candidates else candidates[0]
     return Endpoint(chosen[0] if resolved else None, chosen[0], chosen[1], resolved,
-        max(item[3] for item in candidates), sum(item[3] for item in candidates),
+        max(item[3] for item in candidates), sum(item[6] for item in candidates),
         chosen[5], starts_agree, tuple(reasons), chosen[2])
 
 
@@ -167,6 +238,41 @@ def condition_diagnostic(operator, template, **kwargs):
         failure_reasons=endpoint.failure_reasons, top=endpoint.metrics(),
         operator_matvecs=endpoint.operator_matvecs,
         seconds=time.monotonic() - started)
+
+
+def damped_condition_diagnostic(operator, template, **kwargs):
+    """Estimate both endpoints of SPD A; withhold an unresolved minimum/ratio."""
+    started = time.monotonic()
+    report = condition_diagnostic(operator, template, **kwargs)
+    solver = kwargs.get('compiled_inverse_solver')
+    if solver is None:
+        solver = make_inverse_solver(operator,
+            maxiter=kwargs.get('top_maxiter', 24),
+            inner_maxiter=kwargs.get('inner_cg_maxiter', 100),
+            inner_tol=kwargs.get('inner_cg_tol', 1e-3),
+            agreement_tol=kwargs.get('agreement_tol', .05),
+            residual_tol=kwargs.get('residual_tol', .05),
+            preconditioner=kwargs.get('preconditioner'))
+    bottom = power_iteration(operator, template,
+        key=jax.random.fold_in(kwargs.get('key', jax.random.PRNGKey(0)), 0x4d494e),
+        agreement_tol=kwargs.get('agreement_tol', .05),
+        residual_tol=kwargs.get('residual_tol', .05),
+        num_starts=kwargs.get('num_starts', 2),
+        operator_args=kwargs.get('operator_args', ()), compiled_solver=solver)
+    reasons = list(report['failure_reasons'])
+    reasons.extend('minimum_' + reason for reason in bottom.failure_reasons)
+    minimum, maximum = bottom.value_est, report['lambda_max_est']
+    if minimum is not None and maximum is not None and minimum > maximum:
+        reasons.append('endpoint_order')
+        minimum = None
+    report.update(lambda_min_est=minimum, lambda_min_residual=bottom.residual,
+        condition_est=(maximum / minimum if maximum is not None
+                       and minimum is not None and minimum > 0 else None),
+        resolved=report['resolved'] and minimum is not None,
+        failure_reasons=tuple(reasons), bottom=bottom.metrics(),
+        operator_matvecs=report['operator_matvecs'] + bottom.operator_matvecs,
+        seconds=time.monotonic() - started)
+    return report
 
 
 def preconditioned_condition_diagnostic(apply_b, apply_p, template, c, **kwargs):

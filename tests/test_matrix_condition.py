@@ -50,6 +50,61 @@ class MatrixConditionTest(unittest.TestCase):
         self.assertEqual(report['damping_condition_proxy'], 1.)
         self.assertEqual(report['operator_matvecs'], 0)
 
+    def test_damped_endpoints_against_independent_jax_jacobian(self):
+        weights = jnp.asarray(np.random.default_rng(14).normal(size=(8, 5)), jnp.float32)
+        params = jnp.linspace(-.1, .1, 5)
+        model = lambda p: jnp.tanh(weights @ p)
+        jacobian = np.asarray(jax.jacfwd(model)(params), dtype=np.float64)
+        diagonal = jnp.array([.5, 1., 2., 3., 4.])
+        lam, eta = .3, .7
+        matrix = lam * jacobian.T @ jacobian + (1-lam)/eta * np.diag(diagonal)
+        def apply(v):
+            _, jv = jax.jvp(model, (params,), (v,))
+            gv = jax.vjp(model, params)[1](jv)[0]
+            return lam * gv + (1-lam)/eta * diagonal * v
+        report = mc.damped_condition_diagnostic(apply, params,
+            preconditioner=lambda v: v / diagonal, top_maxiter=150,
+            inner_cg_maxiter=20, inner_cg_tol=1e-5,
+            agreement_tol=1e-4, residual_tol=1e-4)
+        truth = np.linalg.eigvalsh(matrix)
+        self.assertTrue(report['resolved'], report)
+        np.testing.assert_allclose(
+            [report['lambda_min_est'], report['lambda_max_est']],
+            truth[[0, -1]], rtol=2e-5, atol=1e-6)
+        self.assertAlmostEqual(report['condition_est'], truth[-1]/truth[0], delta=1e-4)
+
+    def test_inverse_counts_actual_products_including_solve_checks(self):
+        calls = []
+        def apply(v):
+            jax.debug.callback(lambda: calls.append(1), ordered=True)
+            return 2 * v
+        report = mc.damped_condition_diagnostic(apply, jnp.ones(3))
+        jax.effects_barrier()
+        self.assertTrue(report['resolved'], report)
+        self.assertEqual(report['lambda_min_est'], 2.)
+        self.assertEqual(report['condition_est'], 1.)
+        self.assertEqual(report['operator_matvecs'], len(calls))
+        # Two starts: three maximum products and three (solve + check) pairs each.
+        self.assertEqual(report['operator_matvecs'], 18)
+
+    def test_inverse_underbudget_withholds_minimum_and_ratio(self):
+        matrix = jnp.diag(jnp.array([1., 3., 20., 100.]))
+        report = mc.damped_condition_diagnostic(lambda v: matrix @ v, jnp.ones(4),
+            top_maxiter=100, inner_cg_maxiter=1, inner_cg_tol=1e-6)
+        self.assertIsNotNone(report['lambda_max_est'])
+        self.assertIsNone(report['lambda_min_est'])
+        self.assertIsNone(report['condition_est'])
+        self.assertFalse(report['resolved'])
+        self.assertIn('minimum_outer_not_converged', report['failure_reasons'])
+
+    def test_singular_operator_does_not_publish_positive_minimum(self):
+        diagonal = jnp.array([0., 1., 10.])
+        report = mc.damped_condition_diagnostic(lambda v: diagonal * v, jnp.ones(3),
+            top_maxiter=100, inner_cg_maxiter=20)
+        self.assertIsNone(report['lambda_min_est'])
+        self.assertIsNone(report['condition_est'])
+        self.assertFalse(report['resolved'])
+
     def test_exhaustive_rademacher_trace_identities_and_concentration(self):
         matrix = np.array([[2., .5], [.5, 3.]])
         traces, squares = [], []

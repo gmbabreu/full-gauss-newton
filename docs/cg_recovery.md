@@ -33,33 +33,56 @@ requesting constant lambda.
 
 ## Condition diagnostics
 
-`--condition_log=True` measures the frozen operator every
-`condition_every` outer updates. CG reports `G`, the actual damped `A`, and the
-symmetric `D^-1/2 A D^-1/2`; Muon-GN reports the first already-fetched inner
-batch's `G`. Diagnostics neither fetch data nor consume training RNG, and their
-matrix products are excluded from solve-token accounting. Dropout and FCM must
-be disabled for Muon diagnostics.
+`--condition_log=True` enables all spectral diagnostics at outer step 0 and every
+`condition_every` updates (default 50). It is the sole enable switch; remove
+`--spectrum_log` and replace `--spectrum_every=N` with `--condition_every=N` in
+existing commands. `condition_log=False` disables all of these diagnostics.
 
-Maximum-eigenvalue values use the `_est` suffix because agreement and residual
-checks do not certify global extremality. Failed checks retain residuals,
-counters, and failure reasons but withhold `lambda_max_est`. Four unnormalised Rademacher
-probes are used by default for trace and trace-square plug-in estimates and rough
-sample standard errors. The same `Gz` product is reused for `A`; no preconditioned
-trace estimate is attempted.
+Every supported solver (CG, Adam-GN, Muon-GN) estimates the leading
+`spectrum_top_k` eigenvalues of raw `G`, including its largest eigenvalue. CG
+additionally estimates both endpoints of the actual damped solve matrix
+`A=lambda*G+(1-lambda)/eta*D`, using the effective lambda, safe Adam learning
+rate, and bias-corrected diagonal from that update. The existing maximum of
+symmetric `P=D^-1/2*A*D^-1/2` and its damping proxy are retained. The new minimum
+estimate is for `A`, not `P`; structural lower bounds remain separately named.
 
-The bounded defaults are 24 power steps, two independent starts, and four trace
-probes. Routine diagnostics intentionally estimate maxima only. For the symmetric CG
-operator, the maximum is found from
-`B=lambda*D^-1/2*G*D^-1/2` and then shifted by the known identity coefficient.
-This avoids misleading early convergence when `P=cI+B` is identity dominated.
+Diagnostics reuse the frozen solve batch, never fetch data or consume training
+RNG, and their products are excluded from solve-token accounting. For Adam-GN
+and Muon-GN with multiple inner batches, the first already-fetched inner batch
+is used. Dropout and FCM must be disabled. `cg_n_micro` microbatches diagnostic
+`Gv` for every supported solver, including Muon; it does not microbatch Muon's
+inner training solve.
+
+An accepted top-k result supplies `condition/G/lambda_max_est` without another
+power run. If top-k convergence fails, a power estimate of the maximum is still
+attempted. Existing `spectrum/G/*` and `condition/*` metric names are preserved.
+The combined `condition/gn_products` and `condition/seconds` include spectrum,
+endpoint, and trace work. Per-phase spectrum timings remain available.
+
+`A`'s maximum uses power iteration; its minimum uses inverse iteration with
+compiled, diagonally preconditioned inner CG solves. Defaults are
+`condition_top_maxiter=24` outer iterations for each endpoint,
+`condition_num_starts=2`, `condition_inner_cg_maxiter=100`, and
+`condition_inner_cg_tol=0.001`. Actual inner-solve residuals, eigenpair residuals,
+and agreement between starts must pass; unresolved minima and condition ratios
+are withheld. `condition/A/lambda_min_est` and `condition/A/condition_est` are
+estimates, not certified spectral bounds. Singular undamped systems may remain
+unresolved. Inverse iteration adds GN products beyond the spectrum product
+budget; its cap is separate. TPU memory and runtime of this new minimum path
+still need user-operated validation.
+
+Four unnormalised Rademacher probes remain the default for trace and
+trace-square estimates and rough sample standard errors. The same `Gz` is
+reused for `A`; no preconditioned trace estimate is attempted. For `P=cI+B`,
+the maximum is found on `B=lambda*D^-1/2*G*D^-1/2` before adding the known
+identity shift, avoiding premature convergence on an identity-dominated `P`.
 `spectral_concentration_est=n*lambda_max_est/trace_est` and
-`damping_condition_proxy=p_lambda_max_est/c` are descriptive proxies, not
-certified condition bounds.
+`damping_condition_proxy=p_lambda_max_est/c` are descriptive proxies.
 
 ### CPU-resident top-100 spectrum
 
-`--spectrum_log=True` enables a separate, infrequent thick-restarted block
-Rayleigh--Ritz estimate of raw `G`. Its FP32 basis and restart destination stay
+`--condition_log=True` includes a thick-restarted block
+Rayleigh--Ritz estimate of raw `G`; `spectrum_top_k` defaults to 100. Its FP32 basis and restart destination stay
 on CPU; projection coefficients and the small eigendecomposition use FP64. A
 preflight includes both basis buffers, active blocks, projection/transfer
 workspace, cgroup-aware available memory, and an 8 GiB reserve. At 150M
@@ -79,10 +102,10 @@ Suggested validation commands (run on a host with JAX and sufficient RAM):
 ```bash
 PYTHONPATH=. python -m unittest tests.test_matrix_condition tests.test_matrix_spectrum -v
 # One frozen measurement with the trial budget:
-python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_every=1
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --condition_every=1
 # Independent seed and larger-budget repeats:
-python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_seed=1
-python -m EasyLM.models.llama.llama_train_gn ... --spectrum_log=True --spectrum_max_gn_products=1200
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_seed=1
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_max_gn_products=1200
 ```
 
 The diagnostic controls, including `condition_trace_probes`, may change on exact
@@ -154,3 +177,38 @@ examples. The next batch and numerical state are compared with uninterrupted
 execution across a batch-growth boundary. This is not a full LLaMA trainer test.
 Real TPU multi-host execution, GCS credentials/network failures, and W&B recovery
 remain untested here.
+
+## Reset-start memory validation status
+
+An AdamW GN run has failed at outer update 1 while allocating a program after a
+successful update 0 with `reset_start=True`.  Retention of the previous inner
+optimizer state is a hypothesis, not a confirmed root cause.  The trainer now
+releases the synchronization-only result list immediately after its barrier and
+drops both train-state references to the completed inner optimizer slots before
+initializing their replacement.  CPU tests establish reset-state semantic
+equivalence only; they do not
+establish a TPU memory reduction or rule out condition diagnostics.
+
+For user-operated TPU validation, start from the original batch-600 command and
+keep all learning-rate and schedule arguments, especially the original
+`--total_steps`: it determines schedule decay (and, depending on `--lr_sched`,
+the per-outer-step schedule construction).  Do not shorten it to three.  First
+run with:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=False
+```
+
+Observe completion of outer updates 0, 1, and 2, then stop the run manually (or
+use the existing job controller) after the third update.  Repeat from a fresh
+run/checkpoint with the original condition cadence restored, for example:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=True
+```
+
+Again exercise at least updates 0 through 2.  Record peak HBM and whether the
+allocation failure recurs in each run; until this is done, the memory-lifetime
+explanation remains unverified.

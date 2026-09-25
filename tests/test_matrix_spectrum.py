@@ -7,6 +7,27 @@ from EasyLM import matrix_spectrum as ms
 
 
 class MatrixSpectrumTest(unittest.TestCase):
+    def test_batched_residual_directions_match_explicit_residuals(self):
+        rng = np.random.default_rng(12)
+        q = np.linalg.qr(rng.normal(size=(53, 8)))[0].T.astype(np.float32)
+        matrix = rng.normal(size=(53, 53))
+        matrix = matrix.T @ matrix
+        gq = (q @ matrix).astype(np.float32)
+        values, vectors = np.linalg.eigh(q.astype(np.float64) @ gq.T)
+        # Nonconsecutive, deliberately reordered ranks; uneven coordinate chunks.
+        for wanted in ([6, 2, 7, 4], [3]):
+            coefficients = vectors[:, wanted]
+            selected = values[wanted]
+            expected = np.stack([
+                gq.astype(np.float64).T @ coefficients[:, i]
+                - value * (q.astype(np.float64).T @ coefficients[:, i])
+                for i, value in enumerate(selected)])
+            for chunk in (7, 100):
+                actual = ms._residual_directions(
+                    q, gq, coefficients, selected, chunk=chunk)
+                self.assertEqual(actual.dtype, np.float32)
+                np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
     def test_memory_preflight_counts_two_basis_buffers(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             report = ms.memory_preflight(1000, 160, 4, reserve_bytes=0)
@@ -85,6 +106,40 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 600)
         self.assertAlmostEqual(scalars['top100_condition_est'], 1., delta=.01)
+
+    def test_top10_condition_and_timings(self):
+        diagonal = np.concatenate((
+            np.arange(30., 20., -1),
+            np.ones(38),
+        )).astype(np.float32)
+        calls = 0
+        def apply(vector):
+            nonlocal calls
+            calls += 1
+            return diagonal * vector
+        with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
+            scalars, table = ms.estimate_top_spectrum(
+                apply, diagonal.size, top_k=10, block_size=4,
+                max_basis=32, restart_keep=16, max_products=120,
+                residual_tol=.01, stability_tol=.02, seed=0)
+        self.assertTrue(scalars['accepted'], table)
+        np.testing.assert_allclose(
+            table['values'][:10], diagonal[:10], rtol=.01, atol=.01)
+        self.assertAlmostEqual(
+            scalars['top10_condition_est'], 30. / 21., delta=.01)
+        self.assertIsNone(scalars['top100_condition_est'])
+        self.assertEqual(calls, scalars['gn_products'])
+        self.assertLessEqual(calls, 120)
+        timing_names = (
+            'seconds_operator', 'seconds_orthogonalization', 'seconds_gram',
+            'seconds_projection', 'seconds_eigensolve',
+            'seconds_ritz_residuals', 'seconds_expansion', 'seconds_restart',
+            'seconds_validation')
+        for name in timing_names:
+            self.assertTrue(np.isfinite(scalars[name]), name)
+            self.assertGreaterEqual(scalars[name], 0., name)
+        self.assertLessEqual(
+            scalars['max_relative_ritz_residual'], .01)
 
 
 if __name__ == '__main__':
