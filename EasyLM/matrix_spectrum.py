@@ -34,14 +34,14 @@ def available_host_memory():
     return min(pages, cgroup) if cgroup is not None else pages
 
 
-def memory_preflight(dimension, max_basis, block_size, *, reserve_bytes=8 << 30):
+def memory_preflight(dimension, max_basis, check_every, *, reserve_bytes=8 << 30):
     """Account for one Lanczos basis, validation blocks and bounded temporaries."""
     vector = dimension * np.dtype(np.float32).itemsize
     basis_buffers = max_basis * vector
-    active = (2 * block_size + 3) * vector
+    active = (2 * check_every + 3) * vector
     coordinate_chunk = min(dimension, 1 << 20)
     # Peak: FP64 basis conversion plus retained restart output coexist.
-    chunk_workspace = (2 * max_basis + 2 * block_size + 2) * coordinate_chunk * 8
+    chunk_workspace = (2 * max_basis + 2 * check_every + 2) * coordinate_chunk * 8
     projection = 4 * max_basis * max_basis * np.dtype(np.float64).itemsize
     transfer = 2 * vector
     required = (basis_buffers + active + projection + transfer
@@ -101,23 +101,23 @@ def _reorthogonalize(value, basis):
     return value
 
 
-def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
+def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4,
                           max_basis=160, restart_keep=120, max_products=600,
                           residual_tol=.01, stability_tol=.02, seed=0,
                           progress=None):
     """Leading algebraic eigenvalues of a fixed symmetric PSD operator.
 
-    block_size is the small projected-eigensolve cadence. max_products includes
+    check_every is the small projected-eigensolve cadence. max_products includes
     fresh validation of all published ranks. Failure never publishes scalars.
     """
     if not 0 < top_k <= restart_keep < max_basis or dimension < top_k:
         raise ValueError('require 0 < top_k <= restart_keep < max_basis and dimension >= top_k')
-    if block_size <= 0 or max_products < top_k + 3:
-        raise ValueError('invalid block size or GN-product budget')
+    if check_every <= 0 or max_products < top_k + 3:
+        raise ValueError('invalid check cadence or GN-product budget')
     if not (0 < residual_tol < 1 and 0 <= stability_tol < 1):
         raise ValueError('invalid spectrum tolerances')
     max_basis = min(max_basis, dimension)
-    memory = memory_preflight(dimension, max_basis, block_size)
+    memory = memory_preflight(dimension, max_basis, check_every)
     started, rng = time.monotonic(), np.random.default_rng(seed)
     q = np.empty((max_basis, dimension), np.float32)
     h = np.zeros((max_basis, max_basis), np.float64)
@@ -182,7 +182,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
         timings['orthogonalization'] += time.monotonic() - timer
         count += 1
         breakdown = beta <= 32 * np.finfo(np.float32).eps * max(image_norm, 1e-30)
-        check = (count >= top_k and (products % block_size == 0 or breakdown
+        check = (count >= top_k and (products % check_every == 0 or breakdown
                  or count == max_basis or products == expansion_budget))
         if check:
             timer = time.monotonic()
@@ -241,9 +241,9 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
             failure.append('invalid_orthonormal_basis')
         else:
             # Batched reconstruction of only the scalar ranks we publish.
-            for start in range(0, len(validation_ranks), block_size):
+            for start in range(0, len(validation_ranks), check_every):
                 timer = time.monotonic()
-                ranks = validation_ranks[start:start + block_size]
+                ranks = validation_ranks[start:start + check_every]
                 indices = np.asarray(ranks, dtype=np.int64) - 1
                 u = np.empty((len(ranks), dimension), np.float32)
                 _transform_chunked(q[:count], vectors[:, indices], u)

@@ -49,13 +49,12 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(supported('muon', False))
         self.assertFalse(supported('unknown', True))
 
-    def test_condition_flags_are_reporting_only_but_legacy_rescaling_rejected(self):
-        saved = {'optimizer_type': 'cg', 'condition_log': False,
-                 'condition_trace_probes': 4, 'cg_log_matrix_norms': False}
-        current = dict(saved, condition_log=True, condition_trace_probes=8)
+    def test_spectrum_flags_are_reporting_only(self):
+        saved = {'optimizer_type': 'cg', 'condition_log': False}
+        current = dict(saved, condition_log=True,
+                       spectrum_endpoint_maxiter=48,
+                       spectrum_check_every=8)
         cg.validate_flags(saved, current)
-        with self.assertRaisesRegex(ValueError, 'changed the training trajectory'):
-            cg.validate_flags(dict(saved, cg_log_matrix_norms=True), current)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -65,14 +64,13 @@ class RecoveryTests(unittest.TestCase):
     def test_lambda(self):
         for batch, expected in ((256, .025), (1024, .1), (2048, .2)):
             self.assertEqual(cg.batch_lambda(batch, 10240), expected)
-        cg.validate_batch_lambda(0, 'muon', -1, 0, True, 2048)
-        for args in ((-1, 'cg', -1, 0, False, 256),
-                     (float('nan'), 'cg', -1, 0, False, 256),
-                     (float('inf'), 'cg', -1, 0, False, 256),
-                     (1024, 'muon', -1, 0, False, 256),
-                     (1024, 'cg', .4, 10, False, 256),
-                     (1024, 'cg', -1, 0, True, 256),
-                     (1024, 'cg', -1, 0, False, 2048)):
+        cg.validate_batch_lambda(0, 'muon', -1, 0, 2048)
+        for args in ((-1, 'cg', -1, 0, 256),
+                     (float('nan'), 'cg', -1, 0, 256),
+                     (float('inf'), 'cg', -1, 0, 256),
+                     (1024, 'muon', -1, 0, 256),
+                     (1024, 'cg', .4, 10, 256),
+                     (1024, 'cg', -1, 0, 2048)):
             with self.assertRaises(ValueError):
                 cg.validate_batch_lambda(*args)
         with self.assertRaises(ValueError):

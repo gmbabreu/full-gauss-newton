@@ -31,7 +31,7 @@ def batch_lambda(batch_size, denominator):
 
 
 def validate_batch_lambda(denominator, optimizer_type, final, ramp_steps,
-                          matrix_norms, max_batch):
+                          max_batch):
     if not math.isfinite(denominator) or denominator < 0:
         raise ValueError('cg_lambda_batch_denominator must be finite and nonnegative')
     if denominator == 0:
@@ -40,8 +40,6 @@ def validate_batch_lambda(denominator, optimizer_type, final, ramp_steps,
         raise ValueError('Batch lambda requires optimizer_type=cg')
     if final != -1 or ramp_steps != 0:
         raise ValueError('Batch lambda cannot be combined with a lambda ramp')
-    if matrix_norms:
-        raise ValueError('Batch lambda requires cg_log_matrix_norms=False')
     batch_lambda(max_batch, denominator)
 
 
@@ -143,28 +141,11 @@ def validate_flags(saved, current):
         'wandb_project', 'wandb_entity', 'output_dir', 'tmp_dir', 'experiment_id',
         'notes', 'logger', 'log_all_worker', 'save_model_freq', 'save_milestone_freq',
         'checkpointer', 'param_count', 'param_count_nonembed', 'training_progress',
-        'log_time_offset_s', 'condition_log', 'condition_every',
-        'condition_top_maxiter', 'condition_inverse_maxiter',
-        'condition_inner_cg_maxiter', 'condition_inner_cg_tol',
-        'condition_num_starts', 'condition_agreement_tol',
-        'condition_eigen_residual_tol', 'condition_shifts',
-        # Retired trace-probe control remains ignored for legacy checkpoints.
-        'condition_trace_probes',
-        # Retired switches remain ignored when reading legacy checkpoints.
-        'spectrum_log', 'spectrum_every', 'spectrum_top_k',
-        'spectrum_block_size', 'spectrum_max_basis', 'spectrum_restart_keep',
-        'spectrum_max_gn_products', 'spectrum_residual_tol',
-        'spectrum_stability_tol', 'spectrum_seed',
-        # False was observational; True is explicitly rejected below.
-        'cg_log_matrix_norms', 'cg_matrix_norm_frobenius_probes',
-        'cg_matrix_norm_power_iters'}
-    # This obsolete diagnostic modified effective lambda, so accepting one of
-    # its checkpoints would violate exact-resume semantics.
-    if saved.get('cg_log_matrix_norms', False):
-        raise ValueError('Cannot exactly resume cg_log_matrix_norms=True: the '
-                         'legacy diagnostic changed the training trajectory')
+        'log_time_offset_s'}
     changed = sorted(k for k in set(saved) | set(current)
-                     if k not in ignored and saved.get(k) != current.get(k))
+                     if k not in ignored
+                     and not k.startswith(('condition_', 'spectrum_'))
+                     and saved.get(k) != current.get(k))
     if changed:
         raise ValueError('Resume changes trajectory settings: ' + ', '.join(changed))
 

@@ -9,7 +9,6 @@ import mlxu
 import subprocess as sp
 
 import timeit
-import math
 import os
 import wandb
 from libtpu.sdk import monitoring as tpu_monitoring
@@ -155,14 +154,14 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     # cadence and never alter the solve operator or effective lambda.
     condition_log=False,
     condition_every=100,
-    condition_top_maxiter=24,
-    condition_inner_cg_maxiter=100,
-    condition_inner_cg_tol=1e-3,
-    condition_num_starts=2,
-    condition_agreement_tol=0.05,
-    condition_eigen_residual_tol=0.05,
+    spectrum_endpoint_maxiter=24,
+    spectrum_inverse_cg_maxiter=100,
+    spectrum_inverse_cg_tol=1e-3,
+    spectrum_endpoint_num_starts=2,
+    spectrum_endpoint_agreement_tol=0.05,
+    spectrum_endpoint_residual_tol=0.05,
     spectrum_top_k=100,
-    spectrum_block_size=4,
+    spectrum_check_every=4,
     spectrum_max_basis=600,
     spectrum_restart_keep=120,
     spectrum_max_gn_products=600,
@@ -269,15 +268,16 @@ def main(argv):
                 'Condition diagnostics support CG, Adam-GN, and Muon-GN only')
         if FLAGS.condition_every <= 0:
             raise ValueError('condition cadence must be positive')
-        if FLAGS.condition_top_maxiter < 3 or FLAGS.condition_num_starts < 2:
+        if (FLAGS.spectrum_endpoint_maxiter < 3
+                or FLAGS.spectrum_endpoint_num_starts < 2):
             raise ValueError('Condition diagnostics require positive budgets, '
                              'at least three outer iterations, and two starts')
-        if not 0 < FLAGS.condition_agreement_tol < 1 \
-                or not 0 < FLAGS.condition_eigen_residual_tol < 1:
+        if not 0 < FLAGS.spectrum_endpoint_agreement_tol < 1 \
+                or not 0 < FLAGS.spectrum_endpoint_residual_tol < 1:
             raise ValueError('Condition validation tolerances must be in (0, 1)')
         if FLAGS.optimizer_type == 'cg' and (
-                FLAGS.condition_inner_cg_maxiter <= 0
-                or not 0 < FLAGS.condition_inner_cg_tol < 1):
+                FLAGS.spectrum_inverse_cg_maxiter <= 0
+                or not 0 < FLAGS.spectrum_inverse_cg_tol < 1):
             raise ValueError('Condition inverse iteration needs a positive CG '
                              'budget and a tolerance in (0, 1)')
         if jax.process_count() != 1:
@@ -285,8 +285,8 @@ def main(argv):
         if not (0 < FLAGS.spectrum_top_k <= FLAGS.spectrum_restart_keep
                 < FLAGS.spectrum_max_basis):
             raise ValueError('invalid spectrum top-k/restart/basis settings')
-        if FLAGS.spectrum_block_size <= 0:
-            raise ValueError('spectrum block size must be positive')
+        if FLAGS.spectrum_check_every <= 0:
+            raise ValueError('spectrum check cadence must be positive')
 
     if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
         raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")
@@ -299,7 +299,7 @@ def main(argv):
         raise ValueError("train_batch_growth_interval must be nonnegative")
     cg_resume.validate_batch_lambda(
         FLAGS.cg_lambda_batch_denominator, FLAGS.optimizer_type,
-        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps, False,
+        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps,
         max(FLAGS.train_dataset_batch_size,
             FLAGS.train_batch_max if FLAGS.train_batch_growth_interval > 0 else 0,
             FLAGS.train_dataset.huggingface_dataset.batch_size))
@@ -1494,7 +1494,7 @@ def main(argv):
             print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
             spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
                 cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
-                block_size=FLAGS.spectrum_block_size,
+                check_every=FLAGS.spectrum_check_every,
                 max_basis=FLAGS.spectrum_max_basis,
                 restart_keep=FLAGS.spectrum_restart_keep,
                 max_products=FLAGS.spectrum_max_gn_products,
@@ -1515,16 +1515,16 @@ def main(argv):
                 spectrum_max = spectrum_scalars['lambda_1_est']
             print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: end ' +
                   str(spectrum_scalars), flush=True)
-            options = dict(top_maxiter=FLAGS.condition_top_maxiter,
-                num_starts=FLAGS.condition_num_starts,
-                agreement_tol=FLAGS.condition_agreement_tol,
-                residual_tol=FLAGS.condition_eigen_residual_tol, key=key)
+            options = dict(endpoint_maxiter=FLAGS.spectrum_endpoint_maxiter,
+                num_starts=FLAGS.spectrum_endpoint_num_starts,
+                agreement_tol=FLAGS.spectrum_endpoint_agreement_tol,
+                residual_tol=FLAGS.spectrum_endpoint_residual_tol, key=key)
             if spectrum_max is None:
                 if 'G' not in condition_power_solvers:
                     condition_power_solvers['G'] = matrix_condition.make_power_solver(
-                        apply_g, maxiter=FLAGS.condition_top_maxiter,
-                        agreement_tol=FLAGS.condition_agreement_tol,
-                        residual_tol=FLAGS.condition_eigen_residual_tol)
+                        apply_g, maxiter=FLAGS.spectrum_endpoint_maxiter,
+                        agreement_tol=FLAGS.spectrum_endpoint_agreement_tol,
+                        residual_tol=FLAGS.spectrum_endpoint_residual_tol)
                 print('[spectrum] G fallback maximum: start', flush=True)
                 g_report = matrix_condition.condition_diagnostic(apply_g, params,
                     compiled_power_solver=condition_power_solvers['G'],
@@ -1594,23 +1594,23 @@ def main(argv):
                     apply_a, lambda *args: args[2])
                 if 'A' not in condition_power_solvers:
                     condition_power_solvers['A'] = matrix_condition.make_power_solver(
-                        apply_a, maxiter=FLAGS.condition_top_maxiter,
-                        agreement_tol=FLAGS.condition_agreement_tol,
-                        residual_tol=FLAGS.condition_eigen_residual_tol)
+                        apply_a, maxiter=FLAGS.spectrum_endpoint_maxiter,
+                        agreement_tol=FLAGS.spectrum_endpoint_agreement_tol,
+                        residual_tol=FLAGS.spectrum_endpoint_residual_tol)
                     condition_power_solvers['A_inverse'] = matrix_condition.make_inverse_solver(
-                        apply_a, maxiter=FLAGS.condition_top_maxiter,
-                        inner_maxiter=FLAGS.condition_inner_cg_maxiter,
-                        inner_tol=FLAGS.condition_inner_cg_tol,
-                        agreement_tol=FLAGS.condition_agreement_tol,
-                        residual_tol=FLAGS.condition_eigen_residual_tol,
+                        apply_a, maxiter=FLAGS.spectrum_endpoint_maxiter,
+                        inner_maxiter=FLAGS.spectrum_inverse_cg_maxiter,
+                        inner_tol=FLAGS.spectrum_inverse_cg_tol,
+                        agreement_tol=FLAGS.spectrum_endpoint_agreement_tol,
+                        residual_tol=FLAGS.spectrum_endpoint_residual_tol,
                         preconditioner=lambda v, _params, _batch, d, *_: jax.tree.map(
                             lambda value, diagonal: value / diagonal, v, d))
                 if 'A_preconditioned_B' not in condition_power_solvers:
                     condition_power_solvers['A_preconditioned_B'] = \
                         matrix_condition.make_power_solver(
-                            apply_b, maxiter=FLAGS.condition_top_maxiter,
-                            agreement_tol=FLAGS.condition_agreement_tol,
-                            residual_tol=FLAGS.condition_eigen_residual_tol)
+                            apply_b, maxiter=FLAGS.spectrum_endpoint_maxiter,
+                            agreement_tol=FLAGS.spectrum_endpoint_agreement_tol,
+                            residual_tol=FLAGS.spectrum_endpoint_residual_tol)
                 print('[spectrum] A: start', flush=True)
                 a_report = matrix_condition.damped_condition_diagnostic(apply_a, params,
                     operator_args=a_operator_args,

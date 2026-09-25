@@ -23,8 +23,8 @@ For lambda equal to actual global solve-batch sequences divided by 10240:
 
 This gives 0.025 at batch 256, 0.1 at 1024, and 0.2 at 2048, before device or
 microbatch splitting. Both scheduled and effective lambda report this value.
-Negative/nonfinite denominators, non-CG solvers, simultaneous ramps, matrix-norm
-rescaling, and batches above the denominator are rejected. Startup checks include
+Negative/nonfinite denominators, non-CG solvers, simultaneous ramps, and batches
+above the denominator are rejected. Startup checks include
 the growth cap; actual batch size is checked again at each solve. No clamping is
 performed. The LR schedule remains update-based; this rule does not eliminate
 all coupling between batch schedules and token-budget comparisons, or guarantee
@@ -34,9 +34,8 @@ requesting constant lambda.
 ## Condition diagnostics
 
 `--condition_log=True` enables all spectral diagnostics at outer step 0 and every
-`condition_every` updates (default 50). It is the sole enable switch; remove
-`--spectrum_log` and replace `--spectrum_every=N` with `--condition_every=N` in
-existing commands. `condition_log=False` disables all of these diagnostics.
+`condition_every` updates (default 100). `condition_log=False` disables all of
+these diagnostics.
 
 Every supported solver (CG, Adam-GN, Muon-GN) estimates the leading
 `spectrum_top_k` eigenvalues of raw `G`, including its largest eigenvalue. CG
@@ -44,7 +43,7 @@ additionally estimates both endpoints of the actual damped solve matrix
 `A=lambda*G+(1-lambda)/eta*D`, using the effective lambda, safe Adam learning
 rate, and bias-corrected diagonal from that update. The existing maximum of
 symmetric `P=D^-1/2*A*D^-1/2` and its damping proxy are retained. The new minimum
-estimate is for `A`, not `P`; structural lower bounds remain separately named.
+estimate is for `A`, not `P`.
 
 Diagnostics reuse the frozen solve batch, never fetch data or consume training
 RNG, and their products are excluded from solve-token accounting. For Adam-GN
@@ -63,15 +62,17 @@ transfer timings remain in terminal output rather than W&B.
 
 `A`'s maximum uses power iteration; its minimum uses inverse iteration with
 compiled, diagonally preconditioned inner CG solves. Defaults are
-`condition_top_maxiter=24` outer iterations for each endpoint,
-`condition_num_starts=2`, `condition_inner_cg_maxiter=100`, and
-`condition_inner_cg_tol=0.001`. Actual inner-solve residuals, eigenpair residuals,
-and agreement between starts must pass; unresolved minima and condition ratios
-are withheld. `spectrum/A/lambda_min_est` and `spectrum/A/condition_est` are
-estimates, not certified spectral bounds. Singular undamped systems may remain
-unresolved. Inverse iteration adds GN products beyond the spectrum product
-budget; its cap is separate. All damped and preconditioned results live under
-`spectrum/A/*`; preconditioned fields use a `preconditioned_` prefix. For
+`spectrum_endpoint_maxiter=24` outer iterations for each endpoint,
+`spectrum_endpoint_num_starts=2`, `spectrum_inverse_cg_maxiter=100`, and
+`spectrum_inverse_cg_tol=0.001`. Endpoint stability and eigenpair acceptance use
+`spectrum_endpoint_agreement_tol` and `spectrum_endpoint_residual_tol`.
+Actual inner-solve residuals, eigenpair residuals, and agreement between starts
+must pass; unresolved minima and condition ratios are withheld.
+`spectrum/A/lambda_min_est` and `spectrum/A/condition_est` are estimates, not
+certified spectral bounds. Singular undamped systems may remain unresolved.
+Inverse iteration adds GN products beyond the spectrum product budget; its cap
+is separate. All damped and preconditioned results live under `spectrum/A/*`;
+preconditioned fields use a `preconditioned_` prefix. For
 `P=cI+B`, the maximum is found on
 `B=lambda*D^-1/2*G*D^-1/2` before adding the known identity shift, avoiding
 premature convergence on an identity-dominated `P`. The descriptive
@@ -85,9 +86,10 @@ were not needed for the eigenvalue objective.
 `G`; `spectrum_top_k` defaults to 100. One FP32 basis stays on CPU. The small
 symmetric recurrence matrix and its eigendecomposition use FP64. A preflight
 includes the basis, active blocks, bounded transformation/transfer workspace,
-cgroup-aware available memory, and an 8 GiB reserve. At 150M parameters, one
-160-vector buffer is about 89.4 GiB, before workspace and reserve. The diagnostic
-refuses unsupported multi-host runs and insufficient host memory.
+cgroup-aware available memory, and an 8 GiB reserve. The default 600-vector
+basis is intended for the high-memory TPU host used by this project; at 150M
+parameters the basis alone is about 335 GiB. The diagnostic refuses unsupported
+multi-host runs and insufficient host memory before allocating it.
 
 The short recurrence uses an FP32 overlap scan and adaptive two-pass corrective
 reorthogonalization. Thick restart retains `spectrum_restart_keep` Ritz vectors
@@ -96,8 +98,8 @@ projection before ordinary Lanczos expansion resumes. Numerical breakdown
 starts a random direction orthogonal to the current basis. The old residual
 expansion solver and stored `GQ` buffer have been removed.
 
-`spectrum_block_size` now controls the projected-eigensolve cadence and the
-bounded validation reconstruction batch (not a block Lanczos recurrence).
+`spectrum_check_every` controls the projected-eigensolve cadence and the bounded
+validation reconstruction batch.
 Recurrence residuals screen convergence, together with the existing eigenvalue
 stability tolerance. Before acceptance, a full Gram check and fresh direct
 residual checks of every scalar rank that will be published (1, 10, 20, ...,
@@ -136,10 +138,8 @@ python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum
 python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_max_gn_products=1200
 ```
 
-The diagnostic controls may change on exact resume. The retired
-`condition_trace_probes` field is ignored when reading legacy checkpoints. A
-legacy checkpoint with `cg_log_matrix_norms=True` is rejected because that old
-logging path changed effective lambda and therefore the trajectory.
+The diagnostic controls may change on exact resume because they are
+observational and do not alter optimizer state or data consumption.
 
 ## Data order and compatibility
 

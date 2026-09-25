@@ -29,17 +29,17 @@ class ConditionRoutingTest(unittest.TestCase):
             jax.debug.callback(lambda: self.calls.append(1), ordered=True)
             return {'w': self.g * vector['w']}
         flags = SimpleNamespace(inner_loop_wd=0., spectrum_top_k=2,
-            spectrum_block_size=2, spectrum_max_basis=8, spectrum_restart_keep=4,
+            spectrum_check_every=2, spectrum_max_basis=8, spectrum_restart_keep=4,
             spectrum_max_gn_products=100, spectrum_residual_tol=.01,
-            spectrum_stability_tol=.02, spectrum_seed=0, condition_top_maxiter=150,
-            condition_num_starts=2, condition_agreement_tol=1e-4,
-            condition_eigen_residual_tol=1e-4,
-            condition_inner_cg_maxiter=24, condition_inner_cg_tol=1e-5)
+            spectrum_stability_tol=.02, spectrum_seed=0,
+            spectrum_endpoint_maxiter=150, spectrum_endpoint_num_starts=2,
+            spectrum_endpoint_agreement_tol=1e-4,
+            spectrum_endpoint_residual_tol=1e-4,
+            spectrum_inverse_cg_maxiter=24, spectrum_inverse_cg_tol=1e-5)
         self.namespace = dict(FLAGS=flags, jax=jax, jnp=jnp, np=np, timeit=timeit,
             matrix_condition=matrix_condition, matrix_spectrum=matrix_spectrum,
             step=0, condition_power_solvers={}, sharded_condition_apply_g=apply_g,
-            diagnostic_param_shards={'w': jnp.asarray},
-            wandb=SimpleNamespace(Table=lambda **kw: kw))
+            diagnostic_param_shards={'w': jnp.asarray})
         exec(compile(ast.fix_missing_locations(definitions), str(TRAINER), 'exec'),
              self.namespace)
         self.run_diagnostics = self.namespace['run_condition_diagnostics']
@@ -104,11 +104,11 @@ class ConditionRoutingTest(unittest.TestCase):
                         and isinstance(n.func, ast.Attribute)
                         and n.func.attr == 'define_flags_with_default')
         names = {kw.arg for kw in defaults.keywords}
-        self.assertIn('condition_log', names)
-        self.assertIn('condition_every', names)
-        self.assertNotIn('condition_trace_probes', names)
-        self.assertNotIn('spectrum_log', names)
-        self.assertNotIn('spectrum_every', names)
+        self.assertEqual({name for name in names if name.startswith('condition_')},
+                         {'condition_log', 'condition_every'})
+        self.assertIn('spectrum_endpoint_maxiter', names)
+        self.assertIn('spectrum_inverse_cg_maxiter', names)
+        self.assertIn('spectrum_check_every', names)
         schedules = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'do_condition'
                              for t in n.targets)]
@@ -120,12 +120,12 @@ class ConditionRoutingTest(unittest.TestCase):
                 flags = SimpleNamespace(condition_log=enabled, condition_every=50)
                 self.assertEqual(eval(compiled, dict(FLAGS=flags, step=step)), expected)
 
-    def test_legacy_checkpoint_logging_flags_remain_compatible(self):
+    def test_spectrum_reporting_flags_are_resume_compatible(self):
         cg_resume.validate_flags(
-            {'optimizer_type': 'cg', 'condition_log': False,
-             'spectrum_log': True, 'spectrum_every': 10},
+            {'optimizer_type': 'cg', 'condition_log': False},
             {'optimizer_type': 'cg', 'condition_log': True, 'condition_every': 50,
-             'condition_inner_cg_maxiter': 100, 'condition_inner_cg_tol': .001})
+             'spectrum_inverse_cg_maxiter': 100,
+             'spectrum_inverse_cg_tol': .001})
 
 
 if __name__ == '__main__':

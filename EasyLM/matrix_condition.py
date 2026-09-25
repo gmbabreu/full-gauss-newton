@@ -1,4 +1,4 @@
-"""Spectral endpoint and trace diagnostics for symmetric PSD operators."""
+"""Spectral endpoint diagnostics for symmetric PSD operators."""
 from dataclasses import dataclass, fields
 import math
 import time
@@ -31,14 +31,6 @@ def random_unit_pytree(key, template):
     norm = float(tree_norm(value))
     return None if not math.isfinite(norm) or norm <= 0 else jax.tree.map(
         lambda leaf: leaf / norm, value)
-
-
-def random_rademacher_pytree(key, template):
-    leaves, structure = jax.tree.flatten(template)
-    keys = jax.random.split(key, len(leaves))
-    return jax.tree.unflatten(structure, [
-        jax.random.rademacher(k, leaf.shape, jnp.float32).astype(leaf.dtype)
-        for k, leaf in zip(keys, leaves)])
 
 
 @dataclass
@@ -227,7 +219,7 @@ def condition_diagnostic(operator, template, **kwargs):
     started = time.monotonic()
     endpoint = power_iteration(operator, template,
         key=kwargs.get('key', jax.random.PRNGKey(0)),
-        maxiter=kwargs.get('top_maxiter', 24),
+        maxiter=kwargs.get('endpoint_maxiter', 24),
         agreement_tol=kwargs.get('agreement_tol', .05),
         residual_tol=kwargs.get('residual_tol', .05),
         num_starts=kwargs.get('num_starts', 2),
@@ -247,9 +239,9 @@ def damped_condition_diagnostic(operator, template, **kwargs):
     solver = kwargs.get('compiled_inverse_solver')
     if solver is None:
         solver = make_inverse_solver(operator,
-            maxiter=kwargs.get('top_maxiter', 24),
-            inner_maxiter=kwargs.get('inner_cg_maxiter', 100),
-            inner_tol=kwargs.get('inner_cg_tol', 1e-3),
+            maxiter=kwargs.get('endpoint_maxiter', 24),
+            inner_maxiter=kwargs.get('inverse_cg_maxiter', 100),
+            inner_tol=kwargs.get('inverse_cg_tol', 1e-3),
             agreement_tol=kwargs.get('agreement_tol', .05),
             residual_tol=kwargs.get('residual_tol', .05),
             preconditioner=kwargs.get('preconditioner'))
@@ -284,7 +276,7 @@ def preconditioned_condition_diagnostic(apply_b, apply_p, template, c, **kwargs)
             seconds=time.monotonic() - started, top={'special_case': 'P=cI'})
     endpoint = power_iteration(apply_b, template,
         key=kwargs.get('key', jax.random.PRNGKey(0)),
-        maxiter=kwargs.get('top_maxiter', 24),
+        maxiter=kwargs.get('endpoint_maxiter', 24),
         agreement_tol=kwargs.get('agreement_tol', .05),
         residual_tol=kwargs.get('residual_tol', .05),
         num_starts=kwargs.get('num_starts', 2),
@@ -309,13 +301,6 @@ def preconditioned_condition_diagnostic(apply_b, apply_p, template, c, **kwargs)
         operator_matvecs=products, seconds=time.monotonic() - started)
 
 
-def structural_lower_bounds(effective_lambda, safe_adam_lr, diagonal):
-    c = (1 - float(effective_lambda)) / float(safe_adam_lr)
-    min_d = min(float(jnp.min(leaf)) for leaf in jax.tree.leaves(diagonal))
-    return {'A_lambda_min_lower_bound': c * min_d,
-            'P_lambda_min_lower_bound': c}
-
-
 def symmetric_diagonal_operator(operator, diagonal):
     def apply(vector, *args):
         actual = diagonal(*args) if callable(diagonal) else diagonal
@@ -323,44 +308,3 @@ def symmetric_diagonal_operator(operator, diagonal):
         product = operator(scaled, *args)
         return jax.tree.map(lambda value, d: value / jnp.sqrt(d), product, actual)
     return apply
-
-
-def summarize_probe_samples(trace_samples, square_samples, lambda_max_est,
-                            dimension=None):
-    t, s = np.asarray(trace_samples, np.float64), np.asarray(square_samples, np.float64)
-    if len(t) < 2 or len(t) != len(s):
-        raise ValueError('Need at least two paired probe samples')
-    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(s))):
-        return {'trace_probes': len(t), 'trace_estimates_valid': False}
-    trace, trace_square = float(t.mean()), float(s.mean())
-    top_ok = lambda_max_est is not None and math.isfinite(lambda_max_est) \
-        and lambda_max_est > 0
-    concentration = (dimension * lambda_max_est / trace
-                     if top_ok and dimension is not None and dimension > 0
-                     and trace > 0 else None)
-    return dict(trace_probes=len(t), trace_estimates_valid=trace >= 0 and trace_square >= 0,
-        trace_est=trace, trace_sample_se=float(t.std(ddof=1) / np.sqrt(len(t))),
-        trace_square_est=trace_square,
-        trace_square_sample_se=float(s.std(ddof=1) / np.sqrt(len(s))),
-        spectral_concentration_est=concentration,
-        participation_rank_est=(trace * trace / trace_square
-                                if trace > 0 and trace_square > 0 else None),
-        stable_rank_est=(trace_square / (lambda_max_est * lambda_max_est)
-                         if top_ok and trace_square > 0 else None))
-
-
-def probe_operators(apply_g, template, *, num_probes=4,
-                    key=jax.random.PRNGKey(0), apply_a_from_g=None):
-    if num_probes < 2: raise ValueError('Need at least two trace probes')
-    samples = {'G': ([], [])}
-    if apply_a_from_g is not None: samples['A'] = ([], [])
-    for index in range(num_probes):
-        z = random_rademacher_pytree(jax.random.fold_in(key, index), template)
-        gz = apply_g(z)
-        samples['G'][0].append(float(tree_dot(z, gz)))
-        samples['G'][1].append(float(tree_dot(gz, gz)))
-        if apply_a_from_g is not None:
-            az = apply_a_from_g(gz, z)
-            samples['A'][0].append(float(tree_dot(z, az)))
-            samples['A'][1].append(float(tree_dot(az, az)))
-    return samples

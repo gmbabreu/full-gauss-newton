@@ -21,7 +21,7 @@ class MatrixSpectrumTest(unittest.TestCase):
         matrix = np.diag(np.array([9., 7., 5., 3., 1.], np.float32))
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             scalars, table = ms.estimate_top_spectrum(
-                lambda vector: matrix @ vector, 5, top_k=3, block_size=2,
+                lambda vector: matrix @ vector, 5, top_k=3, check_every=2,
                 max_basis=5, restart_keep=4, max_products=40,
                 residual_tol=1e-4, stability_tol=1e-4, seed=3)
         self.assertTrue(scalars['accepted'], table)
@@ -39,7 +39,7 @@ class MatrixSpectrumTest(unittest.TestCase):
             return diagonal * vector
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             scalars, table = ms.estimate_top_spectrum(
-                apply, 192, top_k=5, block_size=4, max_basis=12,
+                apply, 192, top_k=5, check_every=4, max_basis=12,
                 restart_keep=8, max_products=100, residual_tol=1e-3,
                 stability_tol=1e-3, seed=7)
         self.assertTrue(scalars['accepted'], table)
@@ -56,7 +56,7 @@ class MatrixSpectrumTest(unittest.TestCase):
             return np.arange(vector.size, 0, -1, dtype=np.float32) * vector
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             scalars, table = ms.estimate_top_spectrum(
-                apply, 192, top_k=5, block_size=4, max_basis=12,
+                apply, 192, top_k=5, check_every=4, max_basis=12,
                 restart_keep=8, max_products=8, residual_tol=1e-8,
                 stability_tol=1e-8)
         self.assertFalse(scalars['accepted'])
@@ -76,7 +76,7 @@ class MatrixSpectrumTest(unittest.TestCase):
             return diagonal * vector
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             scalars, table = ms.estimate_top_spectrum(
-                apply, 192, top_k=100, block_size=4, max_basis=160,
+                apply, 192, top_k=100, check_every=4, max_basis=160,
                 restart_keep=120, max_products=600,
                 residual_tol=.01, stability_tol=.02, seed=11)
         self.assertTrue(scalars['accepted'], table)
@@ -104,7 +104,7 @@ class MatrixSpectrumTest(unittest.TestCase):
             return diagonal * vector
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             scalars, table = ms.estimate_top_spectrum(
-                apply, diagonal.size, top_k=10, block_size=4,
+                apply, diagonal.size, top_k=10, check_every=4,
                 max_basis=32, restart_keep=16, max_products=120,
                 residual_tol=.01, stability_tol=.02, seed=0)
         self.assertTrue(scalars['accepted'], table)

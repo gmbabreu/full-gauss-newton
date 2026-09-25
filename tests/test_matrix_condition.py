@@ -1,4 +1,3 @@
-import itertools
 import unittest
 
 import jax
@@ -11,14 +10,14 @@ from EasyLM import matrix_condition as mc
 class MatrixConditionTest(unittest.TestCase):
     def test_identity_maximum(self):
         report = mc.condition_diagnostic(lambda x: x, jnp.ones(5),
-            top_maxiter=24, agreement_tol=.01, residual_tol=.01)
+            endpoint_maxiter=24, agreement_tol=.01, residual_tol=.01)
         self.assertTrue(report['resolved'])
         self.assertAlmostEqual(report['lambda_max_est'], 1., places=5)
 
     def test_underbudget_preserves_rayleigh_but_withholds_estimate(self):
         matrix = jnp.diag(jnp.array([1., 100.]))
         report = mc.condition_diagnostic(lambda x: matrix @ x, jnp.ones(2),
-            top_maxiter=1, residual_tol=1e-8)
+            endpoint_maxiter=1, residual_tol=1e-8)
         self.assertFalse(report['resolved'])
         self.assertIsNone(report['lambda_max_est'])
         self.assertIsNotNone(report['top']['rayleigh_quotient'])
@@ -37,7 +36,7 @@ class MatrixConditionTest(unittest.TestCase):
         c = 100.
         report = mc.preconditioned_condition_diagnostic(
             lambda x: b @ x, lambda x: c * x + b @ x, jnp.ones(2), c,
-            top_maxiter=100, agreement_tol=.01, residual_tol=.01)
+            endpoint_maxiter=100, agreement_tol=.01, residual_tol=.01)
         self.assertTrue(report['resolved'])
         self.assertAlmostEqual(report['lambda_max_est'], 101., delta=.01)
         self.assertAlmostEqual(report['damping_condition_proxy'], 1.01, delta=1e-4)
@@ -63,8 +62,8 @@ class MatrixConditionTest(unittest.TestCase):
             gv = jax.vjp(model, params)[1](jv)[0]
             return lam * gv + (1-lam)/eta * diagonal * v
         report = mc.damped_condition_diagnostic(apply, params,
-            preconditioner=lambda v: v / diagonal, top_maxiter=150,
-            inner_cg_maxiter=20, inner_cg_tol=1e-5,
+            preconditioner=lambda v: v / diagonal, endpoint_maxiter=150,
+            inverse_cg_maxiter=20, inverse_cg_tol=1e-5,
             agreement_tol=1e-4, residual_tol=1e-4)
         truth = np.linalg.eigvalsh(matrix)
         self.assertTrue(report['resolved'], report)
@@ -90,7 +89,7 @@ class MatrixConditionTest(unittest.TestCase):
     def test_inverse_underbudget_withholds_minimum_and_ratio(self):
         matrix = jnp.diag(jnp.array([1., 3., 20., 100.]))
         report = mc.damped_condition_diagnostic(lambda v: matrix @ v, jnp.ones(4),
-            top_maxiter=100, inner_cg_maxiter=1, inner_cg_tol=1e-6)
+            endpoint_maxiter=100, inverse_cg_maxiter=1, inverse_cg_tol=1e-6)
         self.assertIsNotNone(report['lambda_max_est'])
         self.assertIsNone(report['lambda_min_est'])
         self.assertIsNone(report['condition_est'])
@@ -100,41 +99,10 @@ class MatrixConditionTest(unittest.TestCase):
     def test_singular_operator_does_not_publish_positive_minimum(self):
         diagonal = jnp.array([0., 1., 10.])
         report = mc.damped_condition_diagnostic(lambda v: diagonal * v, jnp.ones(3),
-            top_maxiter=100, inner_cg_maxiter=20)
+            endpoint_maxiter=100, inverse_cg_maxiter=20)
         self.assertIsNone(report['lambda_min_est'])
         self.assertIsNone(report['condition_est'])
         self.assertFalse(report['resolved'])
-
-    def test_exhaustive_rademacher_trace_identities_and_concentration(self):
-        matrix = np.array([[2., .5], [.5, 3.]])
-        traces, squares = [], []
-        for signs in itertools.product((-1., 1.), repeat=2):
-            z = np.asarray(signs)
-            mz = matrix @ z
-            traces.append(z @ mz)
-            squares.append(mz @ mz)
-        summary = mc.summarize_probe_samples(
-            traces, squares, 3.20710678, dimension=2)
-        self.assertAlmostEqual(summary['trace_est'], np.trace(matrix))
-        self.assertAlmostEqual(summary['trace_square_est'], np.trace(matrix @ matrix))
-        self.assertAlmostEqual(summary['spectral_concentration_est'],
-                               2 * 3.20710678 / 5.)
-
-    def test_reused_az_matches_explicit_damped_matrix(self):
-        g = jnp.array([[2., .5], [.5, 3.]])
-        diagonal = jnp.array([4., 5.])
-        lam, c = .3, .7
-        samples = mc.probe_operators(lambda z: g @ z, jnp.ones(2), num_probes=4,
-            apply_a_from_g=lambda gz, z: lam * gz + c * diagonal * z)
-        key = jax.random.PRNGKey(0)
-        explicit = []
-        a = lam * g + c * jnp.diag(diagonal)
-        for index in range(4):
-            z = mc.random_rademacher_pytree(
-                jax.random.fold_in(key, index), jnp.ones(2))
-            explicit.append(float(mc.tree_dot(z, a @ z)))
-        np.testing.assert_allclose(samples['A'][0], explicit)
-
 
 if __name__ == '__main__':
     unittest.main()
