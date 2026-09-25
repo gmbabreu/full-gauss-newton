@@ -7,31 +7,10 @@ from EasyLM import matrix_spectrum as ms
 
 
 class MatrixSpectrumTest(unittest.TestCase):
-    def test_batched_residual_directions_match_explicit_residuals(self):
-        rng = np.random.default_rng(12)
-        q = np.linalg.qr(rng.normal(size=(53, 8)))[0].T.astype(np.float32)
-        matrix = rng.normal(size=(53, 53))
-        matrix = matrix.T @ matrix
-        gq = (q @ matrix).astype(np.float32)
-        values, vectors = np.linalg.eigh(q.astype(np.float64) @ gq.T)
-        # Nonconsecutive, deliberately reordered ranks; uneven coordinate chunks.
-        for wanted in ([6, 2, 7, 4], [3]):
-            coefficients = vectors[:, wanted]
-            selected = values[wanted]
-            expected = np.stack([
-                gq.astype(np.float64).T @ coefficients[:, i]
-                - value * (q.astype(np.float64).T @ coefficients[:, i])
-                for i, value in enumerate(selected)])
-            for chunk in (7, 100):
-                actual = ms._residual_directions(
-                    q, gq, coefficients, selected, chunk=chunk)
-                self.assertEqual(actual.dtype, np.float32)
-                np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-    def test_memory_preflight_counts_two_basis_buffers(self):
+    def test_memory_preflight_counts_one_basis_buffer(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             report = ms.memory_preflight(1000, 160, 4, reserve_bytes=0)
-        self.assertEqual(report['basis_buffer_bytes'], 2 * 160 * 1000 * 4)
+        self.assertEqual(report['basis_buffer_bytes'], 160 * 1000 * 4)
 
     def test_preflight_respects_effective_limit(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=1024):
@@ -106,6 +85,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 600)
         self.assertAlmostEqual(scalars['top100_condition_est'], 1., delta=.01)
+        for rank in range(10, 101, 10):
+            self.assertAlmostEqual(scalars[f'lambda_{rank}_est'], 2., delta=.01)
 
     def test_top10_condition_and_timings(self):
         diagonal = np.concatenate((
@@ -140,6 +121,70 @@ class MatrixSpectrumTest(unittest.TestCase):
             self.assertGreaterEqual(scalars[name], 0., name)
         self.assertLessEqual(
             scalars['max_relative_ritz_residual'], .01)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_clustered_rotated_spectrum_and_every_tenth_rank(self, _memory):
+        rng = np.random.default_rng(42)
+        basis = np.linalg.qr(rng.normal(size=(96, 96)))[0]
+        diagonal = np.r_[np.linspace(10., 9.9, 25), np.linspace(4., .1, 71)]
+        matrix = (basis * diagonal) @ basis.T
+        scalars, table = ms.estimate_top_spectrum(
+            lambda v: matrix @ v, 96, top_k=25, max_basis=45,
+            restart_keep=30, max_products=240, residual_tol=1e-4)
+        self.assertTrue(scalars['accepted'], table)
+        self.assertGreater(scalars['restart_count'], 0)
+        np.testing.assert_allclose(table['values'], diagonal[:25], rtol=1e-4)
+        self.assertEqual(set(table['direct_residuals']), set(range(1, 26)))
+        for rank in (1, 10, 20, 25):
+            self.assertAlmostEqual(scalars[f'lambda_{rank}_est'], diagonal[rank-1], places=3)
+        self.assertIsNone(scalars['lambda_100_est'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_fresh_validation_rejects_changed_operator(self, _memory):
+        diagonal = np.arange(8., 0., -1, dtype=np.float32)
+        calls = 0
+        def apply(v):
+            nonlocal calls
+            calls += 1
+            return diagonal * v + (v if calls > 8 else 0)
+        scalars, table = ms.estimate_top_spectrum(
+            apply, 8, top_k=4, max_basis=8, restart_keep=6,
+            max_products=30, residual_tol=1e-4)
+        self.assertFalse(scalars['accepted'])
+        self.assertIn('direct_residual_failed', table['failure_reasons'])
+        self.assertIsNone(scalars['lambda_1_est'])
+        self.assertEqual(scalars['gn_products'], calls)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_nonfinite_product_is_unresolved(self, _memory):
+        scalars, table = ms.estimate_top_spectrum(
+            lambda v: v * np.nan, 8, top_k=3, max_basis=8,
+            restart_keep=5, max_products=20)
+        self.assertFalse(scalars['accepted'])
+        self.assertEqual(scalars['gn_products'], 1)
+        self.assertIn('invalid_operator_product', table['failure_reasons'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_jax_gn_matches_explicit_jacobian(self, _memory):
+        import jax
+        import jax.numpy as jnp
+        rng = np.random.default_rng(15)
+        x = jnp.asarray(rng.normal(size=(9, 24)), dtype=jnp.float32)
+        theta = jnp.asarray(rng.normal(size=24), dtype=jnp.float32)
+        def logits(t): return jnp.sin(x @ t)
+        jacobian = jax.jacfwd(logits)(theta)
+        hessian = jax.hessian(jax.scipy.special.logsumexp)(logits(theta))
+        dense = np.asarray(jacobian.T @ hessian @ jacobian) + .1 * np.eye(24)
+        @jax.jit
+        def product(v):
+            _, tangent = jax.jvp(logits, (theta,), (v,))
+            return jax.vjp(logits, theta)[1](hessian @ tangent)[0] + .1 * v
+        scalars, table = ms.estimate_top_spectrum(
+            lambda v: np.asarray(product(jnp.asarray(v))), 24, top_k=5,
+            max_basis=12, restart_keep=7, max_products=120, residual_tol=1e-4)
+        self.assertTrue(scalars['accepted'], table)
+        expected = np.linalg.eigvalsh(dense)[::-1][:5]
+        np.testing.assert_allclose(table['values'], expected, atol=2e-5, rtol=2e-5)
 
 
 if __name__ == '__main__':

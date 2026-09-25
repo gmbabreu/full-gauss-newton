@@ -1,11 +1,10 @@
-"""CPU-resident thick-restarted block Rayleigh--Ritz diagnostics.
+"""CPU-resident thick-restarted Lanczos with adaptive reorthogonalization.
 
-The maintained decomposition is ``G Q = Q H + F C``.  At restart, leading
-Ritz vectors ``U=QY`` are formed in coordinate chunks and their coupling is
-preserved as ``G U = U Theta + F C Y``.  The retained ``GQ`` products are
-transformed with the retained basis; they are not recomputed at restart.
+Only Q is stored. The small symmetric recurrence matrix becomes an arrowhead
+at thick restart; the retained coupling is beta * Y[-1, :keep]. Residuals from
+this recurrence screen convergence, and fresh products validate every wanted
+Ritz pair before any eigenvalue is published as accepted.
 """
-from dataclasses import dataclass
 import math
 import os
 import time
@@ -36,12 +35,12 @@ def available_host_memory():
 
 
 def memory_preflight(dimension, max_basis, block_size, *, reserve_bytes=8 << 30):
-    """Account for two basis buffers, active blocks, coefficients and transfers."""
+    """Account for one Lanczos basis, validation blocks and bounded temporaries."""
     vector = dimension * np.dtype(np.float32).itemsize
-    basis_buffers = 2 * max_basis * vector
+    basis_buffers = max_basis * vector
     active = (2 * block_size + 3) * vector
     coordinate_chunk = min(dimension, 1 << 20)
-    # Peak: FP64 views/copies for Q, GQ, Ritz U/AU and restart multiplication.
+    # Peak: FP64 basis conversion plus retained restart output coexist.
     chunk_workspace = (2 * max_basis + 2 * block_size + 2) * coordinate_chunk * 8
     projection = 4 * max_basis * max_basis * np.dtype(np.float64).itemsize
     transfer = 2 * vector
@@ -55,35 +54,6 @@ def memory_preflight(dimension, max_basis, block_size, *, reserve_bytes=8 << 30)
                 basis_buffer_bytes=basis_buffers,
                 fp64_chunk_workspace_bytes=chunk_workspace,
                 reserve_bytes=reserve_bytes)
-
-
-def _orthogonalize(vector, basis, count, *, tolerance=1e-7, chunk=1 << 20):
-    """Two-pass FP64-coefficient modified Gram--Schmidt."""
-    value = np.asarray(vector, dtype=np.float32).copy()
-    original = float(np.linalg.norm(value.astype(np.float64)))
-    for _ in range(2):
-        for start in range(0, count, 16):
-            stop = min(count, start + 16)
-            block = basis[start:stop]
-            coefficients = np.zeros(stop - start, np.float64)
-            for offset in range(0, value.size, chunk):
-                end = min(value.size, offset + chunk)
-                coefficients += block[:, offset:end].astype(np.float64) @ \
-                    value[offset:end].astype(np.float64)
-            value -= coefficients.astype(np.float32) @ block
-    norm = float(np.linalg.norm(value.astype(np.float64)))
-    if not math.isfinite(norm) or norm <= tolerance * max(original, 1.0):
-        return None
-    return value / np.float32(norm)
-
-
-def _replenish(rng, basis, count, attempts=32):
-    for _ in range(attempts):
-        candidate = _orthogonalize(
-            rng.choice(np.array([-1., 1.], np.float32), size=basis.shape[1]),
-            basis, count)
-        if candidate is not None: return candidate
-    return None
 
 
 def _transform_chunked(source, coefficients, destination, *, chunk=1 << 20):
@@ -102,27 +72,6 @@ def _transform_in_place(buffer, count, coefficients, *, chunk=1 << 20):
         buffer[:keep, start:stop] = transformed.astype(np.float32)
 
 
-def _residual_directions(q, gq, coefficients, values, *, chunk=1 << 20):
-    """Form an ordered block of Ritz residuals with one basis scan per chunk."""
-    directions = np.empty((len(values), q.shape[1]), np.float32)
-    for start in range(0, q.shape[1], chunk):
-        stop = min(q.shape[1], start + chunk)
-        image = coefficients.T @ gq[:, start:stop].astype(np.float64)
-        ritz = coefficients.T @ q[:, start:stop].astype(np.float64)
-        image -= values[:, None] * ritz
-        directions[:, start:stop] = image
-    return directions
-
-
-def _small_projection(q, gq, count, *, chunk=1 << 20):
-    projection = np.zeros((count, count), np.float64)
-    for start in range(0, q.shape[1], chunk):
-        stop = min(q.shape[1], start + chunk)
-        projection += q[:count, start:stop].astype(np.float64) @ \
-            gq[:count, start:stop].astype(np.float64).T
-    return .5 * (projection + projection.T)
-
-
 def _gram(q, count, *, chunk=1 << 20):
     result = np.zeros((count, count), np.float64)
     for start in range(0, q.shape[1], chunk):
@@ -132,193 +81,204 @@ def _gram(q, count, *, chunk=1 << 20):
     return result
 
 
+def _norm(vector):
+    # FP64 accumulation without a parameter-sized FP64 allocation.
+    return float(np.sqrt(np.einsum('i,i->', vector, vector, dtype=np.float64)))
+
+
+def _reorthogonalize(value, basis):
+    """One FP32 overlap scan; correct only when orthogonality is at risk.
+
+    Two corrective passes are used when triggered. This is adaptive full
+    reorthogonalization, not a claim to implement a PRO error-bound recurrence.
+    """
+    norm = _norm(value)
+    coefficients = basis @ value
+    threshold = 8 * np.finfo(np.float32).eps * norm
+    if _norm(coefficients) > threshold:
+        value -= coefficients @ basis
+        value -= (basis @ value) @ basis
+    return value
+
+
 def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, block_size=4,
                           max_basis=160, restart_keep=120, max_products=600,
                           residual_tol=.01, stability_tol=.02, seed=0,
                           progress=None):
-    """Estimate leading algebraic eigenvalues; unresolved output stays explicit."""
-    if not 0 < top_k <= restart_keep < max_basis:
-        raise ValueError('require 0 < top_k <= restart_keep < max_basis')
+    """Leading algebraic eigenvalues of a fixed symmetric PSD operator.
+
+    block_size is the small projected-eigensolve cadence. max_products includes
+    fresh validation of all top_k pairs. Failure never publishes scalar values.
+    """
+    if not 0 < top_k <= restart_keep < max_basis or dimension < top_k:
+        raise ValueError('require 0 < top_k <= restart_keep < max_basis and dimension >= top_k')
     if block_size <= 0 or max_products < top_k + 3:
         raise ValueError('invalid block size or GN-product budget')
+    if not (0 < residual_tol < 1 and 0 <= stability_tol < 1):
+        raise ValueError('invalid spectrum tolerances')
+    max_basis = min(max_basis, dimension)
     memory = memory_preflight(dimension, max_basis, block_size)
     started, rng = time.monotonic(), np.random.default_rng(seed)
     q = np.empty((max_basis, dimension), np.float32)
-    gq = np.empty_like(q)
-    validation_ranks = tuple(rank for rank in (1, 10, 100) if rank <= top_k)
-    expansion_budget = max_products - len(validation_ranks)
-    count = products = 0
+    h = np.zeros((max_basis, max_basis), np.float64)
+    expansion_budget = max_products - top_k
+    count = products = restart_count = 0
     previous = None
-    stable = False
-    failure = []
+    stable = accepted = False
+    failure, direct = [], {}
     candidate_values = candidate_residuals = vectors = None
     orthogonality_error = math.inf
-    restart_count = 0
     timings = {name: 0. for name in (
         'operator', 'orthogonalization', 'gram', 'projection', 'eigensolve',
         'ritz_residuals', 'expansion', 'restart', 'validation')}
 
-    def add_vector(vector):
-        nonlocal count, products
-        if products >= expansion_budget or count >= max_basis:
-            return False
+    def random_direction():
+        for _ in range(8):
+            value = rng.standard_normal(dimension, dtype=np.float32)
+            value = _reorthogonalize(value, q[:count])
+            norm = _norm(value)
+            if norm > 1e-6:
+                return value / np.float32(norm)
+        return None
+
+    def apply(value):
+        nonlocal products
         timer = time.monotonic()
-        vector = _orthogonalize(vector, q, count)
-        if vector is None:
-            vector = _replenish(rng, q, count)
-        timings['orthogonalization'] += time.monotonic() - timer
-        if vector is None:
-            failure.append('basis_breakdown'); return False
-        timer = time.monotonic()
-        image = np.asarray(apply_operator(vector.copy()), np.float32)
+        image = np.asarray(apply_operator(value.copy()), np.float32)
         timings['operator'] += time.monotonic() - timer
         products += 1
+        if progress and products % 10 == 0:
+            progress(products, max_products)
         if image.shape != (dimension,) or not np.all(np.isfinite(image)):
-            failure.append('invalid_operator_product'); return False
-        q[count], gq[count] = vector, image
-        count += 1
-        if progress and products % 10 == 0: progress(products, max_products)
-        return True
+            raise ValueError('invalid_operator_product')
+        return image.copy()
 
-    for _ in range(min(block_size, expansion_budget)):
-        if not add_vector(rng.choice(np.array([-1., 1.], np.float32), dimension)): break
-
-    while count and not failure:
+    next_vector = random_direction()
+    while products < expansion_budget:
+        q[count] = next_vector
+        try:
+            w = apply(next_vector)
+        except ValueError as error:
+            if str(error) != 'invalid_operator_product': raise
+            failure.append(str(error)); break
         timer = time.monotonic()
-        gram = _gram(q, count)
-        orthogonality_error = float(np.linalg.norm(gram - np.eye(count), ord=np.inf))
-        timings['gram'] += time.monotonic() - timer
-        if not np.all(np.isfinite(gram)) or orthogonality_error > 1e-3:
-            failure.append('invalid_orthonormal_basis'); break
-        timer = time.monotonic()
-        projection = _small_projection(q, gq, count)
-        timings['projection'] += time.monotonic() - timer
-        timer = time.monotonic()
-        values, vectors = np.linalg.eigh(projection)
-        order = np.argsort(values)[::-1]
-        values, vectors = values[order], vectors[:, order]
-        timings['eigensolve'] += time.monotonic() - timer
-        take = min(top_k, count)
-        candidate_values = values[:take].copy()
-        timer = time.monotonic()
-        residual_squared = np.zeros(take, np.float64)
-        for offset in range(0, dimension, 1 << 20):
-            end = min(dimension, offset + (1 << 20))
-            u = vectors[:, :take].T @ q[:count, offset:end].astype(np.float64)
-            au = vectors[:, :take].T @ gq[:count, offset:end].astype(np.float64)
-            residual_squared += np.sum(
-                (au - candidate_values[:, None] * u) ** 2, axis=1)
-        candidate_residuals = np.sqrt(residual_squared) / np.maximum(
-            np.abs(candidate_values), np.finfo(np.float64).eps)
-        timings['ritz_residuals'] += time.monotonic() - timer
-        stable = False
-        if previous is not None and len(previous) >= top_k and take >= top_k:
-            relative_change = (
-                np.abs(candidate_values[:top_k] - previous[:top_k])
-                / np.maximum(np.abs(candidate_values[:top_k]), 1e-30)
-            )
-            stable = bool(np.all(relative_change <= stability_tol))
-        previous = candidate_values.copy()
-        positive_ordered = (take >= top_k
-            and np.all(np.isfinite(candidate_values[:top_k]))
-            and np.all(candidate_values[:top_k] > 0)
-            and np.all(candidate_values[:top_k - 1] >= candidate_values[1:top_k]))
-        accepted_ritz = (positive_ordered and stable
-                         and np.all(candidate_residuals[:top_k] <= residual_tol))
-        if accepted_ritz: break
-        if products >= expansion_budget:
-            failure.append('product_budget_exhausted'); break
-
-        # Target the least-converged wanted Ritz vectors, wherever they occur in
-        # the requested spectrum (including the rank-top_k frontier).
-        timer = time.monotonic()
-        wanted = np.argsort(candidate_residuals)[
-            -min(block_size, take):
-        ][::-1]
-        residual_directions = _residual_directions(
-            q[:count], gq[:count], vectors[:, wanted], candidate_values[wanted])
+        image_norm = _norm(w)
+        # Three-term recurrence except for the first step after thick restart.
+        nonzero = np.flatnonzero(h[:count, count])
+        for index in nonzero:
+            w -= np.float32(h[index, count]) * q[index]
+        alpha = float(np.einsum('i,i->', next_vector, w, dtype=np.float64))
+        h[count, count] = alpha
+        w -= np.float32(alpha) * next_vector
         timings['expansion'] += time.monotonic() - timer
-
-        if count + len(residual_directions) > max_basis:
+        timer = time.monotonic()
+        w = _reorthogonalize(w, q[:count + 1])
+        beta = _norm(w)
+        timings['orthogonalization'] += time.monotonic() - timer
+        count += 1
+        breakdown = beta <= 32 * np.finfo(np.float32).eps * max(image_norm, 1e-30)
+        check = (count >= top_k and (products % block_size == 0 or breakdown
+                 or count == max_basis or products == expansion_budget))
+        if check:
             timer = time.monotonic()
-            restart_count += 1
-            keep = min(restart_keep, count)
-            coefficients = vectors[:, :keep].copy()
-            _transform_in_place(q, count, coefficients)
-            _transform_in_place(gq, count, coefficients)
+            values, vectors = np.linalg.eigh(h[:count, :count])
+            values, vectors = values[::-1], vectors[:, ::-1]
+            timings['eigensolve'] += time.monotonic() - timer
+            candidate_values = values[:top_k].copy()
+            timer = time.monotonic()
+            candidate_residuals = beta * np.abs(vectors[-1, :top_k]) / np.maximum(
+                np.abs(candidate_values), np.finfo(np.float64).eps)
+            stable = previous is not None and bool(np.all(
+                np.abs(candidate_values - previous) / np.maximum(
+                    np.abs(candidate_values), 1e-30) <= stability_tol))
+            # A complete orthonormal basis has no unexplored subspace.
+            stable = stable or count == dimension
+            previous = candidate_values.copy()
+            timings['ritz_residuals'] += time.monotonic() - timer
+            if (stable and np.all(candidate_values > 0)
+                    and np.all(np.isfinite(candidate_values))
+                    and np.all(candidate_residuals <= residual_tol)):
+                accepted = True
+                break
+        if products == expansion_budget:
+            break
+        if count == dimension:
+            failure.append('acceptance_checks_failed'); break
+        if breakdown:
+            timer = time.monotonic()
+            next_vector = random_direction()
+            timings['orthogonalization'] += time.monotonic() - timer
+            beta = 0.
+            if next_vector is None:
+                failure.append('basis_breakdown'); break
+        else:
+            next_vector = w / np.float32(beta)
+        if count == max_basis:
+            timer = time.monotonic()
+            keep = min(restart_keep, count - 1)
+            _transform_in_place(q, count, vectors[:, :keep])
+            h.fill(0)
+            h[np.arange(keep), np.arange(keep)] = values[:keep]
+            h[:keep, keep] = h[keep, :keep] = beta * vectors[-1, :keep]
             count = keep
-            # Q and GQ receive exactly the same Ritz transformation; because Y
-            # is orthogonal, no independent reorthogonalization is necessary.
-            restart_gram = _gram(q, count)
+            restart_count += 1
             timings['restart'] += time.monotonic() - timer
-            if np.linalg.norm(restart_gram - np.eye(count), ord=np.inf) > 1e-3:
-                failure.append('restart_orthogonality'); break
+        else:
+            h[count - 1, count] = h[count, count - 1] = beta
 
-        added = 0
-        for direction in residual_directions:
-            if add_vector(direction): added += 1
-            if products >= expansion_budget: break
-        while added < block_size and products < expansion_budget and count < max_basis:
-            if not add_vector(rng.choice(np.array([-1., 1.], np.float32), dimension)): break
-            added += 1
-        if added == 0:
-            failure.append('incomplete_expansion'); break
-
-    accepted = False
-    direct = {}
-    if (not failure and candidate_values is not None and len(candidate_values) >= top_k
-            and stable and np.all(candidate_residuals[:top_k] <= residual_tol)):
-        accepted = True
-        # Coefficients and Q are still the exact pair used for the accepted Ritz solve.
-        for rank in validation_ranks:
-            timer = time.monotonic()
-            coefficients = vectors[:, rank - 1]
-            eigenvector = np.zeros(dimension, np.float32)
-            _transform_chunked(q[:count], coefficients[:, None], eigenvector[None, :])
-            timings['validation'] += time.monotonic() - timer
-            timer = time.monotonic()
-            image = np.asarray(apply_operator(eigenvector), np.float32); products += 1
-            timings['operator'] += time.monotonic() - timer
-            timer = time.monotonic()
-            residual = np.linalg.norm((image - candidate_values[rank - 1] * eigenvector).astype(np.float64)) / \
-                max(abs(candidate_values[rank - 1]), np.finfo(np.float64).eps)
-            timings['validation'] += time.monotonic() - timer
-            direct[rank] = float(residual)
-            accepted &= math.isfinite(residual) and residual <= residual_tol
-    if not accepted and not failure: failure.append('acceptance_checks_failed')
-    scalars = dict(accepted=accepted, gn_products=products,
+    if accepted:
+        timer = time.monotonic()
+        orthogonality_error = float(np.linalg.norm(
+            _gram(q, count) - np.eye(count), ord=np.inf))
+        timings['gram'] += time.monotonic() - timer
+        if not math.isfinite(orthogonality_error) or orthogonality_error > 1e-3:
+            accepted = False
+            failure.append('invalid_orthonormal_basis')
+        else:
+            # Batched reconstruction; never retain all top_k parameter vectors.
+            for start in range(0, top_k, block_size):
+                timer = time.monotonic()
+                stop = min(top_k, start + block_size)
+                u = np.empty((stop - start, dimension), np.float32)
+                _transform_chunked(q[:count], vectors[:, start:stop], u)
+                timings['validation'] += time.monotonic() - timer
+                for index, vector in enumerate(u, start):
+                    try:
+                        image = apply(vector)
+                    except ValueError as error:
+                        if str(error) != 'invalid_operator_product': raise
+                        failure.append(str(error)); accepted = False; break
+                    timer = time.monotonic()
+                    norm = _norm(vector)
+                    residual = _norm(image - np.float32(candidate_values[index]) * vector) / max(
+                        abs(candidate_values[index]) * norm, np.finfo(np.float64).eps)
+                    direct[index + 1] = residual
+                    accepted &= math.isfinite(residual) and residual <= residual_tol
+                    timings['validation'] += time.monotonic() - timer
+                if failure: break
+            if not accepted and not failure:
+                failure.append('direct_residual_failed')
+    if not accepted and not failure:
+        failure.append('product_budget_exhausted')
+    scalars = dict(accepted=bool(accepted), gn_products=products,
                    seconds=time.monotonic() - started,
                    restart_count=restart_count, basis_size=count,
                    orthogonality_error=orthogonality_error,
-                   max_relative_ritz_residual=(
-                       float(np.max(candidate_residuals[:top_k]))
+                   max_relative_ritz_residual=(float(np.max(candidate_residuals))
                        if candidate_residuals is not None else None),
                    memory_required_gib=memory['required_bytes'] / 2**30)
     scalars.update({f'seconds_{name}': value for name, value in timings.items()})
-    for rank in (1, 10, 100):
+    # Keep legacy absent-rank fields for dashboard compatibility.
+    for rank in sorted({1, 10, 100, top_k, *range(10, top_k + 1, 10)}):
         scalars[f'lambda_{rank}_est'] = (float(candidate_values[rank - 1])
-            if accepted and candidate_values is not None and len(candidate_values) >= rank else None)
-    lambda_1 = scalars["lambda_1_est"]
-    lambda_10 = scalars["lambda_10_est"]
-    lambda_100 = scalars["lambda_100_est"]
-    scalars["top10_condition_est"] = (
-        lambda_1 / lambda_10
-        if (accepted and lambda_1 is not None and lambda_10 is not None
-            and 0 < lambda_10 <= lambda_1) else None)
-    scalars["top100_condition_est"] = (
-        lambda_1 / lambda_100
-        if (
-            accepted
-            and lambda_1 is not None
-            and lambda_100 is not None
-            and 0 < lambda_100 <= lambda_1
-        )
-        else None
-    )
-    table = dict(values=(candidate_values.tolist() if candidate_values is not None else []),
-                 residuals=(candidate_residuals.tolist() if candidate_residuals is not None else []),
+            if accepted and rank <= top_k else None)
+    for rank in (10, 100):
+        endpoint = scalars[f'lambda_{rank}_est']
+        scalars[f'top{rank}_condition_est'] = (
+            scalars['lambda_1_est'] / endpoint if endpoint is not None else None)
+    table = dict(values=candidate_values.tolist() if candidate_values is not None else [],
+                 residuals=candidate_residuals.tolist() if candidate_residuals is not None else [],
                  direct_residuals=direct, failure_reasons=failure,
                  orthogonality_error=orthogonality_error,
-                 restart_count=restart_count,
-                 memory_preflight=memory)
+                 restart_count=restart_count, memory_preflight=memory)
     return scalars, table

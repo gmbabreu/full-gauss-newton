@@ -81,21 +81,43 @@ identity shift, avoiding premature convergence on an identity-dominated `P`.
 
 ### CPU-resident top-100 spectrum
 
-`--condition_log=True` includes a thick-restarted block
-Rayleigh--Ritz estimate of raw `G`; `spectrum_top_k` defaults to 100. Its FP32 basis and restart destination stay
-on CPU; projection coefficients and the small eigendecomposition use FP64. A
-preflight includes both basis buffers, active blocks, projection/transfer
-workspace, cgroup-aware available memory, and an 8 GiB reserve. At 150M
-parameters, the two 160-vector buffers alone are about 179 GiB. The diagnostic
-refuses unsupported multi-host runs and insufficient host memory; this is not a
-claim that a real measurement will fit or converge.
+`--condition_log=True` includes a thick-restarted Lanczos estimate of raw
+`G`; `spectrum_top_k` defaults to 100. One FP32 basis stays on CPU. The small
+symmetric recurrence matrix and its eigendecomposition use FP64. A preflight
+includes the basis, active blocks, bounded transformation/transfer workspace,
+cgroup-aware available memory, and an 8 GiB reserve. At 150M parameters, one
+160-vector buffer is about 89.4 GiB, before workspace and reserve. The diagnostic
+refuses unsupported multi-host runs and insufficient host memory.
 
-The restart preserves `GQ=QH+FC` and, for `U=QY`, the residual coupling in
-`GU=UTheta+FCY`; it does not drop coupling to force a three-term recurrence.
-All GN products are sequential and use the same frozen batch and microbatch
-weighting as routine diagnostics. Candidate values, residuals, and failure
-details are logged in one small W&B table, while accepted ranks 1, 10, and 100
-are scalar metrics only after stability and residual checks pass.
+The short recurrence uses an FP32 overlap scan and adaptive two-pass corrective
+reorthogonalization. Thick restart retains `spectrum_restart_keep` Ritz vectors
+and their residual coupling `beta * Y[-1, :keep]`, producing an arrowhead
+projection before ordinary Lanczos expansion resumes. Numerical breakdown
+starts a random direction orthogonal to the current basis. The old residual
+expansion solver and stored `GQ` buffer have been removed.
+
+`spectrum_block_size` now controls the projected-eigensolve cadence and the
+bounded validation reconstruction batch (not a block Lanczos recurrence).
+Recurrence residuals screen convergence, together with the existing eigenvalue
+stability tolerance. Before acceptance, a full Gram check and **fresh direct
+residual checks of all top-k eigenpairs** guard against recurrence drift and
+lost orthogonality. Consequently `spectrum_max_gn_products=600` reserves 100
+products for final validation when `spectrum_top_k=100`. This budget includes
+all spectrum operator calls; PCG endpoint work remains separate.
+
+All products use the same frozen parameters, batch and microbatch weighting.
+Candidate values and failure details remain in the W&B table. Accepted scalar
+metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
+(`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is
+not divisible by ten. Intermediate ranks need no additional eigensolve or
+operator products for logging. Unresolved estimates remain withheld. Historical
+phase timing keys remain, with zero for removed projection work.
+
+Lanczos still uses Rayleigh--Ritz on a small recurrence matrix. Its advantage
+here is avoiding repeated full-basis projection/residual reconstruction and
+storing only one basis, not making the small eigensolve faster. Direct residuals
+are not a proof that no larger eigenvalue was missed; independent-seed and
+larger-budget repeats remain useful controls. TPU-host speedup must be measured.
 
 Suggested validation commands (run on a host with JAX and sufficient RAM):
 
