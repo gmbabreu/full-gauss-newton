@@ -53,11 +53,13 @@ is used. Dropout and FCM must be disabled. `cg_n_micro` microbatches diagnostic
 `Gv` for every supported solver, including Muon; it does not microbatch Muon's
 inner training solve.
 
-An accepted top-k result supplies `condition/G/lambda_max_est` without another
-power run. If top-k convergence fails, a power estimate of the maximum is still
-attempted. Existing `spectrum/G/*` and `condition/*` metric names are preserved.
-The combined `condition/gn_products` and `condition/seconds` include spectrum,
-endpoint, and trace work. Per-phase spectrum timings remain available.
+An accepted top-k result supplies `spectrum/G/lambda_1_est`; the largest
+eigenvalue is not recomputed. If top-k convergence fails, a power estimate is
+still attempted and recorded as `spectrum/G/fallback_lambda_max_est`. Raw-G
+metrics live only under `spectrum/G/*`. W&B retains the accepted eigenvalues,
+top-10/top-100 ratios, residual and orthogonality checks, basis size, total raw-G
+products, elapsed time, and failure details when unresolved. Detailed phase and
+transfer timings remain in terminal output rather than W&B.
 
 `A`'s maximum uses power iteration; its minimum uses inverse iteration with
 compiled, diagonally preconditioned inner CG solves. Defaults are
@@ -65,19 +67,17 @@ compiled, diagonally preconditioned inner CG solves. Defaults are
 `condition_num_starts=2`, `condition_inner_cg_maxiter=100`, and
 `condition_inner_cg_tol=0.001`. Actual inner-solve residuals, eigenpair residuals,
 and agreement between starts must pass; unresolved minima and condition ratios
-are withheld. `condition/A/lambda_min_est` and `condition/A/condition_est` are
+are withheld. `spectrum/A/lambda_min_est` and `spectrum/A/condition_est` are
 estimates, not certified spectral bounds. Singular undamped systems may remain
 unresolved. Inverse iteration adds GN products beyond the spectrum product
-budget; its cap is separate. TPU memory and runtime of this new minimum path
-still need user-operated validation.
-
-Four unnormalised Rademacher probes remain the default for trace and
-trace-square estimates and rough sample standard errors. The same `Gz` is
-reused for `A`; no preconditioned trace estimate is attempted. For `P=cI+B`,
-the maximum is found on `B=lambda*D^-1/2*G*D^-1/2` before adding the known
-identity shift, avoiding premature convergence on an identity-dominated `P`.
-`spectral_concentration_est=n*lambda_max_est/trace_est` and
-`damping_condition_proxy=p_lambda_max_est/c` are descriptive proxies.
+budget; its cap is separate. All damped and preconditioned results live under
+`spectrum/A/*`; preconditioned fields use a `preconditioned_` prefix. For
+`P=cI+B`, the maximum is found on
+`B=lambda*D^-1/2*G*D^-1/2` before adding the known identity shift, avoiding
+premature convergence on an identity-dominated `P`. The descriptive
+`preconditioned_damping_condition_proxy` is retained. Trace and trace-square
+probes are no longer run by the trainer because they added full GN products but
+were not needed for the eigenvalue objective.
 
 ### CPU-resident top-100 spectrum
 
@@ -107,12 +107,13 @@ top-k) guard against recurrence drift and lost orthogonality. Consequently
 endpoint work remains separate.
 
 All products use the same frozen parameters, batch and microbatch weighting.
-Candidate values and failure details remain in the W&B table. Accepted scalar
-metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
+Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
 (`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is
 not divisible by ten. Intermediate ranks need no additional eigensolve or
-operator products for logging. Unresolved estimates remain withheld. Historical
-phase timing keys remain, with zero for removed projection work.
+operator products for logging. Unresolved estimates remain withheld. Candidate
+tables, memory estimates, and historical phase timing keys are omitted from
+W&B to keep the dashboard compact; the terminal completion record remains
+detailed enough for performance debugging.
 
 Lanczos still uses Rayleigh--Ritz on a small recurrence matrix. Its advantage
 here is avoiding repeated full-basis projection/residual reconstruction and
@@ -135,9 +136,10 @@ python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum
 python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_max_gn_products=1200
 ```
 
-The diagnostic controls, including `condition_trace_probes`, may change on exact
-resume. A legacy checkpoint with `cg_log_matrix_norms=True` is rejected because
-that old logging path changed effective lambda and therefore the trajectory.
+The diagnostic controls may change on exact resume. The retired
+`condition_trace_probes` field is ignored when reading legacy checkpoints. A
+legacy checkpoint with `cg_log_matrix_norms=True` is rejected because that old
+logging path changed effective lambda and therefore the trajectory.
 
 ## Data order and compatibility
 

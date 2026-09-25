@@ -160,7 +160,6 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     condition_num_starts=2,
     condition_agreement_tol=0.05,
     condition_eigen_residual_tol=0.05,
-    condition_trace_probes=4,
     spectrum_top_k=100,
     spectrum_block_size=4,
     spectrum_max_basis=160,
@@ -269,8 +268,7 @@ def main(argv):
                 'Condition diagnostics support CG, Adam-GN, and Muon-GN only')
         if FLAGS.condition_every <= 0:
             raise ValueError('condition cadence must be positive')
-        if FLAGS.condition_top_maxiter < 3 or FLAGS.condition_num_starts < 2 \
-                or FLAGS.condition_trace_probes < 2:
+        if FLAGS.condition_top_maxiter < 3 or FLAGS.condition_num_starts < 2:
             raise ValueError('Condition diagnostics require positive budgets, '
                              'at least three outer iterations, and two starts')
         if not 0 < FLAGS.condition_agreement_tol < 1 \
@@ -1445,17 +1443,6 @@ def main(argv):
 
         condition_power_solvers = {}
 
-        def flatten_condition(prefix, report):
-            """Select logger-safe scalar records; vectors never leave the module."""
-            names = ('lambda_max_est', 'lambda_max_residual',
-                     'lambda_min_est', 'lambda_min_residual', 'condition_est', 'resolved',
-                     'operator_matvecs', 'seconds', 'damping_condition_proxy')
-            result = {f'condition/{prefix}/{name}': report[name]
-                      for name in names if report.get(name) is not None}
-            result[f'condition/{prefix}/failure_reasons'] = ','.join(
-                report.get('failure_reasons', ()))
-            return result
-
         def run_condition_diagnostics(params, solve_batch, *, cg_diagonal=None,
                                       effective_lambda=None, safe_adam_lr=None):
             """Host controller over explicitly sharded immutable Gv kernels."""
@@ -1523,57 +1510,67 @@ def main(argv):
             spectrum_scalars.update({
                 f'seconds_{name}': value
                 for name, value in spectrum_transfer_seconds.items()})
-            metrics_out.update({f'spectrum/G/{name}': value
-                                for name, value in spectrum_scalars.items()
-                                if value is not None})
-            failure_text = ','.join(spectrum_table['failure_reasons'])
-            rows = [[index + 1, value,
-                     spectrum_table['residuals'][index]
-                     if index < len(spectrum_table['residuals']) else None,
-                     spectrum_table['direct_residuals'].get(index + 1),
-                     spectrum_scalars['accepted'], failure_text]
-                    for index, value in enumerate(spectrum_table['values'])]
-            metrics_out['spectrum/G/candidates'] = wandb.Table(
-                columns=['rank', 'value', 'ritz_residual', 'direct_residual',
-                         'accepted', 'failure_reasons'], data=rows)
-            metrics_out['spectrum/G/failure_reasons'] = ','.join(
-                spectrum_table['failure_reasons'])
             if spectrum_scalars['accepted']:
                 spectrum_max = spectrum_scalars['lambda_1_est']
             print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: end ' +
                   str(spectrum_scalars), flush=True)
-            metrics_out['spectrum/G/seconds_total'] = timeit.default_timer() - spectrum_started
-            if 'G' not in condition_power_solvers:
-                condition_power_solvers['G'] = matrix_condition.make_power_solver(
-                    apply_g, maxiter=FLAGS.condition_top_maxiter,
-                    agreement_tol=FLAGS.condition_agreement_tol,
-                    residual_tol=FLAGS.condition_eigen_residual_tol)
             options = dict(top_maxiter=FLAGS.condition_top_maxiter,
                 num_starts=FLAGS.condition_num_starts,
                 agreement_tol=FLAGS.condition_agreement_tol,
                 residual_tol=FLAGS.condition_eigen_residual_tol, key=key)
-            print('[condition] G: start', flush=True)
             if spectrum_max is None:
+                if 'G' not in condition_power_solvers:
+                    condition_power_solvers['G'] = matrix_condition.make_power_solver(
+                        apply_g, maxiter=FLAGS.condition_top_maxiter,
+                        agreement_tol=FLAGS.condition_agreement_tol,
+                        residual_tol=FLAGS.condition_eigen_residual_tol)
+                print('[spectrum] G fallback maximum: start', flush=True)
                 g_report = matrix_condition.condition_diagnostic(apply_g, params,
                     compiled_power_solver=condition_power_solvers['G'],
                     operator_args=g_operator_args, **options)
+                print('[spectrum] G fallback maximum: end ' + str({name: g_report[name]
+                    for name in ('lambda_max_est', 'resolved', 'failure_reasons')}),
+                    flush=True)
             else:
-                g_report = dict(lambda_max_est=spectrum_max,
-                    lambda_max_residual=None, resolved=True, failure_reasons=(),
-                    operator_matvecs=0, seconds=0., top={'source': 'spectrum'})
-            print('[condition] G: end ' + str({name: g_report[name]
-                for name in ('lambda_max_est', 'resolved')}), flush=True)
-            metrics_out.update(flatten_condition('G', g_report))
+                g_report = None
             total_products = (spectrum_scalars['gn_products']
-                              + g_report['operator_matvecs'])
+                              + (g_report['operator_matvecs']
+                                 if g_report is not None else 0))
+            direct_residuals = spectrum_table['direct_residuals']
+            g_metrics = {
+                'accepted': spectrum_scalars['accepted'],
+                'gn_products': total_products,
+                'seconds': timeit.default_timer() - spectrum_started,
+                'basis_size': spectrum_scalars['basis_size'],
+                'orthogonality_error': spectrum_scalars['orthogonality_error'],
+                'max_relative_ritz_residual':
+                    spectrum_scalars['max_relative_ritz_residual'],
+                'max_direct_residual': (max(direct_residuals.values())
+                                        if direct_residuals else None),
+                'top10_condition_est': spectrum_scalars['top10_condition_est'],
+                'top100_condition_est': spectrum_scalars['top100_condition_est'],
+            }
+            g_metrics.update({name: value for name, value in spectrum_scalars.items()
+                              if name.startswith('lambda_') and value is not None})
+            if not spectrum_scalars['accepted']:
+                g_metrics['failure_reasons'] = ','.join(
+                    spectrum_table['failure_reasons'])
+                g_metrics.update({
+                    'fallback_lambda_max_est': g_report['lambda_max_est'],
+                    'fallback_lambda_max_residual':
+                        g_report['lambda_max_residual'],
+                    'fallback_resolved': g_report['resolved'],
+                })
+                if not g_report['resolved']:
+                    g_metrics['fallback_failure_reasons'] = ','.join(
+                        g_report['failure_reasons'])
+            metrics_out.update({f'spectrum/G/{name}': value
+                                for name, value in g_metrics.items()
+                                if value is not None})
 
-            apply_a_from_g = None
             if cg_diagonal is not None:
+                a_started = timeit.default_timer()
                 c = (1.0 - effective_lambda) / safe_adam_lr
-                def apply_a_from_g(gv, vector):
-                    return jax.tree.map(
-                        lambda g, v, d: effective_lambda * g + c * d * v,
-                        gv, vector, cg_diagonal)
                 def apply_a(vector, diagnostic_params, diagnostic_batch,
                             diagonal, interpolation, learning_rate):
                     coefficient = (1.0 - interpolation) / learning_rate
@@ -1613,50 +1610,53 @@ def main(argv):
                             apply_b, maxiter=FLAGS.condition_top_maxiter,
                             agreement_tol=FLAGS.condition_agreement_tol,
                             residual_tol=FLAGS.condition_eigen_residual_tol)
-                print('[condition] A: start', flush=True)
+                print('[spectrum] A: start', flush=True)
                 a_report = matrix_condition.damped_condition_diagnostic(apply_a, params,
                     operator_args=a_operator_args,
                     compiled_power_solver=condition_power_solvers['A'],
                     compiled_inverse_solver=condition_power_solvers['A_inverse'], **options)
-                print('[condition] A: end ' + str({name: a_report[name]
+                print('[spectrum] A: end ' + str({name: a_report[name]
                     for name in ('lambda_max_est', 'lambda_min_est',
                                  'condition_est', 'resolved', 'failure_reasons')}), flush=True)
-                print('[condition] A_preconditioned: start', flush=True)
+                print('[spectrum] A preconditioned: start', flush=True)
                 p_report = matrix_condition.preconditioned_condition_diagnostic(
                     apply_b, apply_p, params, c,
                     operator_args=a_operator_args,
                     compiled_power_solver=condition_power_solvers[
                         'A_preconditioned_B'],
                     effective_lambda=effective_lambda, **options)
-                print('[condition] A_preconditioned: end ' + str({name: p_report[name]
+                print('[spectrum] A preconditioned: end ' + str({name: p_report[name]
                     for name in ('lambda_max_est', 'resolved')}), flush=True)
-                metrics_out.update(flatten_condition('A', a_report))
-                metrics_out.update(flatten_condition('A_preconditioned', p_report))
-                metrics_out.update({f'condition/{name}': value for name, value in
-                    matrix_condition.structural_lower_bounds(
-                        effective_lambda, safe_adam_lr, cg_diagonal).items()})
-                total_products += a_report['operator_matvecs'] + p_report['operator_matvecs']
+                a_products = (a_report['operator_matvecs']
+                              + p_report['operator_matvecs'])
+                a_metrics = {
+                    name: a_report.get(name) for name in (
+                        'lambda_max_est', 'lambda_max_residual',
+                        'lambda_min_est', 'lambda_min_residual',
+                        'condition_est', 'resolved')}
+                a_metrics.update({
+                    'preconditioned_lambda_max_est': p_report['lambda_max_est'],
+                    'preconditioned_lambda_max_residual':
+                        p_report['lambda_max_residual'],
+                    'preconditioned_damping_condition_proxy':
+                        p_report['damping_condition_proxy'],
+                    'preconditioned_resolved': p_report['resolved'],
+                    'gn_products': a_products,
+                    'seconds': timeit.default_timer() - a_started,
+                })
+                if not a_report['resolved']:
+                    a_metrics['failure_reasons'] = ','.join(
+                        a_report['failure_reasons'])
+                if not p_report['resolved']:
+                    a_metrics['preconditioned_failure_reasons'] = ','.join(
+                        p_report['failure_reasons'])
+                metrics_out.update({f'spectrum/A/{name}': value
+                                    for name, value in a_metrics.items()
+                                    if value is not None})
+                total_products += a_products
 
-            # A uses the same Gz as G and therefore adds no GN products.
-            probe_samples = matrix_condition.probe_operators(
-                lambda vector: apply_g(vector, *g_operator_args), params,
-                num_probes=FLAGS.condition_trace_probes,
-                key=jax.random.fold_in(key, 0x54524143),
-                apply_a_from_g=apply_a_from_g)
-            total_products += FLAGS.condition_trace_probes
-            for operator_name, samples in probe_samples.items():
-                top = (g_report['lambda_max_est'] if operator_name == 'G'
-                       else a_report['lambda_max_est'])
-                dimension = sum(leaf.size for leaf in jax.tree.leaves(params))
-                summary = matrix_condition.summarize_probe_samples(
-                    *samples, top, dimension=dimension)
-                metrics_out.update({f'condition/{operator_name}/{name}': value
-                                    for name, value in summary.items()})
-            metrics_out['condition/operator_matvecs'] = total_products
-            metrics_out['condition/gn_products'] = total_products
-            metrics_out['condition/seconds'] = timeit.default_timer() - started
-            print('[condition] total: ' + str({
-                'seconds': metrics_out['condition/seconds'],
+            print('[spectrum] total: ' + str({
+                'seconds': timeit.default_timer() - started,
                 'gn_products': total_products}), flush=True)
             return metrics_out
 
@@ -2292,7 +2292,7 @@ def main(argv):
                         log_metrics = jax.device_get(log_metrics)
                         defer_wandb(log_metrics)
                         console_metrics = {k: v for k, v in log_metrics.items()
-                            if not k.startswith(('condition/', 'spectrum/'))}
+                            if not k.startswith('spectrum/')}
                         tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                         
                         stop_after_log = True
@@ -2319,7 +2319,7 @@ def main(argv):
                                    and (step + 1) % FLAGS.save_milestone_freq == 0))
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
                 console_metrics = {k: v for k, v in log_metrics.items()
-                    if not k.startswith(('condition/', 'spectrum/'))}
+                    if not k.startswith('spectrum/')}
                 tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                 if stop_after_log:
                     break

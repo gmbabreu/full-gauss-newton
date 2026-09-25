@@ -148,6 +148,7 @@ def validate_flags(saved, current):
         'condition_inner_cg_maxiter', 'condition_inner_cg_tol',
         'condition_num_starts', 'condition_agreement_tol',
         'condition_eigen_residual_tol', 'condition_shifts',
+        # Retired trace-probe control remains ignored for legacy checkpoints.
         'condition_trace_probes',
         # Retired switches remain ignored when reading legacy checkpoints.
         'spectrum_log', 'spectrum_every', 'spectrum_top_k',
