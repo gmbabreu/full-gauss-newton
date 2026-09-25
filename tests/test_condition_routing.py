@@ -1,10 +1,9 @@
-"""Exercise the trainer's actual diagnostic controller on small CPU operators."""
+"""Exercise the diagnostic controller directly on small CPU operators."""
 import ast
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
 from types import SimpleNamespace
-import timeit
 import unittest
 from unittest.mock import patch
 
@@ -13,16 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from EasyLM import matrix_condition, matrix_spectrum, cg_resume
+from EasyLM.condition_diagnostics import ConditionDiagnostics
 
 TRAINER = Path(__file__).resolve().parents[1] / 'EasyLM/models/llama/llama_train_gn.py'
 
 
 class ConditionRoutingTest(unittest.TestCase):
     def setUp(self):
-        source = ast.parse(TRAINER.read_text())
-        nodes = {n.name: n for n in ast.walk(source) if isinstance(n, ast.FunctionDef)}
-        definitions = ast.Module(
-            body=[nodes['run_condition_diagnostics']], type_ignores=[])
         self.calls = []
         self.g = jnp.array([10., 7., 4., 3., 2., 1., .8, .6, .5, .4, .3, .2])
         def apply_g(params, batch, vector, wd):
@@ -36,19 +32,14 @@ class ConditionRoutingTest(unittest.TestCase):
             spectrum_endpoint_agreement_tol=1e-4,
             spectrum_endpoint_residual_tol=1e-4,
             spectrum_inverse_cg_maxiter=24, spectrum_inverse_cg_tol=1e-5)
-        self.namespace = dict(FLAGS=flags, jax=jax, jnp=jnp, np=np, timeit=timeit,
-            matrix_condition=matrix_condition, matrix_spectrum=matrix_spectrum,
-            step=0, condition_power_solvers={}, sharded_condition_apply_g=apply_g,
-            diagnostic_param_shards={'w': jnp.asarray})
-        exec(compile(ast.fix_missing_locations(definitions), str(TRAINER), 'exec'),
-             self.namespace)
-        self.run_diagnostics = self.namespace['run_condition_diagnostics']
+        self.diagnostics = ConditionDiagnostics(
+            config=flags, apply_g=apply_g, param_shards={'w': jnp.asarray})
         self.params = {'w': jnp.ones(12)}
 
     def run_controller(self, **kwargs):
         with redirect_stdout(io.StringIO()), patch.object(
                 matrix_spectrum, 'available_host_memory', return_value=10**15):
-            result = self.run_diagnostics(self.params, {}, **kwargs)
+            result = self.diagnostics.run(self.params, {}, step=0, **kwargs)
         jax.effects_barrier()
         self.assertFalse(any(key.startswith('condition/') for key in result))
         return result
@@ -89,7 +80,7 @@ class ConditionRoutingTest(unittest.TestCase):
                 + result['spectrum/A/gn_products'], len(self.calls))
 
     def test_failed_spectrum_falls_back_for_g_maximum(self):
-        self.namespace['FLAGS'].spectrum_max_gn_products = 5
+        self.diagnostics.config.spectrum_max_gn_products = 5
         result = self.run_controller()
         self.assertFalse(result['spectrum/G/accepted'])
         self.assertTrue(result['spectrum/G/fallback_resolved'])
@@ -97,6 +88,38 @@ class ConditionRoutingTest(unittest.TestCase):
             result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
         self.assertEqual(result['spectrum/G/gn_products'], len(self.calls))
         self.assertIn('spectrum/G/failure_reasons', result)
+
+    def test_cached_solvers_use_current_params_batch_and_step(self):
+        def apply_g(params, batch, vector, wd):
+            return {'w': (params['w'] + batch['shift']) * vector['w']}
+
+        self.diagnostics.config.spectrum_max_gn_products = 5
+        controller = ConditionDiagnostics(
+            config=self.diagnostics.config, apply_g=apply_g,
+            param_shards={'w': jnp.asarray})
+        cached = None
+        for step in (0, 17):
+            params = {'w': self.g * (1. if step == 0 else 2.)}
+            batch = {'shift': jnp.float32(step / 17)}
+            diagonal = {'w': jnp.linspace(.2, 2., 12)}
+            kwargs = dict(step=step, cg_diagonal=diagonal,
+                          effective_lambda=.3, safe_adam_lr=.7)
+            fresh = ConditionDiagnostics(
+                config=controller.config, apply_g=apply_g,
+                param_shards={'w': jnp.asarray})
+            with redirect_stdout(io.StringIO()), patch.object(
+                    matrix_spectrum, 'available_host_memory', return_value=10**15):
+                actual = controller.run(params, batch, **kwargs)
+                expected = fresh.run(params, batch, **kwargs)
+            self.assertEqual(
+                {k: v for k, v in actual.items() if not k.endswith('/seconds')},
+                {k: v for k, v in expected.items() if not k.endswith('/seconds')})
+            self.assertAlmostEqual(actual['spectrum/G/fallback_lambda_max_est'],
+                                   10. if step == 0 else 21., delta=.01)
+            if cached is not None:
+                for name, solver in cached.items():
+                    self.assertIs(controller._power_solvers[name], solver)
+            cached = dict(controller._power_solvers)
 
     def test_single_switch_and_cadence_at_all_training_call_sites(self):
         tree = ast.parse(TRAINER.read_text())
