@@ -22,7 +22,7 @@ class InnerStateResetTest(unittest.TestCase):
             apply_fn=None, params=initial_params, tx=tx)
         gradient = {'weight': jnp.array([0.3, -0.4], dtype=jnp.float32)}
         state = state.apply_gradients(grads=gradient).replace(
-            step=jnp.array(7, dtype=state.step.dtype),
+            step=jnp.array(7, dtype=jnp.asarray(state.step).dtype),
             warmstart_params={'weight': jnp.array([5., 6.], dtype=jnp.float32)},
         )
         outer_params = {'weight': jnp.array([4., -3.], dtype=jnp.float32)}
