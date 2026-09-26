@@ -18,18 +18,128 @@ For lambda equal to actual global solve-batch sequences divided by 10240:
 --cg_lambda_batch_denominator=10240
 --cg_lambda_final=-1
 --cg_lambda_ramp_steps=0
---cg_log_matrix_norms=False
+--condition_log=False
 ```
 
 This gives 0.025 at batch 256, 0.1 at 1024, and 0.2 at 2048, before device or
 microbatch splitting. Both scheduled and effective lambda report this value.
-Negative/nonfinite denominators, non-CG solvers, simultaneous ramps, matrix-norm
-rescaling, and batches above the denominator are rejected. Startup checks include
+Negative/nonfinite denominators, non-CG solvers, simultaneous ramps, and batches
+above the denominator are rejected. Startup checks include
 the growth cap; actual batch size is checked again at each solve. No clamping is
 performed. The LR schedule remains update-based; this rule does not eliminate
 all coupling between batch schedules and token-budget comparisons, or guarantee
 training stability. Set the denominator to zero AND disable the old ramp when
 requesting constant lambda.
+
+## Condition diagnostics
+
+`--condition_log=True` enables all spectral diagnostics at outer step 0 and every
+`condition_every` updates (default 100). `condition_log=False` disables all of
+these diagnostics.
+
+Every supported solver (CG, Adam-GN, Muon-GN) estimates the leading
+`spectrum_top_k` eigenvalues of raw `G`, including its largest eigenvalue. CG
+additionally estimates both endpoints of the actual damped solve matrix
+`A=lambda*G+(1-lambda)/eta*D`, using the effective lambda, safe Adam learning
+rate, and bias-corrected diagonal from that update. The existing maximum of
+symmetric `P=D^-1/2*A*D^-1/2` and its damping proxy are retained. The new minimum
+estimate is for `A`, not `P`.
+
+Diagnostics reuse the frozen solve batch, never fetch data or consume training
+RNG, and their products are excluded from solve-token accounting. For Adam-GN
+and Muon-GN with multiple inner batches, the first already-fetched inner batch
+is used. Dropout and FCM must be disabled. `cg_n_micro` microbatches diagnostic
+`Gv` for every supported solver, including Muon; it does not microbatch Muon's
+inner training solve.
+
+An accepted top-k result supplies `spectrum/G/lambda_1_est`; the largest
+eigenvalue is not recomputed. If top-k convergence fails, a power estimate is
+still attempted and recorded as `spectrum/G/fallback_lambda_max_est`. Raw-G
+metrics live only under `spectrum/G/*`. W&B retains the accepted eigenvalues,
+top-10/top-100 ratios, residual and orthogonality checks, basis size, total raw-G
+products, elapsed time, and failure details when unresolved. Detailed phase and
+transfer timings remain in terminal output rather than W&B.
+
+`A`'s maximum uses power iteration; its minimum uses inverse iteration with
+compiled, diagonally preconditioned inner CG solves. Defaults are
+`spectrum_endpoint_maxiter=24` outer iterations for each endpoint,
+`spectrum_endpoint_num_starts=2`, `spectrum_inverse_cg_maxiter=100`, and
+`spectrum_inverse_cg_tol=0.001`. Endpoint stability and eigenpair acceptance use
+`spectrum_endpoint_agreement_tol` and `spectrum_endpoint_residual_tol`.
+Actual inner-solve residuals, eigenpair residuals, and agreement between starts
+must pass; unresolved minima and condition ratios are withheld.
+`spectrum/A/lambda_min_est` and `spectrum/A/condition_est` are estimates, not
+certified spectral bounds. Singular undamped systems may remain unresolved.
+Inverse iteration adds GN products beyond the spectrum product budget; its cap
+is separate. All damped and preconditioned results live under `spectrum/A/*`;
+preconditioned fields use a `preconditioned_` prefix. For
+`P=cI+B`, the maximum is found on
+`B=lambda*D^-1/2*G*D^-1/2` before adding the known identity shift, avoiding
+premature convergence on an identity-dominated `P`. The descriptive
+`preconditioned_damping_condition_proxy` is retained. Trace and trace-square
+probes are no longer run by the trainer because they added full GN products but
+were not needed for the eigenvalue objective.
+
+### CPU-resident top-100 spectrum
+
+`--condition_log=True` includes a thick-restarted Lanczos estimate of raw
+`G`; `spectrum_top_k` defaults to 100. One FP32 basis stays on CPU. The small
+symmetric recurrence matrix and its eigendecomposition use FP64. A preflight
+includes the basis, active blocks, bounded transformation/transfer workspace,
+cgroup-aware available memory, and an 8 GiB reserve. The default 600-vector
+basis is intended for the high-memory TPU host used by this project; at 150M
+parameters the basis alone is about 335 GiB. The diagnostic refuses unsupported
+multi-host runs and insufficient host memory before allocating it.
+
+The short recurrence uses an FP32 overlap scan and adaptive two-pass corrective
+reorthogonalization. Thick restart retains `spectrum_restart_keep` Ritz vectors
+and their residual coupling `beta * Y[-1, :keep]`, producing an arrowhead
+projection before ordinary Lanczos expansion resumes. Numerical breakdown
+starts a random direction orthogonal to the current basis. The old residual
+expansion solver and stored `GQ` buffer have been removed.
+
+`spectrum_check_every` controls the projected-eigensolve cadence and the bounded
+validation reconstruction batch.
+Recurrence residuals screen convergence, together with the existing eigenvalue
+stability tolerance. Before acceptance, a full Gram check and fresh direct
+residual checks of every scalar rank that will be published (1, 10, 20, ...,
+top-k) guard against recurrence drift and lost orthogonality. Consequently
+`spectrum_max_gn_products=600` reserves 11 products for final validation when
+`spectrum_top_k=100`. This budget includes all spectrum operator calls; PCG
+endpoint work remains separate.
+
+All products use the same frozen parameters, batch and microbatch weighting.
+Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
+(`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is
+not divisible by ten. Intermediate ranks need no additional eigensolve or
+operator products for logging. Unresolved estimates remain withheld. Candidate
+tables, memory estimates, and historical phase timing keys are omitted from
+W&B to keep the dashboard compact; the terminal completion record remains
+detailed enough for performance debugging.
+
+Lanczos still uses Rayleigh--Ritz on a small recurrence matrix. Its advantage
+here is avoiding repeated full-basis projection/residual reconstruction and
+storing only one basis, not making the small eigensolve faster. Direct residuals
+are not a proof that no larger eigenvalue was missed; independent-seed and
+larger-budget repeats remain useful controls. As a single-vector method, this
+estimator also does not guarantee recovery of the full multiplicity of an
+exactly repeated leading eigenvalue; the stochastic GN spectrum is expected to
+be generic, but multiplicity-sensitive studies require a block method. TPU-host
+speedup must be measured.
+
+Suggested validation commands (run on a host with JAX and sufficient RAM):
+
+```bash
+PYTHONPATH=. python -m unittest tests.test_matrix_condition tests.test_matrix_spectrum -v
+# One frozen measurement with the trial budget:
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --condition_every=1
+# Independent seed and larger-budget repeats:
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_seed=1
+python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_max_gn_products=1200
+```
+
+The diagnostic controls may change on exact resume because they are
+observational and do not alter optimizer state or data consumption.
 
 ## Data order and compatibility
 
@@ -96,3 +206,38 @@ examples. The next batch and numerical state are compared with uninterrupted
 execution across a batch-growth boundary. This is not a full LLaMA trainer test.
 Real TPU multi-host execution, GCS credentials/network failures, and W&B recovery
 remain untested here.
+
+## Reset-start memory validation status
+
+An AdamW GN run has failed at outer update 1 while allocating a program after a
+successful update 0 with `reset_start=True`.  Retention of the previous inner
+optimizer state is a hypothesis, not a confirmed root cause.  The trainer now
+releases the synchronization-only result list immediately after its barrier and
+drops both train-state references to the completed inner optimizer slots before
+initializing their replacement.  CPU tests establish reset-state semantic
+equivalence only; they do not
+establish a TPU memory reduction or rule out condition diagnostics.
+
+For user-operated TPU validation, start from the original batch-600 command and
+keep all learning-rate and schedule arguments, especially the original
+`--total_steps`: it determines schedule decay (and, depending on `--lr_sched`,
+the per-outer-step schedule construction).  Do not shorten it to three.  First
+run with:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=False
+```
+
+Observe completion of outer updates 0, 1, and 2, then stop the run manually (or
+use the existing job controller) after the third update.  Repeat from a fresh
+run/checkpoint with the original condition cadence restored, for example:
+
+```bash
+<original command> --train_dataset_batch_size=600 --reset_start=True \
+  --condition_log=True
+```
+
+Again exercise at least updates 0 through 2.  Record peak HBM and whether the
+allocation failure recurs in each run; until this is done, the memory-lifetime
+explanation remains unverified.

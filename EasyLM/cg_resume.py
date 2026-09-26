@@ -31,7 +31,7 @@ def batch_lambda(batch_size, denominator):
 
 
 def validate_batch_lambda(denominator, optimizer_type, final, ramp_steps,
-                          matrix_norms, max_batch):
+                          max_batch):
     if not math.isfinite(denominator) or denominator < 0:
         raise ValueError('cg_lambda_batch_denominator must be finite and nonnegative')
     if denominator == 0:
@@ -40,8 +40,6 @@ def validate_batch_lambda(denominator, optimizer_type, final, ramp_steps,
         raise ValueError('Batch lambda requires optimizer_type=cg')
     if final != -1 or ramp_steps != 0:
         raise ValueError('Batch lambda cannot be combined with a lambda ramp')
-    if matrix_norms:
-        raise ValueError('Batch lambda requires cg_log_matrix_norms=False')
     batch_lambda(max_batch, denominator)
 
 
@@ -145,7 +143,9 @@ def validate_flags(saved, current):
         'checkpointer', 'param_count', 'param_count_nonembed', 'training_progress',
         'log_time_offset_s'}
     changed = sorted(k for k in set(saved) | set(current)
-                     if k not in ignored and saved.get(k) != current.get(k))
+                     if k not in ignored
+                     and not k.startswith(('condition_', 'spectrum_'))
+                     and saved.get(k) != current.get(k))
     if changed:
         raise ValueError('Resume changes trajectory settings: ' + ', '.join(changed))
 

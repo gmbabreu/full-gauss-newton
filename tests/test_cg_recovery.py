@@ -1,4 +1,5 @@
 """CPU recovery tests; run with python -m unittest discover -s tests -v."""
+import ast
 import io
 import json
 import os
@@ -9,6 +10,20 @@ from unittest.mock import patch
 
 from EasyLM import cg_resume as cg
 from sweep_launcher import selected_value
+
+
+TRAINER = (Path(__file__).resolve().parents[1]
+           / 'EasyLM/models/llama/llama_train_gn.py')
+
+
+def trainer_function(name):
+    tree = ast.parse(TRAINER.read_text())
+    node = next(item for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(
+        ast.Module(body=[node], type_ignores=[])), str(TRAINER), 'exec'), namespace)
+    return namespace[name]
 
 
 def snapshot(step):
@@ -25,6 +40,22 @@ def save(directory, generation, step):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_condition_diagnostic_solver_support(self):
+        supported = trainer_function('supports_condition_diagnostics')
+        self.assertTrue(supported('cg', False))
+        self.assertTrue(supported('adamw', True))
+        self.assertTrue(supported('muon', True))
+        self.assertFalse(supported('adamw', False))
+        self.assertFalse(supported('muon', False))
+        self.assertFalse(supported('unknown', True))
+
+    def test_spectrum_flags_are_reporting_only(self):
+        saved = {'optimizer_type': 'cg', 'condition_log': False}
+        current = dict(saved, condition_log=True,
+                       spectrum_endpoint_maxiter=48,
+                       spectrum_check_every=8)
+        cg.validate_flags(saved, current)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -33,14 +64,13 @@ class RecoveryTests(unittest.TestCase):
     def test_lambda(self):
         for batch, expected in ((256, .025), (1024, .1), (2048, .2)):
             self.assertEqual(cg.batch_lambda(batch, 10240), expected)
-        cg.validate_batch_lambda(0, 'muon', -1, 0, True, 2048)
-        for args in ((-1, 'cg', -1, 0, False, 256),
-                     (float('nan'), 'cg', -1, 0, False, 256),
-                     (float('inf'), 'cg', -1, 0, False, 256),
-                     (1024, 'muon', -1, 0, False, 256),
-                     (1024, 'cg', .4, 10, False, 256),
-                     (1024, 'cg', -1, 0, True, 256),
-                     (1024, 'cg', -1, 0, False, 2048)):
+        cg.validate_batch_lambda(0, 'muon', -1, 0, 2048)
+        for args in ((-1, 'cg', -1, 0, 256),
+                     (float('nan'), 'cg', -1, 0, 256),
+                     (float('inf'), 'cg', -1, 0, 256),
+                     (1024, 'muon', -1, 0, 256),
+                     (1024, 'cg', .4, 10, 256),
+                     (1024, 'cg', -1, 0, 2048)):
             with self.assertRaises(ValueError):
                 cg.validate_batch_lambda(*args)
         with self.assertRaises(ValueError):

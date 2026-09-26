@@ -30,6 +30,7 @@ import optax
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM import cg_resume
+from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -37,7 +38,8 @@ from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, tree_dot, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
-    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay, CustomTrainState
+    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay,
+    CustomTrainState, create_reset_train_state,
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
@@ -128,7 +130,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     outer_momentum_beta=0.0,
     armijo_linesearch=False,
     adaptive_inner_loop=False,
-    armijo_alpha=0.5,
+    armijo_alpha=1,
     armijo_beta=0.5,
     armijo_init_step=1.0,
 
@@ -148,10 +150,33 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
-    cg_log_matrix_norms=False,
-    cg_matrix_norm_frobenius_probes=4,
-    cg_matrix_norm_power_iters=8,
+
+    # Observational spectral diagnostics.  They run only at the requested
+    # cadence and never alter the solve operator or effective lambda.
+    condition_log=False,
+    condition_every=100,
+    spectrum_endpoint_maxiter=24,
+    spectrum_inverse_cg_maxiter=100,
+    spectrum_inverse_cg_tol=1e-3,
+    spectrum_endpoint_num_starts=2,
+    spectrum_endpoint_agreement_tol=0.05,
+    spectrum_endpoint_residual_tol=0.05,
+    spectrum_top_k=100,
+    spectrum_check_every=4,
+    spectrum_max_basis=600,
+    spectrum_restart_keep=120,
+    spectrum_max_gn_products=600,
+    spectrum_residual_tol=0.01,
+    spectrum_stability_tol=0.02,
+    spectrum_seed=0,
 )
+
+
+def supports_condition_diagnostics(optimizer_type, gauss_newton):
+    """Whether the selected solver exposes the frozen Gauss--Newton operator."""
+    return optimizer_type == 'cg' or (
+        gauss_newton and optimizer_type in ('adamw', 'muon'))
+
 
 def microbatch_groups(batch_size, n_requested, data_shards):
     if batch_size <= 0 or data_shards <= 0 or batch_size % data_shards:
@@ -237,6 +262,33 @@ def get_tpu_metrics():
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
+    if FLAGS.condition_log:
+        if not supports_condition_diagnostics(
+                FLAGS.optimizer_type, FLAGS.gauss_newton):
+            raise ValueError(
+                'Condition diagnostics support CG, Adam-GN, and Muon-GN only')
+        if FLAGS.condition_every <= 0:
+            raise ValueError('condition cadence must be positive')
+        if (FLAGS.spectrum_endpoint_maxiter < 3
+                or FLAGS.spectrum_endpoint_num_starts < 2):
+            raise ValueError('Condition diagnostics require positive budgets, '
+                             'at least three outer iterations, and two starts')
+        if not 0 < FLAGS.spectrum_endpoint_agreement_tol < 1 \
+                or not 0 < FLAGS.spectrum_endpoint_residual_tol < 1:
+            raise ValueError('Condition validation tolerances must be in (0, 1)')
+        if FLAGS.optimizer_type == 'cg' and (
+                FLAGS.spectrum_inverse_cg_maxiter <= 0
+                or not 0 < FLAGS.spectrum_inverse_cg_tol < 1):
+            raise ValueError('Condition inverse iteration needs a positive CG '
+                             'budget and a tolerance in (0, 1)')
+        if jax.process_count() != 1:
+            raise ValueError('spectrum diagnostics currently support single-host execution only')
+        if not (0 < FLAGS.spectrum_top_k <= FLAGS.spectrum_restart_keep
+                < FLAGS.spectrum_max_basis):
+            raise ValueError('invalid spectrum top-k/restart/basis settings')
+        if FLAGS.spectrum_check_every <= 0:
+            raise ValueError('spectrum check cadence must be positive')
+
     if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
         raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")
     if FLAGS.outer_weight_decay and (
@@ -248,7 +300,7 @@ def main(argv):
         raise ValueError("train_batch_growth_interval must be nonnegative")
     cg_resume.validate_batch_lambda(
         FLAGS.cg_lambda_batch_denominator, FLAGS.optimizer_type,
-        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps, FLAGS.cg_log_matrix_norms,
+        FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps,
         max(FLAGS.train_dataset_batch_size,
             FLAGS.train_batch_max if FLAGS.train_batch_growth_interval > 0 else 0,
             FLAGS.train_dataset.huggingface_dataset.batch_size))
@@ -371,6 +423,16 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+    if (FLAGS.condition_log
+            and FLAGS.optimizer_type in ('adamw', 'muon')):
+        stochastic = ('embedding_dropout', 'feedforward_dropout',
+                      'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
+                      'fcm_max_ratio')
+        enabled = [name for name in stochastic
+                   if float(getattr(llama_config, name, 0.0)) != 0.0]
+        if enabled:
+            raise ValueError('Gauss-Newton condition diagnostics require dropout/FCM '
+                             'disabled: ' + ', '.join(enabled))
 
     model = FlaxLLaMAForCausalLMModule(
         llama_config,
@@ -869,144 +931,6 @@ def main(argv):
                 batch_, groups, curvature_contribution,
                 jax.tree.map(jnp.zeros_like, params0))
 
-        matrix_norm_metrics = {}
-        if FLAGS.cg_log_matrix_norms:
-            assert FLAGS.cg_matrix_norm_frobenius_probes >= 1
-            assert FLAGS.cg_matrix_norm_power_iters >= 1
-
-            param_leaves, param_treedef = jax.tree_util.tree_flatten(params0)
-            num_param_leaves = len(param_leaves)
-
-            def diagnostic_tree_dot(left, right):
-                leaf_products = [
-                    jnp.sum(x.astype(jnp.float32) * y.astype(jnp.float32))
-                    for x, y in zip(
-                        jax.tree_util.tree_leaves(left),
-                        jax.tree_util.tree_leaves(right),
-                    )
-                ]
-                return jnp.sum(jnp.stack(leaf_products))
-
-            def diagnostic_tree_norm(tree):
-                return jnp.sqrt(jnp.maximum(diagnostic_tree_dot(tree, tree), 0.0))
-
-            def rademacher_tree(key):
-                keys = jax.random.split(key, num_param_leaves)
-                leaves = [
-                    jax.random.rademacher(key, leaf.shape, dtype=leaf.dtype)
-                    for key, leaf in zip(keys, param_leaves)
-                ]
-                return jax.tree_util.tree_unflatten(param_treedef, leaves)
-
-            diagnostic_rng = jax.random.PRNGKey(FLAGS.seed)
-            frobenius_rng, power_rng = jax.random.split(diagnostic_rng)
-
-            def frobenius_body(i, squared_norm_sum):
-                probe = rademacher_tree(jax.random.fold_in(frobenius_rng, i))
-                g_probe = apply_G(probe)
-                return squared_norm_sum + diagnostic_tree_dot(g_probe, g_probe)
-
-            g_frob_squared = jax.lax.fori_loop(
-                0,
-                FLAGS.cg_matrix_norm_frobenius_probes,
-                frobenius_body,
-                jnp.asarray(0.0, dtype=jnp.float32),
-            ) / jnp.asarray(
-                FLAGS.cg_matrix_norm_frobenius_probes, dtype=jnp.float32
-            )
-            g_frob = jnp.sqrt(jnp.maximum(g_frob_squared, 0.0))
-
-            power_vector = rademacher_tree(power_rng)
-            power_vector_norm = diagnostic_tree_norm(power_vector)
-            power_vector = jax.tree_util.tree_map(
-                lambda value: value / (power_vector_norm + 1e-12),
-                power_vector,
-            )
-
-            def power_body(_, vector):
-                g_vector = apply_G(vector)
-                g_vector_norm = diagnostic_tree_norm(g_vector)
-                return jax.tree_util.tree_map(
-                    lambda value: value / (g_vector_norm + 1e-12),
-                    g_vector,
-                )
-
-            power_vector = jax.lax.fori_loop(
-                0,
-                FLAGS.cg_matrix_norm_power_iters - 1,
-                power_body,
-                power_vector,
-            )
-            g_power_vector = apply_G(power_vector)
-            g_spectral = (
-                diagnostic_tree_dot(power_vector, g_power_vector)
-                / diagnostic_tree_dot(power_vector, power_vector)
-            )
-            power_residual = jax.tree_util.tree_map(
-                lambda gq, q: gq - g_spectral * q,
-                g_power_vector,
-                power_vector,
-            )
-            g_spectral_relative_residual = (
-                diagnostic_tree_norm(power_residual)
-                / (diagnostic_tree_norm(g_power_vector) + 1e-12)
-            )
-
-            adam_diag = jax.tree_util.tree_map(
-                lambda second_moment: (
-                    jnp.sqrt(second_moment.astype(jnp.float32) / beta2_correction)
-                    + adam_eps
-                ),
-                new_second_moment,
-            )
-            d_diag = jax.tree_util.tree_map(
-                lambda diagonal: diagonal / safe_adam_lr,
-                adam_diag,
-            )
-            d_leaves = jax.tree_util.tree_leaves(d_diag)
-            d_frob = jnp.sqrt(jnp.sum(jnp.stack([
-                jnp.sum(diagonal * diagonal) for diagonal in d_leaves
-            ])))
-            d_max_eig = jnp.max(jnp.stack([
-                jnp.max(diagonal) for diagonal in d_leaves
-            ]))
-            d_min_eig = jnp.min(jnp.stack([
-                jnp.min(diagonal) for diagonal in d_leaves
-            ]))
-            d_spectral = d_max_eig
-            d_condition = jnp.where(
-                d_min_eig > 0.0,
-                d_max_eig / d_min_eig,
-                jnp.asarray(jnp.inf, dtype=jnp.float32),
-            )
-            g_d_ratio_frob = g_frob / (d_frob + 1e-12)
-            g_d_ratio_spec = g_spectral / (d_spectral + 1e-12)
-            lambda_balance_frob = d_frob / (g_frob + d_frob + 1e-12)
-            lambda_balance_spec = (
-                d_spectral / (g_spectral + d_spectral + 1e-12)
-            )
-
-            interpolation_lambda = jnp.asarray(
-                lambda_balance_spec * scheduled_lambda,
-                dtype=jnp.float32,
-            )
-            matrix_norm_metrics = {
-                'G_frob': g_frob,
-                'G_spectral': g_spectral,
-                'G_spectral_relative_residual': g_spectral_relative_residual,
-                'D_frob': d_frob,
-                'D_spectral': d_spectral,
-                'D_min_eig': d_min_eig,
-                'D_max_eig': d_max_eig,
-                'D_condition': d_condition,
-                'G_D_ratio_frob': g_d_ratio_frob,
-                'G_D_ratio_spec': g_d_ratio_spec,
-                'cg_lambda_balance_frob': lambda_balance_frob,
-                'cg_lambda_balance_spec': interpolation_lambda,
-            }
-
-
-
         # ── CG operator Av ────────────────────────────────
         # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
         # CG calls this repeatedly to solve A_t x = rhs.
@@ -1105,7 +1029,6 @@ def main(argv):
                 (1.0 - interpolation_lambda) /
                 (safe_adam_lr * interpolation_lambda),
                 jnp.asarray(jnp.nan, dtype=jnp.float32)),
-            **matrix_norm_metrics,
         }
 
         return (
@@ -1117,6 +1040,36 @@ def main(argv):
             rng_generator(),
             metrics,
         )
+
+    def condition_apply_g(params0, batch, vector, wd):
+        """Deterministic full-parameter Gv on the frozen diagnostic batch.
+
+        For non-CG solvers with multiple inner batches this intentionally
+        describes the first solve batch only. Weight decay is constant with
+        respect to logits and therefore is not part of this Gauss--Newton
+        operator.
+        """
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        _, groups = microbatch_groups(
+            batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+
+        def contribution(mb):
+            def logits_fn(params):
+                return model.apply(
+                    params, mb['input_tokens'], deterministic=True).logits
+
+            def logits_loss(logits):
+                return cross_entropy_loss_and_accuracy_with_weight_decay(
+                    logits, mb['target_tokens'], params0, params0,
+                    mb['loss_masks'], weight_decay=wd)[0]
+
+            logits0, jvp_fn = linearize(logits_fn, params0)
+            grad_logits = jax.grad(logits_loss)
+            _, h_jv = jax.jvp(grad_logits, (logits0,), (jvp_fn(vector),))
+            return linear_transpose(jvp_fn, params0)(h_jv)[0]
+
+        return weighted_microbatch_sum(
+            batch, groups, contribution, jax.tree.map(jnp.zeros_like, params0))
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -1132,6 +1085,8 @@ def main(argv):
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
     )
+    diagnostic_param_shards, _ = make_shard_and_gather_fns(
+        train_state_partition.params)
     if FLAGS.optimizer_type == 'cg':
         cg_param_shards, cg_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
 
@@ -1196,6 +1151,12 @@ def main(argv):
             ),
             donate_argnums=(1, 2, 3),
         )
+    sharded_condition_apply_g = pjit(
+        condition_apply_g,
+        in_shardings=(train_state_partition.params, batch_partition,
+                      train_state_partition.params, PS()),
+        out_shardings=train_state_partition.params,
+    )
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
@@ -1377,7 +1338,7 @@ def main(argv):
         # Memory breakdown diagnostic
         param_mem_gb = param_count * 4 / 1e9  # fp32 = 4 bytes
         optimizer_mem_gb = param_count * 4 * 2 / 1e9  # muon: ~2x params for momentum
-        hbm_info = jax.devices()[0].memory_stats()
+        hbm_info = jax.local_devices()[0].memory_stats()
         total_hbm_gb = hbm_info.get("bytes_limit", 0) / 1e9
         used_hbm_gb = hbm_info.get("bytes_in_use", 0) / 1e9
         print(f"\n=== Memory Breakdown ===")
@@ -1481,6 +1442,10 @@ def main(argv):
                 actual_solve_batch_size = int(batch['input_tokens'].shape[0])
             progress.charge(role, batch, metadata)
             return batch, metadata
+
+        diagnostics = ConditionDiagnostics(
+            config=FLAGS, apply_g=sharded_condition_apply_g,
+            param_shards=diagnostic_param_shards)
 
         muon_matrix_mask = unflatten_dict({
             name: w.ndim == 2 and name not in (
@@ -1604,9 +1569,37 @@ def main(argv):
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
 
             if FLAGS.reset_start:
-                inner_state = inner_state.replace(
-                    params=train_state.params,
-                    opt_state=tayl_solver.init(train_state.params)
+                # Drop the obsolete slots before allocating their replacement.
+                # Params and warm-start buffers may be shared, so retain their
+                # references normally rather than deleting device buffers.
+                inner_step = inner_state.step
+                inner_apply_fn = inner_state.apply_fn
+                inner_tx = inner_state.tx
+                inner_warmstart_params = inner_state.warmstart_params
+                outer_step = train_state.step
+                outer_apply_fn = train_state.apply_fn
+                outer_params = train_state.params
+                outer_tx = train_state.tx
+                outer_warmstart_params = train_state.warmstart_params
+                # The completed inner optimizer slots are also referenced by
+                # train_state for checkpointing.  Neither reference is needed
+                # after a reset, and both must go before tx.init allocates.
+                del inner_state, train_state
+                inner_state = create_reset_train_state(
+                    CustomTrainState,
+                    step=inner_step,
+                    apply_fn=inner_apply_fn,
+                    params=outer_params,
+                    tx=inner_tx,
+                    warmstart_params=inner_warmstart_params,
+                )
+                train_state = CustomTrainState(
+                    step=outer_step,
+                    apply_fn=outer_apply_fn,
+                    params=outer_params,
+                    tx=outer_tx,
+                    opt_state=inner_state.opt_state,
+                    warmstart_params=outer_warmstart_params,
                 )
 
                 if FLAGS.optimizer_type == "cg":
@@ -1737,6 +1730,21 @@ def main(argv):
                     FLAGS.inner_loop_wd,
                     jnp.asarray(scheduled_lambda, dtype=jnp.float32),
                 )
+                do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                if do_condition:
+                    beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
+                        jax.device_get(cg_adam_step))
+                    adam_diagonal = jax.tree.map(
+                        lambda moment: jnp.sqrt(moment / beta2_correction) + 1e-8,
+                        cg_second_moment)
+                    condition_metrics = diagnostics.run(
+                        train_state.params, batch, step=step,
+                        cg_diagonal=adam_diagonal,
+                        effective_lambda=float(jax.device_get(
+                            cg_metrics['cg_lambda_effective'])),
+                        safe_adam_lr=max(float(jax.device_get(
+                            cg_metrics['adamw_learning_rate'])), 1e-12))
+                    defer_wandb(condition_metrics, step=step)
                 
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
@@ -1837,6 +1845,13 @@ def main(argv):
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
                         )
+                        do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                        if i == 0 and do_condition:
+                            # Deterministic diagnostic of the first already-fetched
+                            # Muon solve batch; training RNG and cursor are untouched.
+                            condition_metrics = diagnostics.run(
+                                train_state.params, batch, step=step)
+                            defer_wandb(condition_metrics, step=step)
                         # is_last_step deliberately always False here -- see explanation
                         inner_state, sharded_rng, metrics = sharded_train_step(
                             inner_state, train_state.params, sharded_rng, batch,
@@ -1912,6 +1927,11 @@ def main(argv):
                         lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                         batch_
                     )
+                    do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
+                    if i == 0 and do_condition:
+                        condition_metrics = diagnostics.run(
+                            train_state.params, batch, step=step)
+                        defer_wandb(condition_metrics, step=step)
                     is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
@@ -1999,6 +2019,7 @@ def main(argv):
                 live_results.extend((cg_first_moment, cg_second_moment,
                                      cg_x0, cg_adam_step))
             jax.block_until_ready(live_results)
+            del live_results
             timing.stop_train_interval(completed_update=True)
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
@@ -2020,7 +2041,9 @@ def main(argv):
             should_log = (
                 step % FLAGS.log_freq == 0
                 or FLAGS.train_batch_growth_interval > 0
-                or FLAGS.optimizer_type == 'cg')
+                or FLAGS.optimizer_type == 'cg'
+                or (FLAGS.condition_log
+                    and step % FLAGS.condition_every == 0))
             if should_log:
                 log_metrics = {}
                 stop_after_log = False
@@ -2055,7 +2078,9 @@ def main(argv):
                         print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
                         log_metrics = jax.device_get(log_metrics)
                         defer_wandb(log_metrics)
-                        tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                        console_metrics = {k: v for k, v in log_metrics.items()
+                            if not k.startswith('spectrum/')}
+                        tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                         
                         stop_after_log = True
                     elif FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] >= 15:
@@ -2080,7 +2105,9 @@ def main(argv):
                         milestone=(FLAGS.save_milestone_freq > 0
                                    and (step + 1) % FLAGS.save_milestone_freq == 0))
                 wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
-                tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                console_metrics = {k: v for k, v in log_metrics.items()
+                    if not k.startswith('spectrum/')}
+                tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
                 if stop_after_log:
                     break
             
