@@ -38,6 +38,9 @@ sweep_launcher.py (+)                  # Sweep launcher for hyperparameter tunin
 | `llama_train_gn.py` | Runs full Gauss–Newton (GN) and GN-prox-linear methods. |
 | `llama_train_gn_layerwise.py` | Runs layer-wise GN and layer-wise GN-prox-linear methods. |
 
+For controlled Adam-GN state-carryover experiments, see
+[Adam inner-solver reset ablations](docs/adam_reset_ablations.md).
+
 ---
 ### llama_train_gn Structure
 ```text

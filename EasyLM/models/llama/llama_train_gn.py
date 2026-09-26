@@ -30,6 +30,10 @@ import optax
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM import cg_resume
+from EasyLM.adam_reset import (
+    ADAM_RESET_COMPONENTS, parse_adam_reset_components,
+    reset_adam_inner_state, adam_inner_metrics,
+)
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
@@ -137,6 +141,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     gauss_newton=False,
     redo_gn=0,
     reset_start=False,
+    adam_reset_components='none',  # Adam-GN: comma-separated states, none, or all.
 
     target_loss=0.0,
 
@@ -260,6 +265,12 @@ def get_tpu_metrics():
 
 
 def main(argv):
+    adam_reset_components = parse_adam_reset_components(
+        FLAGS.adam_reset_components, optimizer_type=FLAGS.optimizer_type,
+        gauss_newton=FLAGS.gauss_newton,
+        adaptive_inner_loop=FLAGS.adaptive_inner_loop,
+        reset_start=FLAGS.reset_start,
+    )
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.condition_log:
@@ -687,6 +698,10 @@ def main(argv):
     def train_step_gauss_newton(train_state, params0, rng, batch, wd, is_last_step):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        # Read before apply_gradients: TrainState.step is not the optimizer's
+        # LR clock after a reset (and post-update logging is one step ahead).
+        adam_metrics = (adam_inner_metrics(train_state.opt_state, lr_sched)
+                        if FLAGS.optimizer_type == 'adamw' else {})
 
         def f_batch(p):
             out = model.apply(
@@ -757,6 +772,7 @@ def main(argv):
             param_norm=global_norm(train_state.params),
             gpu_memory=get_gpu_memory()[0],
         )
+        metrics.update(adam_metrics)
         return train_state, rng_generator(), metrics
 
 
@@ -1568,7 +1584,7 @@ def main(argv):
 
             print("step", step, "param norm", global_norm(train_state.params), flush=True)
 
-            if FLAGS.reset_start:
+            if FLAGS.reset_start or adam_reset_components == ADAM_RESET_COMPONENTS:
                 # Drop the obsolete slots before allocating their replacement.
                 # Params and warm-start buffers may be shared, so retain their
                 # references normally rather than deleting device buffers.
@@ -1608,7 +1624,10 @@ def main(argv):
                         jnp.zeros_like,
                         train_state.params,
                     )
-
+            elif adam_reset_components:
+                inner_state = reset_adam_inner_state(
+                    inner_state, train_state.params, adam_reset_components)
+                train_state = train_state.replace(opt_state=inner_state.opt_state)
 
             # Fetch only the solve batch below; no unused advance of the data cursor.
         
@@ -1945,6 +1964,9 @@ def main(argv):
                         log_metrics['inner_param_norm'] = metrics['param_norm']
                         log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         log_metrics['inner_learning_rate'] = metrics['learning_rate']
+                        if FLAGS.gauss_newton and FLAGS.optimizer_type == 'adamw':
+                            log_metrics.update({key: metrics[key] for key in
+                                                ('adam/bias_count', 'adam/schedule_count')})
                         defer_wandb(log_metrics)
                     if FLAGS.weight_average and not FLAGS.linesearch:
                         alpha = FLAGS.weight_average_decay
