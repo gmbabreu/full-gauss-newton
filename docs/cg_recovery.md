@@ -101,6 +101,16 @@ failed device collective still relies on JAX distributed failure handling.
 Single-host execution, flags, training updates and estimator mathematics are
 unchanged. Multi-host transfers add diagnostic wall time.
 
+After a multi-host diagnostic, every probe and product buffer is explicitly
+deleted and the diagnostic/collective compilation caches are released on each
+host. This avoids carrying transfer executables into an HBM-constrained inner
+solve. Because JAX does not expose the collective helpers' individual caches,
+this clears the local in-memory compilation cache; the first training dispatch
+after a later periodic diagnostic may therefore recompile. Single-host cache
+reuse is unchanged. The terminal line
+`[spectrum] cleanup: released multi-host diagnostic caches` confirms that the
+boundary completed.
+
 The two-process CPU integration check is opt-in (run once on a machine with a
 working JAX CPU collective transport; no TPU training is launched):
 
@@ -115,7 +125,7 @@ unchanged parameters, failed-spectrum fallback, A endpoints, and CPU error
 propagation. `SPECTRUM_TEST_MPI=1` optionally uses an installed MPI-enabled JAX
 CPU runtime and `mpiexec`; ordinary runs use Gloo.
 
-Implementation validation in this development container: 63 CPU tests pass
+Validation before the cleanup change: 63 CPU tests passed
 (one opt-in transport test skipped), including numerical/routing/Adam
 regressions, four local sharded devices, and a simulated-transport controller.
 The four-device top-100 test has max relative error 5.90e-8 and resolves
@@ -123,7 +133,9 @@ fallback G and damped/preconditioned A endpoints. The latter checks a
 real JAX J^T J and top-100 values (max relative error 7.21e-8), but is **not** a
 real multi-host test. The opt-in integration test could not reach diagnostics:
 Gloo failed local transport setup (EPERM), and MPI lacked its trampoline wrapper.
-A real two-host TPU smoke run remains required before a long ablation run.
+The cleanup-specific tests cover successful, failed, and single-host boundaries,
+but the current scratch runtime cannot import its stale CPU JAX build. A real
+two-host TPU smoke run remains required before a long ablation run.
 
 The short recurrence uses an FP32 overlap scan and adaptive two-pass corrective
 reorthogonalization. Thick restart retains `spectrum_restart_keep` Ritz vectors

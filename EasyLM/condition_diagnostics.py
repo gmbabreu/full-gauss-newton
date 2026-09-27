@@ -4,6 +4,7 @@ Numerical estimators live in matrix_condition and matrix_spectrum. This
 controller owns their compiled-solver cache; changing parameters, batches,
 diagonals and interpolation settings are passed to those solvers at runtime.
 """
+import gc
 import timeit
 
 import jax
@@ -25,6 +26,40 @@ class ConditionDiagnostics:
 
     def run(self, params, solve_batch, *, step, cg_diagonal=None,
             effective_lambda=None, safe_adam_lr=None):
+        """Run diagnostics and release multi-host-only device resources."""
+        try:
+            return self._run(params, solve_batch, step=step,
+                             cg_diagonal=cg_diagonal,
+                             effective_lambda=effective_lambda,
+                             safe_adam_lr=safe_adam_lr)
+        finally:
+            if jax.process_count() > 1:
+                self._release_multihost_resources()
+
+    def _release_multihost_resources(self):
+        """Drop diagnostic executables and collective caches on every host.
+
+        Multi-host host/device transfers add broadcast and all-gather
+        executables that otherwise remain resident after the diagnostic.  The
+        training path runs close enough to the HBM limit that even this small
+        residue can prevent the next inner-step allocation.
+        """
+        cached = (self.apply_g, *self._power_solvers.values())
+        for compiled in cached:
+            clear_cache = getattr(compiled, 'clear_cache', None)
+            if clear_cache is not None:
+                clear_cache()
+        self._power_solvers.clear()
+        # The collective helpers construct internal jitted functions that are
+        # not exposed for selective clearing.  This is multi-host-only; the
+        # established single-host diagnostic retains its compiled caches.
+        jax.clear_caches()
+        gc.collect()
+        print('[spectrum] cleanup: released multi-host diagnostic caches',
+              flush=True)
+
+    def _run(self, params, solve_batch, *, step, cg_diagonal=None,
+             effective_lambda=None, safe_adam_lr=None):
         """Host controller over explicitly sharded immutable Gv kernels."""
         FLAGS = self.config
         sharded_condition_apply_g = self.apply_g
@@ -47,42 +82,55 @@ class ConditionDiagnostics:
         dimension = sum(sizes)
         def cpu_apply(flat_vector):
             boundary = timeit.default_timer()
+            vector_tree = product = host = None
             offset, vector_leaves = 0, []
-            for shape, size, leaf in zip(shapes, sizes, leaves):
-                vector_leaves.append(flat_vector[offset:offset + size].reshape(
-                    shape).astype(np.float32, copy=False))
-                offset += size
-            vector_tree = jax.tree.unflatten(structure, vector_leaves)
-            if jax.process_count() == 1:
-                vector_tree = jax.tree.map(
-                    lambda value, shard: shard(value),
-                    vector_tree, diagnostic_param_shards)
-            else:
-                # Each host has the broadcast full vector, but creates only
-                # its addressable parameter shards. Preserve FP32 diagnostics.
-                vector_tree = jax.tree.map(
-                    lambda value, param: jax.make_array_from_callback(
-                        value.shape, param.sharding, lambda index: value[index]),
-                    vector_tree, params)
-            jax.block_until_ready(vector_tree)
-            spectrum_transfer_seconds['upload'] += (
-                timeit.default_timer() - boundary)
-            boundary = timeit.default_timer()
-            product = sharded_condition_apply_g(
-                params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
-            jax.block_until_ready(product)
-            spectrum_transfer_seconds['compute'] += (
-                timeit.default_timer() - boundary)
-            boundary = timeit.default_timer()
-            host = (jax.device_get(product) if jax.process_count() == 1
-                    else gather_product(product))
-            result = np.concatenate([
-                np.asarray(leaf, np.float32).reshape(-1)
-                for leaf in jax.tree.leaves(host)])
-            spectrum_transfer_seconds['download'] += (
-                timeit.default_timer() - boundary)
-            del vector_tree, product, host
-            return result
+            try:
+                for shape, size, leaf in zip(shapes, sizes, leaves):
+                    vector_leaves.append(flat_vector[offset:offset + size].reshape(
+                        shape).astype(np.float32, copy=False))
+                    offset += size
+                vector_tree = jax.tree.unflatten(structure, vector_leaves)
+                if jax.process_count() == 1:
+                    vector_tree = jax.tree.map(
+                        lambda value, shard: shard(value),
+                        vector_tree, diagnostic_param_shards)
+                else:
+                    # Each host has the broadcast full vector, but creates only
+                    # its addressable parameter shards. Preserve FP32 diagnostics.
+                    vector_tree = jax.tree.map(
+                        lambda value, param: jax.make_array_from_callback(
+                            value.shape, param.sharding, lambda index: value[index]),
+                        vector_tree, params)
+                jax.block_until_ready(vector_tree)
+                spectrum_transfer_seconds['upload'] += (
+                    timeit.default_timer() - boundary)
+                boundary = timeit.default_timer()
+                product = sharded_condition_apply_g(
+                    params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
+                jax.block_until_ready(product)
+                spectrum_transfer_seconds['compute'] += (
+                    timeit.default_timer() - boundary)
+                boundary = timeit.default_timer()
+                host = (jax.device_get(product) if jax.process_count() == 1
+                        else gather_product(product))
+                result = np.concatenate([
+                    np.asarray(leaf, np.float32).reshape(-1)
+                    for leaf in jax.tree.leaves(host)])
+                spectrum_transfer_seconds['download'] += (
+                    timeit.default_timer() - boundary)
+                return result
+            finally:
+                # `del` normally drops these references, but explicit deletion
+                # keeps their device buffers from surviving through Python GC
+                # or a cached collective executable after this product.
+                if jax.process_count() > 1:
+                    for tree in (product, vector_tree):
+                        if tree is not None:
+                            for value in jax.tree.leaves(tree):
+                                delete = getattr(value, 'delete', None)
+                                if delete is not None:
+                                    delete()
+                del vector_tree, product, host
         print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
         spectrum_scalars, spectrum_table = run_spectrum(
             matrix_spectrum.estimate_top_spectrum,
