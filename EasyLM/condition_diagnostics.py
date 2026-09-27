@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from EasyLM import matrix_condition, matrix_spectrum
+from EasyLM.multihost_spectrum import gather_product, run_spectrum
 
 
 class ConditionDiagnostics:
@@ -52,9 +53,17 @@ class ConditionDiagnostics:
                     shape).astype(np.float32, copy=False))
                 offset += size
             vector_tree = jax.tree.unflatten(structure, vector_leaves)
-            vector_tree = jax.tree.map(
-                lambda value, shard: shard(value),
-                vector_tree, diagnostic_param_shards)
+            if jax.process_count() == 1:
+                vector_tree = jax.tree.map(
+                    lambda value, shard: shard(value),
+                    vector_tree, diagnostic_param_shards)
+            else:
+                # Each host has the broadcast full vector, but creates only
+                # its addressable parameter shards. Preserve FP32 diagnostics.
+                vector_tree = jax.tree.map(
+                    lambda value, param: jax.make_array_from_callback(
+                        value.shape, param.sharding, lambda index: value[index]),
+                    vector_tree, params)
             jax.block_until_ready(vector_tree)
             spectrum_transfer_seconds['upload'] += (
                 timeit.default_timer() - boundary)
@@ -65,7 +74,8 @@ class ConditionDiagnostics:
             spectrum_transfer_seconds['compute'] += (
                 timeit.default_timer() - boundary)
             boundary = timeit.default_timer()
-            host = jax.device_get(product)
+            host = (jax.device_get(product) if jax.process_count() == 1
+                    else gather_product(product))
             result = np.concatenate([
                 np.asarray(leaf, np.float32).reshape(-1)
                 for leaf in jax.tree.leaves(host)])
@@ -74,7 +84,8 @@ class ConditionDiagnostics:
             del vector_tree, product, host
             return result
         print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
-        spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
+        spectrum_scalars, spectrum_table = run_spectrum(
+            matrix_spectrum.estimate_top_spectrum,
             cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
             check_every=FLAGS.spectrum_check_every,
             max_basis=FLAGS.spectrum_max_basis,
