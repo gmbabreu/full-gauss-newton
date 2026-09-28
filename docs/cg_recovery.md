@@ -154,6 +154,15 @@ top-k) guard against recurrence drift and lost orthogonality. Consequently
 `spectrum_top_k=100`. This budget includes all spectrum operator calls; PCG
 endpoint work remains separate.
 
+FP32 recurrence residuals can become optimistic at slightly different basis
+sizes when device reductions are regrouped across hosts. A recurrence-qualified
+candidate that fails fresh direct residual validation therefore no longer ends
+the estimate immediately: Lanczos continues for at least two check intervals
+and retries while products remain. `validation_attempts` and
+`max_direct_residual` appear in the terminal completion record. All retry
+products count against `spectrum_max_gn_products`; eigenvalues are still
+withheld unless one complete fresh validation passes.
+
 All products use the same frozen parameters, batch and microbatch weighting.
 Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
 (`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is

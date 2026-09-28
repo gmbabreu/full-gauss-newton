@@ -108,7 +108,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     """Leading algebraic eigenvalues of a fixed symmetric PSD operator.
 
     check_every is the small projected-eigensolve cadence. max_products includes
-    fresh validation of all published ranks. Failure never publishes scalars.
+    fresh validation of all published ranks. A failed direct validation resumes
+    expansion and retries within the same budget. Failure never publishes scalars.
     """
     if not 0 < top_k <= restart_keep < max_basis or dimension < top_k:
         raise ValueError('require 0 < top_k <= restart_keep < max_basis and dimension >= top_k')
@@ -123,10 +124,12 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     h = np.zeros((max_basis, max_basis), np.float64)
     validation_ranks = tuple(sorted({1, top_k, *range(10, top_k + 1, 10)}))
     expansion_budget = max_products - len(validation_ranks)
-    count = products = restart_count = 0
+    count = products = expansion_products = restart_count = 0
     previous = None
     stable = accepted = False
     failure, direct = [], {}
+    validation_attempts = 0
+    next_validation_expansion = top_k
     candidate_values = candidate_residuals = vectors = None
     orthogonality_error = math.inf
     timings = {name: 0. for name in (
@@ -154,11 +157,53 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
             raise ValueError('invalid_operator_product')
         return image.copy()
 
+    def validate_candidate():
+        """Freshly check published Ritz pairs; return False to keep expanding."""
+        nonlocal orthogonality_error, direct, validation_attempts
+        validation_attempts += 1
+        timer = time.monotonic()
+        orthogonality_error = float(np.linalg.norm(
+            _gram(q, count) - np.eye(count), ord=np.inf))
+        timings['gram'] += time.monotonic() - timer
+        if not math.isfinite(orthogonality_error) or orthogonality_error > 1e-3:
+            failure.append('invalid_orthonormal_basis')
+            return False
+
+        attempt = {}
+        valid = True
+        for start in range(0, len(validation_ranks), check_every):
+            timer = time.monotonic()
+            ranks = validation_ranks[start:start + check_every]
+            indices = np.asarray(ranks, dtype=np.int64) - 1
+            u = np.empty((len(ranks), dimension), np.float32)
+            _transform_chunked(q[:count], vectors[:, indices], u)
+            timings['validation'] += time.monotonic() - timer
+            for rank, index, vector in zip(ranks, indices, u):
+                try:
+                    image = apply(vector)
+                except ValueError as error:
+                    if str(error) != 'invalid_operator_product':
+                        raise
+                    failure.append(str(error))
+                    return False
+                timer = time.monotonic()
+                norm = _norm(vector)
+                residual = _norm(
+                    image - np.float32(candidate_values[index]) * vector
+                ) / max(abs(candidate_values[index]) * norm,
+                        np.finfo(np.float64).eps)
+                attempt[rank] = residual
+                valid &= math.isfinite(residual) and residual <= residual_tol
+                timings['validation'] += time.monotonic() - timer
+        direct = attempt
+        return bool(valid)
+
     next_vector = random_direction()
     while products < expansion_budget:
         q[count] = next_vector
         try:
             w = apply(next_vector)
+            expansion_products += 1
         except ValueError as error:
             if str(error) != 'invalid_operator_product': raise
             failure.append(str(error)); break
@@ -182,7 +227,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
         timings['orthogonalization'] += time.monotonic() - timer
         count += 1
         breakdown = beta <= 32 * np.finfo(np.float32).eps * max(image_norm, 1e-30)
-        check = (count >= top_k and (products % check_every == 0 or breakdown
+        check = (count >= top_k and (
+                 expansion_products % check_every == 0 or breakdown
                  or count == max_basis or products == expansion_budget))
         if check:
             timer = time.monotonic()
@@ -200,15 +246,24 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
             stable = stable or count == dimension
             previous = candidate_values.copy()
             timings['ritz_residuals'] += time.monotonic() - timer
-            if (stable and np.all(candidate_values > 0)
+            recurrence_passed = (stable and np.all(candidate_values > 0)
                     and np.all(np.isfinite(candidate_values))
-                    and np.all(candidate_residuals <= residual_tol)):
-                accepted = True
-                break
-        if products == expansion_budget:
+                    and np.all(candidate_residuals <= residual_tol))
+            if (recurrence_passed
+                    and expansion_products >= next_validation_expansion):
+                accepted = validate_candidate()
+                if accepted or failure:
+                    break
+                # FP32 recurrence residuals can be optimistic. Continue far
+                # enough to make a second direct validation meaningful.
+                next_validation_expansion = (
+                    expansion_products + 2 * check_every)
+        if products >= expansion_budget:
             break
         if count == dimension:
-            failure.append('acceptance_checks_failed'); break
+            failure.append('direct_residual_failed' if validation_attempts
+                           else 'acceptance_checks_failed')
+            break
         if breakdown:
             timer = time.monotonic()
             next_vector = random_direction()
@@ -231,45 +286,16 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
         else:
             h[count - 1, count] = h[count, count - 1] = beta
 
-    if accepted:
-        timer = time.monotonic()
-        orthogonality_error = float(np.linalg.norm(
-            _gram(q, count) - np.eye(count), ord=np.inf))
-        timings['gram'] += time.monotonic() - timer
-        if not math.isfinite(orthogonality_error) or orthogonality_error > 1e-3:
-            accepted = False
-            failure.append('invalid_orthonormal_basis')
-        else:
-            # Batched reconstruction of only the scalar ranks we publish.
-            for start in range(0, len(validation_ranks), check_every):
-                timer = time.monotonic()
-                ranks = validation_ranks[start:start + check_every]
-                indices = np.asarray(ranks, dtype=np.int64) - 1
-                u = np.empty((len(ranks), dimension), np.float32)
-                _transform_chunked(q[:count], vectors[:, indices], u)
-                timings['validation'] += time.monotonic() - timer
-                for rank, index, vector in zip(ranks, indices, u):
-                    try:
-                        image = apply(vector)
-                    except ValueError as error:
-                        if str(error) != 'invalid_operator_product': raise
-                        failure.append(str(error)); accepted = False; break
-                    timer = time.monotonic()
-                    norm = _norm(vector)
-                    residual = _norm(image - np.float32(candidate_values[index]) * vector) / max(
-                        abs(candidate_values[index]) * norm, np.finfo(np.float64).eps)
-                    direct[rank] = residual
-                    accepted &= math.isfinite(residual) and residual <= residual_tol
-                    timings['validation'] += time.monotonic() - timer
-                if failure: break
-            if not accepted and not failure:
-                failure.append('direct_residual_failed')
     if not accepted and not failure:
-        failure.append('product_budget_exhausted')
+        failure.append('direct_residual_failed' if validation_attempts
+                       else 'product_budget_exhausted')
     scalars = dict(accepted=bool(accepted), gn_products=products,
                    seconds=time.monotonic() - started,
                    restart_count=restart_count, basis_size=count,
+                   validation_attempts=validation_attempts,
                    orthogonality_error=orthogonality_error,
+                   max_direct_residual=(float(max(direct.values()))
+                       if direct else None),
                    max_relative_ritz_residual=(float(np.max(candidate_residuals))
                        if candidate_residuals is not None else None),
                    memory_required_gib=memory['required_bytes'] / 2**30)

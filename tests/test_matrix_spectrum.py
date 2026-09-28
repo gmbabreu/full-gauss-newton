@@ -160,6 +160,32 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(scalars['gn_products'], calls)
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_failed_direct_validation_continues_and_retries(self, _memory):
+        diagonal = np.r_[np.linspace(10., 9., 5),
+                         np.linspace(4., .1, 59)].astype(np.float32)
+        calls = 0
+        def apply(v):
+            nonlocal calls
+            calls += 1
+            image = diagonal * v
+            # The first candidate uses 18 expansion products, followed by the
+            # two published-rank validations. Make only that validation fail.
+            if calls in (19, 20):
+                image = image + .1 * np.roll(v, 1)
+            return image
+        scalars, table = ms.estimate_top_spectrum(
+            apply, 64, top_k=5, check_every=2, max_basis=24,
+            restart_keep=12, max_products=120, residual_tol=1e-3,
+            stability_tol=1e-3, seed=3)
+        self.assertTrue(scalars['accepted'], table)
+        self.assertEqual(scalars['validation_attempts'], 2)
+        self.assertEqual(calls, scalars['gn_products'])
+        self.assertLessEqual(calls, 120)
+        np.testing.assert_allclose(
+            table['values'], diagonal[:5], rtol=1e-3, atol=1e-3)
+        self.assertLessEqual(scalars['max_direct_residual'], 1e-3)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_nonfinite_product_is_unresolved(self, _memory):
         scalars, table = ms.estimate_top_spectrum(
             lambda v: v * np.nan, 8, top_k=3, max_basis=8,
