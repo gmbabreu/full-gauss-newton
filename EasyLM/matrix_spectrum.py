@@ -34,7 +34,7 @@ def available_host_memory():
     return min(pages, cgroup) if cgroup is not None else pages
 
 
-def memory_preflight(dimension, max_basis, check_every, *, reserve_bytes=8 << 30):
+def _memory_report(dimension, max_basis, check_every, reserve_bytes, available):
     """Account for one Lanczos basis, validation blocks and bounded temporaries."""
     vector = dimension * np.dtype(np.float32).itemsize
     basis_buffers = max_basis * vector
@@ -46,14 +46,74 @@ def memory_preflight(dimension, max_basis, check_every, *, reserve_bytes=8 << 30
     transfer = 2 * vector
     required = (basis_buffers + active + projection + transfer
                 + chunk_workspace + reserve_bytes)
-    available = available_host_memory()
-    if required > available:
-        raise MemoryError(f'spectrum preflight requires {required / 2**30:.2f} GiB; '
-                          f'effective available host memory is {available / 2**30:.2f} GiB')
     return dict(required_bytes=required, available_bytes=available,
                 basis_buffer_bytes=basis_buffers,
                 fp64_chunk_workspace_bytes=chunk_workspace,
                 reserve_bytes=reserve_bytes)
+
+
+def memory_preflight(dimension, max_basis, check_every, *, reserve_bytes=8 << 30,
+                     available_bytes=None):
+    """Check that one Lanczos basis and its bounded temporaries fit in RAM."""
+    available = (available_host_memory() if available_bytes is None
+                 else available_bytes)
+    report = _memory_report(
+        dimension, max_basis, check_every, reserve_bytes, available)
+    required = report['required_bytes']
+    if required > available:
+        raise MemoryError(f'spectrum preflight requires {required / 2**30:.2f} GiB; '
+                          f'effective available host memory is {available / 2**30:.2f} GiB')
+    return report
+
+
+def fit_basis_to_memory(dimension, max_basis, min_basis, check_every,
+                        *, reserve_bytes=8 << 30):
+    """Use the largest requested basis capacity that fits current host RAM."""
+    available = available_host_memory()
+    requested = max_basis
+    if _memory_report(dimension, max_basis, check_every, reserve_bytes,
+                      available)['required_bytes'] > available:
+        low, high = min_basis, max_basis
+        while low < high:
+            middle = (low + high + 1) // 2
+            required = _memory_report(
+                dimension, middle, check_every, reserve_bytes,
+                available)['required_bytes']
+            if required <= available:
+                low = middle
+            else:
+                high = middle - 1
+        max_basis = low
+    report = memory_preflight(
+        dimension, max_basis, check_every, reserve_bytes=reserve_bytes,
+        available_bytes=available)
+    report.update(requested_max_basis=requested,
+                  effective_max_basis=max_basis,
+                  memory_limited=max_basis < requested)
+    return max_basis, report
+
+
+def unavailable_spectrum_report(top_k, reason, configured_max_basis):
+    """Return the normal failure schema when even the minimum basis cannot fit."""
+    scalars = dict(accepted=False, gn_products=0, seconds=0., restart_count=0,
+                   basis_size=0, basis_capacity=0,
+                   configured_max_basis=configured_max_basis,
+                   memory_limited=True, validation_attempts=0,
+                   orthogonality_error=None, max_direct_residual=None,
+                   max_relative_ritz_residual=None, memory_required_gib=None)
+    for name in ('operator', 'orthogonalization', 'gram', 'projection',
+                 'eigensolve', 'ritz_residuals', 'expansion', 'restart',
+                 'validation'):
+        scalars[f'seconds_{name}'] = 0.
+    for rank in sorted({1, 10, 100, top_k, *range(10, top_k + 1, 10)}):
+        scalars[f'lambda_{rank}_est'] = None
+    scalars['top10_condition_est'] = None
+    scalars['top100_condition_est'] = None
+    table = dict(values=[], residuals=[], direct_residuals={},
+                 failure_reasons=['insufficient_host_memory'],
+                 orthogonality_error=None, restart_count=0,
+                 memory_preflight=None, diagnostic_error=reason)
+    return scalars, table
 
 
 def _transform_chunked(source, coefficients, destination, *, chunk=1 << 20):
@@ -118,7 +178,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     if not (0 < residual_tol < 1 and 0 <= stability_tol < 1):
         raise ValueError('invalid spectrum tolerances')
     max_basis = min(max_basis, dimension)
-    memory = memory_preflight(dimension, max_basis, check_every)
+    max_basis, memory = fit_basis_to_memory(
+        dimension, max_basis, restart_keep + 1, check_every)
     started, rng = time.monotonic(), np.random.default_rng(seed)
     q = np.empty((max_basis, dimension), np.float32)
     h = np.zeros((max_basis, max_basis), np.float64)
@@ -292,6 +353,9 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     scalars = dict(accepted=bool(accepted), gn_products=products,
                    seconds=time.monotonic() - started,
                    restart_count=restart_count, basis_size=count,
+                   basis_capacity=max_basis,
+                   configured_max_basis=memory['requested_max_basis'],
+                   memory_limited=memory['memory_limited'],
                    validation_attempts=validation_attempts,
                    orthogonality_error=orthogonality_error,
                    max_direct_residual=(float(max(direct.values()))

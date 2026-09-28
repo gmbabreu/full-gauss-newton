@@ -132,23 +132,37 @@ class ConditionDiagnostics:
                                     delete()
                 del vector_tree, product, host
         print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
-        spectrum_scalars, spectrum_table = run_spectrum(
-            matrix_spectrum.estimate_top_spectrum,
-            cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
-            check_every=FLAGS.spectrum_check_every,
-            max_basis=FLAGS.spectrum_max_basis,
-            restart_keep=FLAGS.spectrum_restart_keep,
-            max_products=FLAGS.spectrum_max_gn_products,
-            residual_tol=FLAGS.spectrum_residual_tol,
-            stability_tol=FLAGS.spectrum_stability_tol,
-            seed=FLAGS.spectrum_seed,
-            progress=lambda done, total: print(
-                f'[spectrum] G products {done}/{total}; '
-                f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
-                f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
-                f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
-                f'download={spectrum_transfer_seconds["download"]:.1f}s',
-                flush=True))
+        try:
+            spectrum_scalars, spectrum_table = run_spectrum(
+                matrix_spectrum.estimate_top_spectrum,
+                cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
+                check_every=FLAGS.spectrum_check_every,
+                max_basis=FLAGS.spectrum_max_basis,
+                restart_keep=FLAGS.spectrum_restart_keep,
+                max_products=FLAGS.spectrum_max_gn_products,
+                residual_tol=FLAGS.spectrum_residual_tol,
+                stability_tol=FLAGS.spectrum_stability_tol,
+                seed=FLAGS.spectrum_seed,
+                progress=lambda done, total: print(
+                    f'[spectrum] G products {done}/{total}; '
+                    f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
+                    f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
+                    f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
+                    f'download={spectrum_transfer_seconds["download"]:.1f}s',
+                    flush=True))
+        except (MemoryError, RuntimeError) as error:
+            # Host 0 receives MemoryError and peers receive its synchronized
+            # RuntimeError wrapper. A memory preflight is an observational
+            # diagnostic limitation, not a reason to terminate training.
+            if 'spectrum preflight requires' not in str(error):
+                raise
+            reason = str(error)[str(error).index('spectrum preflight requires'):]
+            print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: skipped: {reason}',
+                  flush=True)
+            spectrum_scalars, spectrum_table = (
+                matrix_spectrum.unavailable_spectrum_report(
+                    FLAGS.spectrum_top_k, reason,
+                    FLAGS.spectrum_max_basis))
         spectrum_scalars.update({
             f'seconds_{name}': value
             for name, value in spectrum_transfer_seconds.items()})
@@ -184,6 +198,9 @@ class ConditionDiagnostics:
             'gn_products': total_products,
             'seconds': timeit.default_timer() - spectrum_started,
             'basis_size': spectrum_scalars['basis_size'],
+            'basis_capacity': spectrum_scalars['basis_capacity'],
+            'configured_max_basis': spectrum_scalars['configured_max_basis'],
+            'memory_limited': spectrum_scalars['memory_limited'],
             'orthogonality_error': spectrum_scalars['orthogonality_error'],
             'max_relative_ritz_residual':
                 spectrum_scalars['max_relative_ritz_residual'],

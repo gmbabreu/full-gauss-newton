@@ -55,6 +55,9 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertEqual(set(result), {
             'spectrum/G/accepted', 'spectrum/G/gn_products',
             'spectrum/G/seconds', 'spectrum/G/basis_size',
+            'spectrum/G/basis_capacity',
+            'spectrum/G/configured_max_basis',
+            'spectrum/G/memory_limited',
             'spectrum/G/orthogonality_error',
             'spectrum/G/max_relative_ritz_residual',
             'spectrum/G/max_direct_residual', 'spectrum/G/lambda_1_est',
@@ -88,6 +91,20 @@ class ConditionRoutingTest(unittest.TestCase):
             result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
         self.assertEqual(result['spectrum/G/gn_products'], len(self.calls))
         self.assertIn('spectrum/G/failure_reasons', result)
+
+    def test_insufficient_host_memory_skips_topk_and_falls_back(self):
+        with redirect_stdout(io.StringIO()) as output, patch.object(
+                matrix_spectrum, 'available_host_memory', return_value=1):
+            result = self.diagnostics.run(self.params, {}, step=0)
+        self.assertFalse(result['spectrum/G/accepted'])
+        self.assertEqual(result['spectrum/G/basis_capacity'], 0)
+        self.assertTrue(result['spectrum/G/memory_limited'])
+        self.assertEqual(result['spectrum/G/failure_reasons'],
+                         'insufficient_host_memory')
+        self.assertTrue(result['spectrum/G/fallback_resolved'])
+        self.assertAlmostEqual(
+            result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
+        self.assertIn('skipped: spectrum preflight requires', output.getvalue())
 
     def test_cached_solvers_use_current_params_batch_and_step(self):
         def apply_g(params, batch, vector, wd):

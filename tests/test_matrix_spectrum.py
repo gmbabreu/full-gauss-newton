@@ -17,6 +17,48 @@ class MatrixSpectrumTest(unittest.TestCase):
             with self.assertRaises(MemoryError):
                 ms.memory_preflight(1000, 160, 4, reserve_bytes=0)
 
+    def test_basis_capacity_shrinks_to_current_memory(self):
+        available = ms._memory_report(1000, 6, 2, 0, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            capacity, report = ms.fit_basis_to_memory(
+                1000, 8, 5, 2, reserve_bytes=0)
+        self.assertEqual(capacity, 6)
+        self.assertEqual(report['requested_max_basis'], 8)
+        self.assertEqual(report['effective_max_basis'], 6)
+        self.assertTrue(report['memory_limited'])
+
+    def test_basis_capacity_still_rejects_when_minimum_does_not_fit(self):
+        available = ms._memory_report(1000, 4, 2, 0, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            with self.assertRaisesRegex(MemoryError,
+                                        'spectrum preflight requires'):
+                ms.fit_basis_to_memory(1000, 8, 5, 2, reserve_bytes=0)
+
+    def test_memory_limited_estimator_restarts_and_converges(self):
+        dimension = 192
+        diagonal = np.concatenate((
+            np.array([20., 19., 18., 17., 16.]),
+            np.linspace(4., .1, dimension - 5),
+        )).astype(np.float32)
+        available = ms._memory_report(
+            dimension, 12, 4, 8 << 30, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda vector: diagonal * vector, dimension,
+                top_k=5, check_every=4, max_basis=32, restart_keep=8,
+                max_products=100, residual_tol=1e-3,
+                stability_tol=1e-3, seed=7)
+        self.assertTrue(scalars['accepted'], table)
+        self.assertEqual(scalars['basis_capacity'], 12)
+        self.assertEqual(scalars['configured_max_basis'], 32)
+        self.assertTrue(scalars['memory_limited'])
+        self.assertGreater(scalars['restart_count'], 0)
+        np.testing.assert_allclose(table['values'][:5], diagonal[:5],
+                                   rtol=1e-3)
+
     def test_small_diagonal_candidates_are_ordered(self):
         matrix = np.diag(np.array([9., 7., 5., 3., 1.], np.float32))
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
