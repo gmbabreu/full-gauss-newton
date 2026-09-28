@@ -5,13 +5,13 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from EasyLM import matrix_condition, matrix_spectrum, cg_resume
+from EasyLM import condition_diagnostics, matrix_condition, matrix_spectrum, cg_resume
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 
 TRAINER = Path(__file__).resolve().parents[1] / 'EasyLM/models/llama/llama_train_gn.py'
@@ -55,6 +55,9 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertEqual(set(result), {
             'spectrum/G/accepted', 'spectrum/G/gn_products',
             'spectrum/G/seconds', 'spectrum/G/basis_size',
+            'spectrum/G/basis_capacity',
+            'spectrum/G/configured_max_basis',
+            'spectrum/G/memory_limited',
             'spectrum/G/orthogonality_error',
             'spectrum/G/max_relative_ritz_residual',
             'spectrum/G/max_direct_residual', 'spectrum/G/lambda_1_est',
@@ -89,6 +92,20 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertEqual(result['spectrum/G/gn_products'], len(self.calls))
         self.assertIn('spectrum/G/failure_reasons', result)
 
+    def test_insufficient_host_memory_skips_topk_and_falls_back(self):
+        with redirect_stdout(io.StringIO()) as output, patch.object(
+                matrix_spectrum, 'available_host_memory', return_value=1):
+            result = self.diagnostics.run(self.params, {}, step=0)
+        self.assertFalse(result['spectrum/G/accepted'])
+        self.assertEqual(result['spectrum/G/basis_capacity'], 0)
+        self.assertTrue(result['spectrum/G/memory_limited'])
+        self.assertEqual(result['spectrum/G/failure_reasons'],
+                         'insufficient_host_memory')
+        self.assertTrue(result['spectrum/G/fallback_resolved'])
+        self.assertAlmostEqual(
+            result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
+        self.assertIn('skipped: spectrum preflight requires', output.getvalue())
+
     def test_cached_solvers_use_current_params_batch_and_step(self):
         def apply_g(params, batch, vector, wd):
             return {'w': (params['w'] + batch['shift']) * vector['w']}
@@ -120,6 +137,51 @@ class ConditionRoutingTest(unittest.TestCase):
                 for name, solver in cached.items():
                     self.assertIs(controller._power_solvers[name], solver)
             cached = dict(controller._power_solvers)
+
+    def test_multihost_boundary_releases_diagnostic_and_collective_caches(self):
+        apply_g = Mock()
+        apply_g.clear_cache = Mock()
+        solver = Mock()
+        solver.clear_cache = Mock()
+        controller = ConditionDiagnostics(
+            config=self.diagnostics.config, apply_g=apply_g,
+            param_shards={'w': jnp.asarray})
+        controller._power_solvers['G'] = solver
+        expected = {'spectrum/G/accepted': True}
+        with patch.object(controller, '_run', return_value=expected), \
+                patch.object(condition_diagnostics.jax, 'process_count',
+                             return_value=2), \
+                patch.object(condition_diagnostics.jax, 'clear_caches') as clear, \
+                patch.object(condition_diagnostics.gc, 'collect') as collect:
+            self.assertIs(controller.run(self.params, {}, step=0), expected)
+        apply_g.clear_cache.assert_called_once_with()
+        solver.clear_cache.assert_called_once_with()
+        clear.assert_called_once_with()
+        collect.assert_called_once_with()
+        self.assertEqual(controller._power_solvers, {})
+
+    def test_multihost_boundary_cleans_up_after_diagnostic_failure(self):
+        controller = ConditionDiagnostics(
+            config=self.diagnostics.config, apply_g=Mock(),
+            param_shards={'w': jnp.asarray})
+        with patch.object(controller, '_run', side_effect=RuntimeError('failed')), \
+                patch.object(controller, '_release_multihost_resources') as release, \
+                patch.object(condition_diagnostics.jax, 'process_count',
+                             return_value=2):
+            with self.assertRaisesRegex(RuntimeError, 'failed'):
+                controller.run(self.params, {}, step=0)
+        release.assert_called_once_with()
+
+    def test_single_host_boundary_preserves_compiled_caches(self):
+        controller = ConditionDiagnostics(
+            config=self.diagnostics.config, apply_g=Mock(),
+            param_shards={'w': jnp.asarray})
+        with patch.object(controller, '_run', return_value={}), \
+                patch.object(controller, '_release_multihost_resources') as release, \
+                patch.object(condition_diagnostics.jax, 'process_count',
+                             return_value=1):
+            controller.run(self.params, {}, step=0)
+        release.assert_not_called()
 
     def test_single_switch_and_cadence_at_all_training_call_sites(self):
         tree = ast.parse(TRAINER.read_text())

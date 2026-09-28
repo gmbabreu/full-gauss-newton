@@ -17,6 +17,48 @@ class MatrixSpectrumTest(unittest.TestCase):
             with self.assertRaises(MemoryError):
                 ms.memory_preflight(1000, 160, 4, reserve_bytes=0)
 
+    def test_basis_capacity_shrinks_to_current_memory(self):
+        available = ms._memory_report(1000, 6, 2, 0, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            capacity, report = ms.fit_basis_to_memory(
+                1000, 8, 5, 2, reserve_bytes=0)
+        self.assertEqual(capacity, 6)
+        self.assertEqual(report['requested_max_basis'], 8)
+        self.assertEqual(report['effective_max_basis'], 6)
+        self.assertTrue(report['memory_limited'])
+
+    def test_basis_capacity_still_rejects_when_minimum_does_not_fit(self):
+        available = ms._memory_report(1000, 4, 2, 0, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            with self.assertRaisesRegex(MemoryError,
+                                        'spectrum preflight requires'):
+                ms.fit_basis_to_memory(1000, 8, 5, 2, reserve_bytes=0)
+
+    def test_memory_limited_estimator_restarts_and_converges(self):
+        dimension = 192
+        diagonal = np.concatenate((
+            np.array([20., 19., 18., 17., 16.]),
+            np.linspace(4., .1, dimension - 5),
+        )).astype(np.float32)
+        available = ms._memory_report(
+            dimension, 12, 4, 8 << 30, 0)['required_bytes']
+        with mock.patch.object(ms, 'available_host_memory',
+                               return_value=available):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda vector: diagonal * vector, dimension,
+                top_k=5, check_every=4, max_basis=32, restart_keep=8,
+                max_products=100, residual_tol=1e-3,
+                stability_tol=1e-3, seed=7)
+        self.assertTrue(scalars['accepted'], table)
+        self.assertEqual(scalars['basis_capacity'], 12)
+        self.assertEqual(scalars['configured_max_basis'], 32)
+        self.assertTrue(scalars['memory_limited'])
+        self.assertGreater(scalars['restart_count'], 0)
+        np.testing.assert_allclose(table['values'][:5], diagonal[:5],
+                                   rtol=1e-3)
+
     def test_small_diagonal_candidates_are_ordered(self):
         matrix = np.diag(np.array([9., 7., 5., 3., 1.], np.float32))
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
@@ -158,6 +200,32 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertIn('direct_residual_failed', table['failure_reasons'])
         self.assertIsNone(scalars['lambda_1_est'])
         self.assertEqual(scalars['gn_products'], calls)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_failed_direct_validation_continues_and_retries(self, _memory):
+        diagonal = np.r_[np.linspace(10., 9., 5),
+                         np.linspace(4., .1, 59)].astype(np.float32)
+        calls = 0
+        def apply(v):
+            nonlocal calls
+            calls += 1
+            image = diagonal * v
+            # The first candidate uses 18 expansion products, followed by the
+            # two published-rank validations. Make only that validation fail.
+            if calls in (19, 20):
+                image = image + .1 * np.roll(v, 1)
+            return image
+        scalars, table = ms.estimate_top_spectrum(
+            apply, 64, top_k=5, check_every=2, max_basis=24,
+            restart_keep=12, max_products=120, residual_tol=1e-3,
+            stability_tol=1e-3, seed=3)
+        self.assertTrue(scalars['accepted'], table)
+        self.assertEqual(scalars['validation_attempts'], 2)
+        self.assertEqual(calls, scalars['gn_products'])
+        self.assertLessEqual(calls, 120)
+        np.testing.assert_allclose(
+            table['values'], diagonal[:5], rtol=1e-3, atol=1e-3)
+        self.assertLessEqual(scalars['max_direct_residual'], 1e-3)
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_nonfinite_product_is_unresolved(self, _memory):

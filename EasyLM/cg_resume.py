@@ -136,6 +136,12 @@ def newest(directory):
 
 
 def validate_flags(saved, current):
+    # Older bundles predate the opt-in Adam ablation flag. Only its inactive
+    # default is equivalent to absence; active changes remain disallowed.
+    saved = dict(saved)
+    current = dict(current)
+    for flags in (saved, current):
+        flags.setdefault('adam_reset_components', 'none')
     # Everything is trajectory-affecting unless explicitly operational/reporting.
     ignored = {'cg_resume_state', 'load_dataset_state', 'wandb_run_id', 'wandb_dir',
         'wandb_project', 'wandb_entity', 'output_dir', 'tmp_dir', 'experiment_id',
