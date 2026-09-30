@@ -4,6 +4,7 @@ Numerical estimators live in matrix_condition and matrix_spectrum. This
 controller owns their compiled-solver cache; changing parameters, batches,
 diagonals and interpolation settings are passed to those solvers at runtime.
 """
+import gc
 import timeit
 
 import jax
@@ -11,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from EasyLM import matrix_condition, matrix_spectrum
+from EasyLM.multihost_spectrum import gather_product, run_spectrum
 
 
 class ConditionDiagnostics:
@@ -24,6 +26,40 @@ class ConditionDiagnostics:
 
     def run(self, params, solve_batch, *, step, cg_diagonal=None,
             effective_lambda=None, safe_adam_lr=None):
+        """Run diagnostics and release multi-host-only device resources."""
+        try:
+            return self._run(params, solve_batch, step=step,
+                             cg_diagonal=cg_diagonal,
+                             effective_lambda=effective_lambda,
+                             safe_adam_lr=safe_adam_lr)
+        finally:
+            if jax.process_count() > 1:
+                self._release_multihost_resources()
+
+    def _release_multihost_resources(self):
+        """Drop diagnostic executables and collective caches on every host.
+
+        Multi-host host/device transfers add broadcast and all-gather
+        executables that otherwise remain resident after the diagnostic.  The
+        training path runs close enough to the HBM limit that even this small
+        residue can prevent the next inner-step allocation.
+        """
+        cached = (self.apply_g, *self._power_solvers.values())
+        for compiled in cached:
+            clear_cache = getattr(compiled, 'clear_cache', None)
+            if clear_cache is not None:
+                clear_cache()
+        self._power_solvers.clear()
+        # The collective helpers construct internal jitted functions that are
+        # not exposed for selective clearing.  This is multi-host-only; the
+        # established single-host diagnostic retains its compiled caches.
+        jax.clear_caches()
+        gc.collect()
+        print('[spectrum] cleanup: released multi-host diagnostic caches',
+              flush=True)
+
+    def _run(self, params, solve_batch, *, step, cg_diagonal=None,
+             effective_lambda=None, safe_adam_lr=None):
         """Host controller over explicitly sharded immutable Gv kernels."""
         FLAGS = self.config
         sharded_condition_apply_g = self.apply_g
@@ -46,50 +82,87 @@ class ConditionDiagnostics:
         dimension = sum(sizes)
         def cpu_apply(flat_vector):
             boundary = timeit.default_timer()
+            vector_tree = product = host = None
             offset, vector_leaves = 0, []
-            for shape, size, leaf in zip(shapes, sizes, leaves):
-                vector_leaves.append(flat_vector[offset:offset + size].reshape(
-                    shape).astype(np.float32, copy=False))
-                offset += size
-            vector_tree = jax.tree.unflatten(structure, vector_leaves)
-            vector_tree = jax.tree.map(
-                lambda value, shard: shard(value),
-                vector_tree, diagnostic_param_shards)
-            jax.block_until_ready(vector_tree)
-            spectrum_transfer_seconds['upload'] += (
-                timeit.default_timer() - boundary)
-            boundary = timeit.default_timer()
-            product = sharded_condition_apply_g(
-                params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
-            jax.block_until_ready(product)
-            spectrum_transfer_seconds['compute'] += (
-                timeit.default_timer() - boundary)
-            boundary = timeit.default_timer()
-            host = jax.device_get(product)
-            result = np.concatenate([
-                np.asarray(leaf, np.float32).reshape(-1)
-                for leaf in jax.tree.leaves(host)])
-            spectrum_transfer_seconds['download'] += (
-                timeit.default_timer() - boundary)
-            del vector_tree, product, host
-            return result
+            try:
+                for shape, size, leaf in zip(shapes, sizes, leaves):
+                    vector_leaves.append(flat_vector[offset:offset + size].reshape(
+                        shape).astype(np.float32, copy=False))
+                    offset += size
+                vector_tree = jax.tree.unflatten(structure, vector_leaves)
+                if jax.process_count() == 1:
+                    vector_tree = jax.tree.map(
+                        lambda value, shard: shard(value),
+                        vector_tree, diagnostic_param_shards)
+                else:
+                    # Each host has the broadcast full vector, but creates only
+                    # its addressable parameter shards. Preserve FP32 diagnostics.
+                    vector_tree = jax.tree.map(
+                        lambda value, param: jax.make_array_from_callback(
+                            value.shape, param.sharding, lambda index: value[index]),
+                        vector_tree, params)
+                jax.block_until_ready(vector_tree)
+                spectrum_transfer_seconds['upload'] += (
+                    timeit.default_timer() - boundary)
+                boundary = timeit.default_timer()
+                product = sharded_condition_apply_g(
+                    params, solve_batch, vector_tree, FLAGS.inner_loop_wd)
+                jax.block_until_ready(product)
+                spectrum_transfer_seconds['compute'] += (
+                    timeit.default_timer() - boundary)
+                boundary = timeit.default_timer()
+                host = (jax.device_get(product) if jax.process_count() == 1
+                        else gather_product(product))
+                result = np.concatenate([
+                    np.asarray(leaf, np.float32).reshape(-1)
+                    for leaf in jax.tree.leaves(host)])
+                spectrum_transfer_seconds['download'] += (
+                    timeit.default_timer() - boundary)
+                return result
+            finally:
+                # `del` normally drops these references, but explicit deletion
+                # keeps their device buffers from surviving through Python GC
+                # or a cached collective executable after this product.
+                if jax.process_count() > 1:
+                    for tree in (product, vector_tree):
+                        if tree is not None:
+                            for value in jax.tree.leaves(tree):
+                                delete = getattr(value, 'delete', None)
+                                if delete is not None:
+                                    delete()
+                del vector_tree, product, host
         print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: start', flush=True)
-        spectrum_scalars, spectrum_table = matrix_spectrum.estimate_top_spectrum(
-            cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
-            check_every=FLAGS.spectrum_check_every,
-            max_basis=FLAGS.spectrum_max_basis,
-            restart_keep=FLAGS.spectrum_restart_keep,
-            max_products=FLAGS.spectrum_max_gn_products,
-            residual_tol=FLAGS.spectrum_residual_tol,
-            stability_tol=FLAGS.spectrum_stability_tol,
-            seed=FLAGS.spectrum_seed,
-            progress=lambda done, total: print(
-                f'[spectrum] G products {done}/{total}; '
-                f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
-                f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
-                f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
-                f'download={spectrum_transfer_seconds["download"]:.1f}s',
-                flush=True))
+        try:
+            spectrum_scalars, spectrum_table = run_spectrum(
+                matrix_spectrum.estimate_top_spectrum,
+                cpu_apply, dimension, top_k=FLAGS.spectrum_top_k,
+                check_every=FLAGS.spectrum_check_every,
+                max_basis=FLAGS.spectrum_max_basis,
+                restart_keep=FLAGS.spectrum_restart_keep,
+                max_products=FLAGS.spectrum_max_gn_products,
+                residual_tol=FLAGS.spectrum_residual_tol,
+                stability_tol=FLAGS.spectrum_stability_tol,
+                seed=FLAGS.spectrum_seed,
+                progress=lambda done, total: print(
+                    f'[spectrum] G products {done}/{total}; '
+                    f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
+                    f'upload={spectrum_transfer_seconds["upload"]:.1f}s, '
+                    f'compute={spectrum_transfer_seconds["compute"]:.1f}s, '
+                    f'download={spectrum_transfer_seconds["download"]:.1f}s',
+                    flush=True))
+        except (MemoryError, RuntimeError) as error:
+            # Host 0 receives MemoryError and peers receive its synchronized
+            # RuntimeError wrapper. A memory preflight is an observational
+            # diagnostic limitation, not a reason to terminate training.
+            if 'spectrum preflight requires' not in str(error):
+                raise
+            reason = str(error)[str(error).index('spectrum preflight requires'):]
+            print(f'[spectrum] G top-{FLAGS.spectrum_top_k}: skipped: {reason}',
+                  flush=True)
+            spectrum_scalars, spectrum_table = (
+                matrix_spectrum.unavailable_spectrum_report(
+                    FLAGS.spectrum_top_k, reason,
+                    FLAGS.spectrum_max_basis))
         spectrum_scalars.update({
             f'seconds_{name}': value
             for name, value in spectrum_transfer_seconds.items()})
@@ -125,6 +198,9 @@ class ConditionDiagnostics:
             'gn_products': total_products,
             'seconds': timeit.default_timer() - spectrum_started,
             'basis_size': spectrum_scalars['basis_size'],
+            'basis_capacity': spectrum_scalars['basis_capacity'],
+            'configured_max_basis': spectrum_scalars['configured_max_basis'],
+            'memory_limited': spectrum_scalars['memory_limited'],
             'orthogonality_error': spectrum_scalars['orthogonality_error'],
             'max_relative_ritz_residual':
                 spectrum_scalars['max_relative_ritz_residual'],

@@ -88,8 +88,54 @@ symmetric recurrence matrix and its eigendecomposition use FP64. A preflight
 includes the basis, active blocks, bounded transformation/transfer workspace,
 cgroup-aware available memory, and an 8 GiB reserve. The default 600-vector
 basis is intended for the high-memory TPU host used by this project; at 150M
-parameters the basis alone is about 335 GiB. The diagnostic refuses unsupported
-multi-host runs and insufficient host memory before allocating it.
+parameters the basis alone is about 335 GiB. On multiple hosts, only process 0
+allocates that basis and runs the unchanged CPU estimator. It broadcasts each
+probe and directs all hosts through the same sharded GN product; global products
+are gathered before CPU calculations. The final report is broadcast before the
+fallback/A diagnostics so every host takes the same path. Other hosts hold
+transient full vectors, not a second basis. Process 0 still needs sufficient
+host memory; adding a worker does not pool RAM for the Lanczos basis.
+
+CPU preflight/estimator exceptions release waiting peers. A killed process or
+failed device collective still relies on JAX distributed failure handling.
+Single-host execution, flags, training updates and estimator mathematics are
+unchanged. Multi-host transfers add diagnostic wall time.
+
+After a multi-host diagnostic, every probe and product buffer is explicitly
+deleted and the diagnostic/collective compilation caches are released on each
+host. This avoids carrying transfer executables into an HBM-constrained inner
+solve. Because JAX does not expose the collective helpers' individual caches,
+this clears the local in-memory compilation cache; the first training dispatch
+after a later periodic diagnostic may therefore recompile. Single-host cache
+reuse is unchanged. The terminal line
+`[spectrum] cleanup: released multi-host diagnostic caches` confirms that the
+boundary completed.
+
+The two-process CPU integration check is opt-in (run once on a machine with a
+working JAX CPU collective transport; no TPU training is launched):
+
+```bash
+RUN_MULTIHOST_TESTS=1 JAX_PLATFORMS=cpu OPENBLAS_NUM_THREADS=1 \
+  python -m pytest -q -s tests/test_multihost_spectrum.py
+```
+
+It checks top-100 values against dense NumPy eigenvalues of an explicit J^T J,
+parameter-sharded products, replicated leaves, identical metrics/counts,
+unchanged parameters, failed-spectrum fallback, A endpoints, and CPU error
+propagation. `SPECTRUM_TEST_MPI=1` optionally uses an installed MPI-enabled JAX
+CPU runtime and `mpiexec`; ordinary runs use Gloo.
+
+Validation before the cleanup change: 63 CPU tests passed
+(one opt-in transport test skipped), including numerical/routing/Adam
+regressions, four local sharded devices, and a simulated-transport controller.
+The four-device top-100 test has max relative error 5.90e-8 and resolves
+fallback G and damped/preconditioned A endpoints. The latter checks a
+real JAX J^T J and top-100 values (max relative error 7.21e-8), but is **not** a
+real multi-host test. The opt-in integration test could not reach diagnostics:
+Gloo failed local transport setup (EPERM), and MPI lacked its trampoline wrapper.
+The cleanup-specific tests cover successful, failed, and single-host boundaries,
+but the current scratch runtime cannot import its stale CPU JAX build. A real
+two-host TPU smoke run remains required before a long ablation run.
 
 The short recurrence uses an FP32 overlap scan and adaptive two-pass corrective
 reorthogonalization. Thick restart retains `spectrum_restart_keep` Ritz vectors
@@ -107,6 +153,15 @@ top-k) guard against recurrence drift and lost orthogonality. Consequently
 `spectrum_max_gn_products=600` reserves 11 products for final validation when
 `spectrum_top_k=100`. This budget includes all spectrum operator calls; PCG
 endpoint work remains separate.
+
+FP32 recurrence residuals can become optimistic at slightly different basis
+sizes when device reductions are regrouped across hosts. A recurrence-qualified
+candidate that fails fresh direct residual validation therefore no longer ends
+the estimate immediately: Lanczos continues for at least two check intervals
+and retries while products remain. `validation_attempts` and
+`max_direct_residual` appear in the terminal completion record. All retry
+products count against `spectrum_max_gn_products`; eigenvalues are still
+withheld unless one complete fresh validation passes.
 
 All products use the same frozen parameters, batch and microbatch weighting.
 Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k

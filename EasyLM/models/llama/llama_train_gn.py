@@ -281,8 +281,6 @@ def main(argv):
                 or not 0 < FLAGS.spectrum_inverse_cg_tol < 1):
             raise ValueError('Condition inverse iteration needs a positive CG '
                              'budget and a tolerance in (0, 1)')
-        if jax.process_count() != 1:
-            raise ValueError('spectrum diagnostics currently support single-host execution only')
         if not (0 < FLAGS.spectrum_top_k <= FLAGS.spectrum_restart_keep
                 < FLAGS.spectrum_max_basis):
             raise ValueError('invalid spectrum top-k/restart/basis settings')
