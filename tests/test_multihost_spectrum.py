@@ -109,6 +109,7 @@ def worker(rank, port, distributed=True):
         spectrum_check_every=4, spectrum_max_basis=128, spectrum_restart_keep=100,
         spectrum_max_gn_products=400, spectrum_residual_tol=1e-3,
         spectrum_stability_tol=1e-3, spectrum_seed=0,
+        spectrum_max_validation_attempts=3, spectrum_max_seconds=3600,
         spectrum_endpoint_maxiter=150, spectrum_endpoint_num_starts=2,
         spectrum_endpoint_agreement_tol=1e-3, spectrum_endpoint_residual_tol=1e-3,
         spectrum_inverse_cg_maxiter=128, spectrum_inverse_cg_tol=1e-5)
@@ -135,7 +136,7 @@ def worker(rank, port, distributed=True):
             np.testing.assert_allclose(values, exact[:100], rtol=1e-3)
             print('TOP100_MAX_REL_ERROR', error, flush=True)
         # Both hosts receive identical scientific metrics and product counts.
-        scientific = {k: v for k, v in report.items() if not k.endswith('/seconds')}
+        scientific = {k: v for k, v in report.items() if '/seconds' not in k}
         encoded = np.frombuffer(json.dumps(scientific, sort_keys=True).encode(), np.uint8)
         multihost_utils.assert_equal(encoded)
         np.testing.assert_array_equal(gather_product(params)['w'], original)
@@ -147,7 +148,8 @@ def worker(rank, port, distributed=True):
                                 effective_lambda=.3, safe_adam_lr=.7)
         assert not report['spectrum/G/accepted']
         assert report['spectrum/G/fallback_resolved'], report
-        np.testing.assert_allclose(report['spectrum/G/fallback_lambda_max_est'], exact[0], rtol=.003)
+        assert report['spectrum/G/lambda_1_from_fallback']
+        np.testing.assert_allclose(report['spectrum/G/lambda_1_est'], exact[0], rtol=.003)
         assert report['spectrum/A/resolved'], report
         np.testing.assert_allclose(
             [report['spectrum/A/lambda_min_est'], report['spectrum/A/lambda_max_est']],

@@ -43,11 +43,13 @@ def _memory_report(dimension, max_basis, check_every, reserve_bytes, available):
     # Peak: FP64 basis conversion plus retained restart output coexist.
     chunk_workspace = (2 * max_basis + 2 * check_every + 2) * coordinate_chunk * 8
     projection = 4 * max_basis * max_basis * np.dtype(np.float64).itemsize
+    gram_cache = max_basis * max_basis * np.dtype(np.float64).itemsize
     transfer = 2 * vector
-    required = (basis_buffers + active + projection + transfer
+    required = (basis_buffers + active + projection + gram_cache + transfer
                 + chunk_workspace + reserve_bytes)
     return dict(required_bytes=required, available_bytes=available,
                 basis_buffer_bytes=basis_buffers,
+                gram_cache_bytes=gram_cache,
                 fp64_chunk_workspace_bytes=chunk_workspace,
                 reserve_bytes=reserve_bytes)
 
@@ -100,6 +102,8 @@ def unavailable_spectrum_report(top_k, reason, configured_max_basis):
                    configured_max_basis=configured_max_basis,
                    memory_limited=True, validation_attempts=0,
                    orthogonality_error=None, max_direct_residual=None,
+                   worst_direct_residual_rank=None,
+                   worst_direct_residual=None,
                    max_relative_ritz_residual=None, memory_required_gib=None)
     for name in ('operator', 'orthogonalization', 'gram', 'projection',
                  'eigensolve', 'ritz_residuals', 'expansion', 'restart',
@@ -116,29 +120,72 @@ def unavailable_spectrum_report(top_k, reason, configured_max_basis):
     return scalars, table
 
 
-def _transform_chunked(source, coefficients, destination, *, chunk=1 << 20):
+def _transform_chunked(source, coefficients, destination, *, chunk=1 << 20,
+                       check_deadline=None, heartbeat=None, phase='transform'):
     for start in range(0, source.shape[1], chunk):
+        if check_deadline:
+            check_deadline()
         stop = min(source.shape[1], start + chunk)
         destination[:, start:stop] = (
             coefficients.T @ source[:, start:stop].astype(np.float64)).astype(np.float32)
+        if check_deadline:
+            check_deadline()
+        if heartbeat:
+            heartbeat(phase, stop, source.shape[1])
 
 
-def _transform_in_place(buffer, count, coefficients, *, chunk=1 << 20):
+def _transform_in_place(buffer, count, coefficients, *, chunk=1 << 20,
+                        check_deadline=None, heartbeat=None):
     """Apply coefficients.T to rows using only a bounded coordinate temporary."""
     keep = coefficients.shape[1]
     for start in range(0, buffer.shape[1], chunk):
+        if check_deadline:
+            check_deadline()
         stop = min(buffer.shape[1], start + chunk)
         transformed = coefficients.T @ buffer[:count, start:stop].astype(np.float64)
         buffer[:keep, start:stop] = transformed.astype(np.float32)
+        if check_deadline:
+            check_deadline()
+        if heartbeat:
+            heartbeat('restart transform', stop, buffer.shape[1])
+
+
+def _incremental_gram(q, count, cache=None, cached_count=0, *, chunk=1 << 20,
+                      check_deadline=None, heartbeat=None, stats=None):
+    """Extend an FP64 Gram cache without recomputing its old-old block."""
+    if cache is None:
+        cache = np.zeros((q.shape[0], q.shape[0]), np.float64)
+        cached_count = 0
+    if not 0 <= cached_count <= count or cache.shape[0] < count:
+        raise ValueError('invalid Gram cache state')
+    if stats is not None:
+        stats['old_old_rows_recomputed'] = 0
+        stats['old_rows_reused'] = cached_count
+        stats['new_rows'] = count - cached_count
+    if cached_count == count:
+        return cache, count
+    for start in range(0, q.shape[1], chunk):
+        if check_deadline:
+            check_deadline()
+        stop = min(q.shape[1], start + chunk)
+        new = q[cached_count:count, start:stop].astype(np.float64)
+        cache[cached_count:count, cached_count:count] += new @ new.T
+        if cached_count:
+            old = q[:cached_count, start:stop].astype(np.float64)
+            cross = old @ new.T
+            cache[:cached_count, cached_count:count] += cross
+            cache[cached_count:count, :cached_count] += cross.T
+        if check_deadline:
+            check_deadline()
+        if heartbeat:
+            heartbeat('Gram', stop, q.shape[1])
+    return cache, count
 
 
 def _gram(q, count, *, chunk=1 << 20):
-    result = np.zeros((count, count), np.float64)
-    for start in range(0, q.shape[1], chunk):
-        stop = min(q.shape[1], start + chunk)
-        block = q[:count, start:stop].astype(np.float64)
-        result += block @ block.T
-    return result
+    """Independent full FP64 Gram calculation, retained for checks/tests."""
+    cache, _ = _incremental_gram(q, count, chunk=chunk)
+    return cache[:count, :count].copy()
 
 
 def _norm(vector):
@@ -161,30 +208,44 @@ def _reorthogonalize(value, basis):
     return value
 
 
+class _TimeBudgetExceeded(Exception):
+    pass
+
+
 def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4,
                           max_basis=160, restart_keep=120, max_products=600,
                           residual_tol=.01, stability_tol=.02, seed=0,
-                          progress=None):
+                          max_validation_attempts=3, max_seconds=3600,
+                          progress=None, clock=time.monotonic,
+                          heartbeat_seconds=30):
     """Leading algebraic eigenvalues of a fixed symmetric PSD operator.
 
     check_every is the small projected-eigensolve cadence. max_products includes
     fresh validation of all published ranks. A failed direct validation resumes
-    expansion and retries within the same budget. Failure never publishes scalars.
+    expansion with exponential retry spacing. Failure never publishes scalars.
+    max_seconds is a cooperative, soft host-controller deadline; zero disables it.
     """
     if not 0 < top_k <= restart_keep < max_basis or dimension < top_k:
         raise ValueError('require 0 < top_k <= restart_keep < max_basis and dimension >= top_k')
     if check_every <= 0 or max_products < top_k + 3:
         raise ValueError('invalid check cadence or GN-product budget')
+    if max_validation_attempts <= 0 or int(max_validation_attempts) != max_validation_attempts:
+        raise ValueError('max_validation_attempts must be a positive integer')
+    if not math.isfinite(max_seconds) or max_seconds < 0:
+        raise ValueError('max_seconds must be finite and nonnegative')
     if not (0 < residual_tol < 1 and 0 <= stability_tol < 1):
         raise ValueError('invalid spectrum tolerances')
+    started = clock()
+    deadline = started + max_seconds if max_seconds else None
     max_basis = min(max_basis, dimension)
     max_basis, memory = fit_basis_to_memory(
         dimension, max_basis, restart_keep + 1, check_every)
-    started, rng = time.monotonic(), np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
     q = np.empty((max_basis, dimension), np.float32)
     h = np.zeros((max_basis, max_basis), np.float64)
+    gram_cache = np.zeros((max_basis, max_basis), np.float64)
+    gram_cached_count = 0
     validation_ranks = tuple(sorted({1, top_k, *range(10, top_k + 1, 10)}))
-    expansion_budget = max_products - len(validation_ranks)
     count = products = expansion_products = restart_count = 0
     previous = None
     stable = accepted = False
@@ -193,12 +254,42 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     next_validation_expansion = top_k
     candidate_values = candidate_residuals = vectors = None
     orthogonality_error = math.inf
+    last_heartbeat = started
     timings = {name: 0. for name in (
         'operator', 'orthogonalization', 'gram', 'projection', 'eigensolve',
         'ritz_residuals', 'expansion', 'restart', 'validation')}
 
+    def elapsed(now=None):
+        return (clock() if now is None else now) - started
+
+    def check_deadline():
+        if deadline is not None and clock() >= deadline:
+            raise _TimeBudgetExceeded
+
+    def heartbeat(phase, done, total):
+        nonlocal last_heartbeat
+        now = clock()
+        if heartbeat_seconds >= 0 and now - last_heartbeat >= heartbeat_seconds:
+            print(f'[spectrum] {phase}: {done}/{total}; products={products}; '
+                  f'basis={count}/{max_basis}; elapsed={elapsed(now):.1f}s',
+                  flush=True)
+            last_heartbeat = now
+
+    def progress_line(event, *, attempt=None, recurrence=None, direct_value=None,
+                      worst_rank=None):
+        fields = [f'[spectrum] {event}',
+                  f'attempt={validation_attempts + 1 if attempt is None else attempt}',
+                  f'products={products}', f'basis={count}/{max_basis}',
+                  f'elapsed={elapsed():.1f}s',
+                  f'recurrence_residual={recurrence if recurrence is not None else "n/a"}',
+                  f'direct_residual={direct_value if direct_value is not None else "n/a"}']
+        if worst_rank is not None:
+            fields.append(f'worst_rank={worst_rank}')
+        print(' '.join(fields), flush=True)
+
     def random_direction():
         for _ in range(8):
+            check_deadline()
             value = rng.standard_normal(dimension, dtype=np.float32)
             value = _reorthogonalize(value, q[:count])
             norm = _norm(value)
@@ -208,37 +299,62 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
 
     def apply(value):
         nonlocal products
-        timer = time.monotonic()
+        if products >= max_products:
+            raise RuntimeError('spectrum product budget exceeded')
+        check_deadline()
+        timer = clock()
         image = np.asarray(apply_operator(value.copy()), np.float32)
-        timings['operator'] += time.monotonic() - timer
+        timings['operator'] += clock() - timer
         products += 1
         if progress and products % 10 == 0:
             progress(products, max_products)
         if image.shape != (dimension,) or not np.all(np.isfinite(image)):
             raise ValueError('invalid_operator_product')
+        check_deadline()
         return image.copy()
 
     def validate_candidate():
         """Freshly check published Ritz pairs; return False to keep expanding."""
         nonlocal orthogonality_error, direct, validation_attempts
+        nonlocal gram_cache, gram_cached_count
         validation_attempts += 1
-        timer = time.monotonic()
+        recurrence = (float(np.max(candidate_residuals))
+                      if candidate_residuals is not None else None)
+        progress_line('validation start', attempt=validation_attempts,
+                      recurrence=recurrence)
+        check_deadline()
+        timer = clock()
+        try:
+            gram_cache, new_cached_count = _incremental_gram(
+                q, count, gram_cache, gram_cached_count,
+                check_deadline=check_deadline, heartbeat=heartbeat)
+        finally:
+            timings['gram'] += clock() - timer
         orthogonality_error = float(np.linalg.norm(
-            _gram(q, count) - np.eye(count), ord=np.inf))
-        timings['gram'] += time.monotonic() - timer
+            gram_cache[:count, :count] - np.eye(count), ord=np.inf))
+        gram_cached_count = new_cached_count
+        check_deadline()
         if not math.isfinite(orthogonality_error) or orthogonality_error > 1e-3:
             failure.append('invalid_orthonormal_basis')
+            progress_line('validation end', attempt=validation_attempts,
+                          recurrence=recurrence)
             return False
 
         attempt = {}
         valid = True
         for start in range(0, len(validation_ranks), check_every):
-            timer = time.monotonic()
+            check_deadline()
+            timer = clock()
             ranks = validation_ranks[start:start + check_every]
             indices = np.asarray(ranks, dtype=np.int64) - 1
             u = np.empty((len(ranks), dimension), np.float32)
-            _transform_chunked(q[:count], vectors[:, indices], u)
-            timings['validation'] += time.monotonic() - timer
+            try:
+                _transform_chunked(q[:count], vectors[:, indices], u,
+                                   check_deadline=check_deadline,
+                                   heartbeat=heartbeat,
+                                   phase='validation transform')
+            finally:
+                timings['validation'] += clock() - timer
             for rank, index, vector in zip(ranks, indices, u):
                 try:
                     image = apply(vector)
@@ -247,7 +363,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                         raise
                     failure.append(str(error))
                     return False
-                timer = time.monotonic()
+                timer = clock()
                 norm = _norm(vector)
                 residual = _norm(
                     image - np.float32(candidate_values[index]) * vector
@@ -255,103 +371,141 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                         np.finfo(np.float64).eps)
                 attempt[rank] = residual
                 valid &= math.isfinite(residual) and residual <= residual_tol
-                timings['validation'] += time.monotonic() - timer
+                timings['validation'] += clock() - timer
+                check_deadline()
+        # Publish only a complete attempt; deadline exits leave the prior result.
         direct = attempt
+        worst_rank = max(attempt, key=attempt.get) if attempt else None
+        progress_line('validation end', attempt=validation_attempts,
+                      recurrence=recurrence,
+                      direct_value=attempt.get(worst_rank) if worst_rank else None,
+                      worst_rank=worst_rank)
         return bool(valid)
 
-    next_vector = random_direction()
-    while products < expansion_budget:
-        q[count] = next_vector
-        try:
-            w = apply(next_vector)
-            expansion_products += 1
-        except ValueError as error:
-            if str(error) != 'invalid_operator_product': raise
-            failure.append(str(error)); break
-        timer = time.monotonic()
-        image_norm = _norm(w)
-        # Three-term recurrence except for the first step after thick restart.
-        coupling = h[:count, count]
-        nonzero = np.flatnonzero(coupling)
-        if len(nonzero) == 1:
-            index = nonzero[0]
-            w -= np.float32(coupling[index]) * q[index]
-        elif len(nonzero) > 1:
-            w -= coupling.astype(np.float32) @ q[:count]
-        alpha = float(np.einsum('i,i->', next_vector, w, dtype=np.float64))
-        h[count, count] = alpha
-        w -= np.float32(alpha) * next_vector
-        timings['expansion'] += time.monotonic() - timer
-        timer = time.monotonic()
-        w = _reorthogonalize(w, q[:count + 1])
-        beta = _norm(w)
-        timings['orthogonalization'] += time.monotonic() - timer
-        count += 1
-        breakdown = beta <= 32 * np.finfo(np.float32).eps * max(image_norm, 1e-30)
-        check = (count >= top_k and (
-                 expansion_products % check_every == 0 or breakdown
-                 or count == max_basis or products == expansion_budget))
-        if check:
-            timer = time.monotonic()
-            values, vectors = np.linalg.eigh(h[:count, :count])
-            values, vectors = values[::-1], vectors[:, ::-1]
-            timings['eigensolve'] += time.monotonic() - timer
-            candidate_values = values[:top_k].copy()
-            timer = time.monotonic()
-            candidate_residuals = beta * np.abs(vectors[-1, :top_k]) / np.maximum(
-                np.abs(candidate_values), np.finfo(np.float64).eps)
-            stable = previous is not None and bool(np.all(
-                np.abs(candidate_values - previous) / np.maximum(
-                    np.abs(candidate_values), 1e-30) <= stability_tol))
-            # A complete orthonormal basis has no unexplored subspace.
-            stable = stable or count == dimension
-            previous = candidate_values.copy()
-            timings['ritz_residuals'] += time.monotonic() - timer
-            recurrence_passed = (stable and np.all(candidate_values > 0)
-                    and np.all(np.isfinite(candidate_values))
-                    and np.all(candidate_residuals <= residual_tol))
-            if (recurrence_passed
-                    and expansion_products >= next_validation_expansion):
-                accepted = validate_candidate()
-                if accepted or failure:
-                    break
-                # FP32 recurrence residuals can be optimistic. Continue far
-                # enough to make a second direct validation meaningful.
-                next_validation_expansion = (
-                    expansion_products + 2 * check_every)
-        if products >= expansion_budget:
-            break
-        if count == dimension:
-            failure.append('direct_residual_failed' if validation_attempts
-                           else 'acceptance_checks_failed')
-            break
-        if breakdown:
-            timer = time.monotonic()
-            next_vector = random_direction()
-            timings['orthogonalization'] += time.monotonic() - timer
-            beta = 0.
-            if next_vector is None:
-                failure.append('basis_breakdown'); break
-        else:
-            next_vector = w / np.float32(beta)
-        if count == max_basis:
-            timer = time.monotonic()
-            keep = min(restart_keep, count - 1)
-            _transform_in_place(q, count, vectors[:, :keep])
-            h.fill(0)
-            h[np.arange(keep), np.arange(keep)] = values[:keep]
-            h[:keep, keep] = h[keep, :keep] = beta * vectors[-1, :keep]
-            count = keep
-            restart_count += 1
-            timings['restart'] += time.monotonic() - timer
-        else:
-            h[count - 1, count] = h[count, count - 1] = beta
+    try:
+        next_vector = random_direction()
+        while products < max_products:
+            check_deadline()
+            if products + 1 > max_products:
+                break
+            q[count] = next_vector
+            try:
+                w = apply(next_vector)
+                expansion_products += 1
+            except ValueError as error:
+                if str(error) != 'invalid_operator_product':
+                    raise
+                failure.append(str(error)); break
+            timer = clock()
+            image_norm = _norm(w)
+            # Three-term recurrence except for the first step after thick restart.
+            coupling = h[:count, count]
+            nonzero = np.flatnonzero(coupling)
+            if len(nonzero) == 1:
+                index = nonzero[0]
+                w -= np.float32(coupling[index]) * q[index]
+            elif len(nonzero) > 1:
+                w -= coupling.astype(np.float32) @ q[:count]
+            alpha = float(np.einsum('i,i->', next_vector, w, dtype=np.float64))
+            h[count, count] = alpha
+            w -= np.float32(alpha) * next_vector
+            timings['expansion'] += clock() - timer
+            check_deadline()
+            timer = clock()
+            w = _reorthogonalize(w, q[:count + 1])
+            beta = _norm(w)
+            timings['orthogonalization'] += clock() - timer
+            check_deadline()
+            count += 1
+            breakdown = beta <= 32 * np.finfo(np.float32).eps * max(image_norm, 1e-30)
+            validation_fits = products + len(validation_ranks) <= max_products
+            final_validation_point = (count == max_basis or count == dimension
+                                      or products + len(validation_ranks) == max_products)
+            check = (count >= top_k and (
+                     expansion_products % check_every == 0 or breakdown
+                     or final_validation_point))
+            if check:
+                timer = clock()
+                values, vectors = np.linalg.eigh(h[:count, :count])
+                values, vectors = values[::-1], vectors[:, ::-1]
+                timings['eigensolve'] += clock() - timer
+                check_deadline()
+                candidate_values = values[:top_k].copy()
+                timer = clock()
+                candidate_residuals = beta * np.abs(vectors[-1, :top_k]) / np.maximum(
+                    np.abs(candidate_values), np.finfo(np.float64).eps)
+                stable = previous is not None and bool(np.all(
+                    np.abs(candidate_values - previous) / np.maximum(
+                        np.abs(candidate_values), 1e-30) <= stability_tol))
+                stable = stable or count == dimension
+                previous = candidate_values.copy()
+                timings['ritz_residuals'] += clock() - timer
+                check_deadline()
+                recurrence_passed = (stable and np.all(candidate_values > 0)
+                        and np.all(np.isfinite(candidate_values))
+                        and np.all(candidate_residuals <= residual_tol))
+                validation_due = (expansion_products >= next_validation_expansion
+                                  or final_validation_point)
+                if recurrence_passed and validation_due and validation_fits:
+                    accepted = validate_candidate()
+                    if accepted or failure:
+                        break
+                    if validation_attempts >= max_validation_attempts:
+                        failure.append('validation_attempt_budget_exhausted')
+                        break
+                    # Failed complete validations back off by 8, 16, ... cadences.
+                    next_validation_expansion = (expansion_products
+                        + (2 ** (validation_attempts + 2)) * check_every)
+            if products + len(validation_ranks) >= max_products:
+                break
+            if count == dimension:
+                failure.append('direct_residual_failed' if validation_attempts
+                               else 'acceptance_checks_failed')
+                break
+            if breakdown:
+                timer = clock()
+                next_vector = random_direction()
+                timings['orthogonalization'] += clock() - timer
+                beta = 0.
+                if next_vector is None:
+                    failure.append('basis_breakdown'); break
+            else:
+                next_vector = w / np.float32(beta)
+            if count == max_basis:
+                recurrence = (float(np.max(candidate_residuals))
+                              if candidate_residuals is not None else None)
+                progress_line('basis restart', attempt=validation_attempts,
+                              recurrence=recurrence,
+                              direct_value=max(direct.values()) if direct else None,
+                              worst_rank=max(direct, key=direct.get) if direct else None)
+                timer = clock()
+                keep = min(restart_keep, count - 1)
+                try:
+                    _transform_in_place(q, count, vectors[:, :keep],
+                                        check_deadline=check_deadline,
+                                        heartbeat=heartbeat)
+                finally:
+                    timings['restart'] += clock() - timer
+                # Stored rows were rounded to FP32; rebuild from those rows later.
+                gram_cache.fill(0.)
+                gram_cached_count = 0
+                h.fill(0)
+                h[np.arange(keep), np.arange(keep)] = values[:keep]
+                h[:keep, keep] = h[keep, :keep] = beta * vectors[-1, :keep]
+                count = keep
+                restart_count += 1
+                check_deadline()
+            else:
+                h[count - 1, count] = h[count, count - 1] = beta
+    except _TimeBudgetExceeded:
+        failure.append('time_budget_exhausted')
 
     if not accepted and not failure:
         failure.append('direct_residual_failed' if validation_attempts
                        else 'product_budget_exhausted')
+    worst_rank = max(direct, key=direct.get) if direct else None
     scalars = dict(accepted=bool(accepted), gn_products=products,
-                   seconds=time.monotonic() - started,
+                   seconds=elapsed(),
                    restart_count=restart_count, basis_size=count,
                    basis_capacity=max_basis,
                    configured_max_basis=memory['requested_max_basis'],
@@ -360,6 +514,9 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                    orthogonality_error=orthogonality_error,
                    max_direct_residual=(float(max(direct.values()))
                        if direct else None),
+                   worst_direct_residual_rank=worst_rank,
+                   worst_direct_residual=(float(direct[worst_rank])
+                       if worst_rank is not None else None),
                    max_relative_ritz_residual=(float(np.max(candidate_residuals))
                        if candidate_residuals is not None else None),
                    memory_required_gib=memory['required_bytes'] / 2**30)

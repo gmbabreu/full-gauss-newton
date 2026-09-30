@@ -13,7 +13,8 @@ from EasyLM import matrix_spectrum
 from EasyLM import multihost_spectrum as transport
 
 
-@pytest.mark.parametrize('failure', [None, 'before_product', 'after_product'])
+@pytest.mark.parametrize('failure',
+                         [None, 'controlled', 'before_product', 'after_product'])
 def test_controller_owns_estimator_and_releases_peers(failure):
     barrier = threading.Barrier(2, timeout=20)
     local = threading.local()
@@ -37,6 +38,13 @@ def test_controller_owns_estimator_and_releases_peers(failure):
         return np.asarray(apply(vector))
     def estimate(apply, dimension, **kwargs):
         assert local.rank == 0
+        if failure == 'controlled':
+            return matrix_spectrum.unavailable_spectrum_report(
+                100, 'time budget', 128)[0], dict(
+                    values=[], residuals=[], direct_residuals={},
+                    failure_reasons=['time_budget_exhausted'],
+                    orthogonality_error=None, restart_count=0,
+                    memory_preflight=None)
         if failure:
             if failure == 'after_product':
                 apply(np.ones(dimension, np.float32))
@@ -49,7 +57,8 @@ def test_controller_owns_estimator_and_releases_peers(failure):
                 check_every=4, max_basis=128, restart_keep=100, max_products=400,
                 residual_tol=1e-3, stability_tol=1e-3)
         except (MemoryError, RuntimeError) as error:
-            assert failure and 'test allocation failure' in str(error)
+            assert failure not in (None, 'controlled')
+            assert 'test allocation failure' in str(error)
             return 'released'
     with patch.object(transport, 'jax', SimpleNamespace(
             process_count=lambda: 2, process_index=lambda: local.rank)), \
@@ -61,7 +70,12 @@ def test_controller_owns_estimator_and_releases_peers(failure):
         results = [future.result(timeout=30) for future in futures]
     assert results[0] == results[1]
     assert counts[0] == counts[1]
-    if failure:
+    if failure == 'controlled':
+        scalars, table = results[0]
+        assert not scalars['accepted']
+        assert table['failure_reasons'] == ['time_budget_exhausted']
+        assert counts == [0, 0]
+    elif failure:
         assert results == ['released', 'released']
     else:
         scalars, table = results[0]

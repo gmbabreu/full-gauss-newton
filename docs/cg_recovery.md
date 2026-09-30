@@ -52,13 +52,15 @@ is used. Dropout and FCM must be disabled. `cg_n_micro` microbatches diagnostic
 `Gv` for every supported solver, including Muon; it does not microbatch Muon's
 inner training solve.
 
-An accepted top-k result supplies `spectrum/G/lambda_1_est`; the largest
-eigenvalue is not recomputed. If top-k convergence fails, a power estimate is
-still attempted and recorded as `spectrum/G/fallback_lambda_max_est`. Raw-G
-metrics live only under `spectrum/G/*`. W&B retains the accepted eigenvalues,
-top-10/top-100 ratios, residual and orthogonality checks, basis size, total raw-G
-products, elapsed time, and failure details when unresolved. Detailed phase and
-transfer timings remain in terminal output rather than W&B.
+`spectrum/G/lambda_1_est` is the one canonical maximum series. An accepted
+top-k result supplies it directly. If full top-k acceptance fails, a bounded
+power estimate supplies the same series only when that endpoint is resolved and
+finite; there is no duplicate fallback-value series. `lambda_1_from_fallback`,
+`lambda_1_resolved`, `lambda_1_residual`, and `lambda_1_residual_tol` make the
+source and validation standard explicit. The top-k direct tolerance defaults to
+0.01, while the maximum-only fallback defaults to 0.05. A maximum-only fallback
+never fabricates higher ranks or condition ratios. Raw-G metrics live only under
+`spectrum/G/*`; failure and fallback status remain available when unresolved.
 
 `A`'s maximum uses power iteration; its minimum uses inverse iteration with
 compiled, diagonally preconditioned inner CG solves. Defaults are
@@ -105,7 +107,7 @@ After a multi-host diagnostic, every probe and product buffer is explicitly
 deleted and the diagnostic/collective compilation caches are released on each
 host. This avoids carrying transfer executables into an HBM-constrained inner
 solve. Because JAX does not expose the collective helpers' individual caches,
-this clears the local in-memory compilation cache; the first training dispatch
+`jax.clear_caches()` clears caches globally within that process; the first training dispatch
 after a later periodic diagnostic may therefore recompile. Single-host cache
 reuse is unchanged. The terminal line
 `[spectrum] cleanup: released multi-host diagnostic caches` confirms that the
@@ -145,7 +147,11 @@ starts a random direction orthogonal to the current basis. The old residual
 expansion solver and stored `GQ` buffer have been removed.
 
 `spectrum_check_every` controls the projected-eigensolve cadence and the bounded
-validation reconstruction batch.
+validation reconstruction batch. The FP64 Gram matrix is cached: validation
+retains old-old entries and computes only old-new and new-new blocks in bounded
+coordinate chunks. A thick restart transforms and rounds stored rows to FP32,
+so it invalidates this cache and the next validation rebuilds it from actual
+stored rows. The cache is included in host-memory preflight accounting.
 Recurrence residuals screen convergence, together with the existing eigenvalue
 stability tolerance. Before acceptance, a full Gram check and fresh direct
 residual checks of every scalar rank that will be published (1, 10, 20, ...,
@@ -157,20 +163,27 @@ endpoint work remains separate.
 FP32 recurrence residuals can become optimistic at slightly different basis
 sizes when device reductions are regrouped across hosts. A recurrence-qualified
 candidate that fails fresh direct residual validation therefore no longer ends
-the estimate immediately: Lanczos continues for at least two check intervals
-and retries while products remain. `validation_attempts` and
-`max_direct_residual` appear in the terminal completion record. All retry
-products count against `spectrum_max_gn_products`; eigenvalues are still
-withheld unless one complete fresh validation passes.
+the estimate immediately. Retries are spaced by 8, 16, ...
+`spectrum_check_every` expansion steps. `spectrum_max_validation_attempts=3`
+caps total complete validations, and `spectrum_max_seconds=3600` adds a soft,
+cooperative host-0 deadline; zero disables only the elapsed-time limit. The
+deadline is checked around products and within chunked CPU work, never by peers
+using independent clocks and never by asynchronously interrupting a collective.
+An in-flight device/BLAS call can overrun it, and fallback plus cleanup take
+additional time. Controlled stops report `validation_attempt_budget_exhausted`
+or `time_budget_exhausted`, withhold incomplete candidates, and then use the
+existing bounded maximum fallback. All validation products count against
+`spectrum_max_gn_products`.
 
 All products use the same frozen parameters, batch and microbatch weighting.
 Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
 (`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is
 not divisible by ten. Intermediate ranks need no additional eigensolve or
-operator products for logging. Unresolved estimates remain withheld. Candidate
-tables, memory estimates, and historical phase timing keys are omitted from
-W&B to keep the dashboard compact; the terminal completion record remains
-detailed enough for performance debugging.
+operator products for logging. Unresolved estimates remain withheld. Validation
+attempts, phase and transfer timers, capacity/memory status, maximum direct
+residual, and the worst checked rank/residual are forwarded to metrics.
+Validation starts/ends, restarts, and long chunked CPU work also produce terminal
+progress so quiet TPU-product periods are distinguishable from a hang.
 
 Lanczos still uses Rayleigh--Ritz on a small recurrence matrix. Its advantage
 here is avoiding repeated full-basis projection/residual reconstruction and
@@ -193,8 +206,21 @@ python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum
 python -m EasyLM.models.llama.llama_train_gn ... --condition_log=True --spectrum_max_gn_products=1200
 ```
 
-The diagnostic controls may change on exact resume because they are
-observational and do not alter optimizer state or data consumption.
+The diagnostic controls, including the two new `spectrum_*` limits, may change
+on exact resume because they are observational and do not alter optimizer state
+or data consumption.
+
+This implementation was transplanted from diagnostics-only commits `b891ac7`,
+`bd5401d`, `0ce84ca`, and `db86be7` onto main `1ac6532`, then extended here.
+CPU tests cover exact/rotated spectra, thick restart, explicit-Jacobian GN,
+incremental Gram reuse/rebuild, retry/product limits, cooperative deadlines,
+canonical maximum routing, and simulated multi-host coordination/cleanup. They
+do not diagnose the observed 12-hour event, establish a TPU speedup, or replace
+a real multi-host run. Before another full run, perform a short training
+continuation smoke test and repeat diagnostics on the saved difficult
+checkpoint. If the residual plateau remains, next test the frozen operator's
+repeatability, linearity, symmetry, and BF16/FP32 discrepancy; a
+diagnostic-only precision change is separate work requiring its own validation.
 
 ## Data order and compatibility
 

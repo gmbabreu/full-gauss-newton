@@ -28,6 +28,7 @@ class ConditionRoutingTest(unittest.TestCase):
             spectrum_check_every=2, spectrum_max_basis=8, spectrum_restart_keep=4,
             spectrum_max_gn_products=100, spectrum_residual_tol=.01,
             spectrum_stability_tol=.02, spectrum_seed=0,
+            spectrum_max_validation_attempts=3, spectrum_max_seconds=3600,
             spectrum_endpoint_maxiter=150, spectrum_endpoint_num_starts=2,
             spectrum_endpoint_agreement_tol=1e-4,
             spectrum_endpoint_residual_tol=1e-4,
@@ -44,6 +45,28 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertFalse(any(key.startswith('condition/') for key in result))
         return result
 
+    @staticmethod
+    def spectrum_result(*, accepted, reason=(), direct=None):
+        scalars = dict(accepted=accepted, gn_products=7, seconds=.5,
+            restart_count=0, basis_size=6, basis_capacity=8,
+            configured_max_basis=8, memory_limited=False,
+            validation_attempts=1, orthogonality_error=1e-6,
+            max_direct_residual=2e-4, worst_direct_residual_rank=2,
+            worst_direct_residual=2e-4, max_relative_ritz_residual=1e-5,
+            memory_required_gib=.01, lambda_1_est=10. if accepted else None,
+            lambda_2_est=7. if accepted else None, lambda_10_est=None,
+            lambda_100_est=None, top10_condition_est=None,
+            top100_condition_est=None)
+        for name in ('operator', 'orthogonalization', 'gram', 'projection',
+                     'eigensolve', 'ritz_residuals', 'expansion', 'restart',
+                     'validation'):
+            scalars[f'seconds_{name}'] = .01
+        table = dict(values=[10., 7.], residuals=[1e-5, 1e-5],
+                     direct_residuals=direct or {}, failure_reasons=list(reason),
+                     orthogonality_error=1e-6, restart_count=0,
+                     memory_preflight={})
+        return scalars, table
+
     def test_non_cg_reuses_spectrum_maximum_without_damped_work(self):
         with patch.object(matrix_condition, 'condition_diagnostic',
                           side_effect=AssertionError('duplicate G maximum')):
@@ -52,16 +75,47 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertAlmostEqual(result['spectrum/G/lambda_1_est'], 10., delta=.01)
         self.assertFalse(any(k.startswith('spectrum/A/') for k in result))
         self.assertEqual(result['spectrum/G/gn_products'], len(self.calls))
-        self.assertEqual(set(result), {
-            'spectrum/G/accepted', 'spectrum/G/gn_products',
-            'spectrum/G/seconds', 'spectrum/G/basis_size',
-            'spectrum/G/basis_capacity',
-            'spectrum/G/configured_max_basis',
-            'spectrum/G/memory_limited',
-            'spectrum/G/orthogonality_error',
-            'spectrum/G/max_relative_ritz_residual',
-            'spectrum/G/max_direct_residual', 'spectrum/G/lambda_1_est',
-            'spectrum/G/lambda_2_est'})
+        self.assertTrue(result['spectrum/G/lambda_1_resolved'])
+        self.assertFalse(result['spectrum/G/lambda_1_from_fallback'])
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], .01)
+        self.assertIn('spectrum/G/validation_attempts', result)
+        self.assertIn('spectrum/G/seconds_gram', result)
+        self.assertNotIn('spectrum/G/fallback_lambda_max_est', result)
+
+    def test_accepted_multihost_string_rank_reports_truthful_maximum(self):
+        report = self.spectrum_result(accepted=True, direct={'1': 3e-4, '2': 2e-4})
+        with patch.object(condition_diagnostics, 'run_spectrum', return_value=report), \
+                patch.object(matrix_condition, 'condition_diagnostic',
+                             side_effect=AssertionError('no fallback')):
+            result = self.run_controller()
+        self.assertEqual(result['spectrum/G/lambda_1_est'], 10.)
+        self.assertEqual(result['spectrum/G/lambda_1_residual'], 3e-4)
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], .01)
+        self.assertFalse(result['spectrum/G/lambda_1_from_fallback'])
+
+    def test_unresolved_fallback_withholds_all_eigenvalue_series(self):
+        spectrum = self.spectrum_result(
+            accepted=False, reason=('time_budget_exhausted',))
+        fallback = dict(lambda_max_est=None, lambda_max_residual=.2,
+                        resolved=False, failure_reasons=('eigenpair_residual',),
+                        operator_matvecs=4)
+        with patch.object(condition_diagnostics, 'run_spectrum',
+                          return_value=spectrum), \
+                patch.object(matrix_condition, 'condition_diagnostic',
+                             return_value=fallback):
+            result = self.run_controller()
+        self.assertFalse(result['spectrum/G/lambda_1_resolved'])
+        self.assertTrue(result['spectrum/G/lambda_1_from_fallback'])
+        self.assertEqual(result['spectrum/G/lambda_1_residual'], .2)
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], 1e-4)
+        self.assertNotIn('spectrum/G/lambda_1_est', result)
+        self.assertFalse(any(key.startswith('spectrum/G/lambda_') and
+                             key.endswith('_est') for key in result))
+        self.assertNotIn('spectrum/G/top10_condition_est', result)
+        self.assertEqual(result['spectrum/G/failure_reasons'],
+                         'time_budget_exhausted')
+        self.assertEqual(result['spectrum/G/fallback_failure_reasons'],
+                         'eigenpair_residual')
 
     def test_cg_damped_endpoints_and_compiled_reuse_with_new_diagonal(self):
         for scale in (1., 2.):
@@ -87,8 +141,11 @@ class ConditionRoutingTest(unittest.TestCase):
         result = self.run_controller()
         self.assertFalse(result['spectrum/G/accepted'])
         self.assertTrue(result['spectrum/G/fallback_resolved'])
-        self.assertAlmostEqual(
-            result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
+        self.assertTrue(result['spectrum/G/lambda_1_resolved'])
+        self.assertTrue(result['spectrum/G/lambda_1_from_fallback'])
+        self.assertAlmostEqual(result['spectrum/G/lambda_1_est'], 10., delta=.01)
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], 1e-4)
+        self.assertNotIn('spectrum/G/fallback_lambda_max_est', result)
         self.assertEqual(result['spectrum/G/gn_products'], len(self.calls))
         self.assertIn('spectrum/G/failure_reasons', result)
 
@@ -102,8 +159,7 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertEqual(result['spectrum/G/failure_reasons'],
                          'insufficient_host_memory')
         self.assertTrue(result['spectrum/G/fallback_resolved'])
-        self.assertAlmostEqual(
-            result['spectrum/G/fallback_lambda_max_est'], 10., delta=.01)
+        self.assertAlmostEqual(result['spectrum/G/lambda_1_est'], 10., delta=.01)
         self.assertIn('skipped: spectrum preflight requires', output.getvalue())
 
     def test_cached_solvers_use_current_params_batch_and_step(self):
@@ -129,9 +185,9 @@ class ConditionRoutingTest(unittest.TestCase):
                 actual = controller.run(params, batch, **kwargs)
                 expected = fresh.run(params, batch, **kwargs)
             self.assertEqual(
-                {k: v for k, v in actual.items() if not k.endswith('/seconds')},
-                {k: v for k, v in expected.items() if not k.endswith('/seconds')})
-            self.assertAlmostEqual(actual['spectrum/G/fallback_lambda_max_est'],
+                {k: v for k, v in actual.items() if '/seconds' not in k},
+                {k: v for k, v in expected.items() if '/seconds' not in k})
+            self.assertAlmostEqual(actual['spectrum/G/lambda_1_est'],
                                    10. if step == 0 else 21., delta=.01)
             if cached is not None:
                 for name, solver in cached.items():
@@ -194,6 +250,8 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertIn('spectrum_endpoint_maxiter', names)
         self.assertIn('spectrum_inverse_cg_maxiter', names)
         self.assertIn('spectrum_check_every', names)
+        self.assertIn('spectrum_max_validation_attempts', names)
+        self.assertIn('spectrum_max_seconds', names)
         schedules = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'do_condition'
                              for t in n.targets)]
@@ -210,7 +268,9 @@ class ConditionRoutingTest(unittest.TestCase):
             {'optimizer_type': 'cg', 'condition_log': False},
             {'optimizer_type': 'cg', 'condition_log': True, 'condition_every': 50,
              'spectrum_inverse_cg_maxiter': 100,
-             'spectrum_inverse_cg_tol': .001})
+             'spectrum_inverse_cg_tol': .001,
+             'spectrum_max_validation_attempts': 3,
+             'spectrum_max_seconds': 3600})
 
 
 if __name__ == '__main__':

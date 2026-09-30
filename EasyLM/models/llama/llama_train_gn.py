@@ -166,6 +166,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     spectrum_max_basis=600,
     spectrum_restart_keep=120,
     spectrum_max_gn_products=600,
+    spectrum_max_validation_attempts=3,
+    spectrum_max_seconds=3600,
     spectrum_residual_tol=0.01,
     spectrum_stability_tol=0.02,
     spectrum_seed=0,
@@ -286,6 +288,13 @@ def main(argv):
             raise ValueError('invalid spectrum top-k/restart/basis settings')
         if FLAGS.spectrum_check_every <= 0:
             raise ValueError('spectrum check cadence must be positive')
+        if (FLAGS.spectrum_max_validation_attempts <= 0
+                or int(FLAGS.spectrum_max_validation_attempts)
+                != FLAGS.spectrum_max_validation_attempts):
+            raise ValueError('spectrum validation attempt budget must be a positive integer')
+        if (not np.isfinite(FLAGS.spectrum_max_seconds)
+                or FLAGS.spectrum_max_seconds < 0):
+            raise ValueError('spectrum elapsed-time budget must be finite and nonnegative')
 
     if not 0.0 <= FLAGS.outer_weight_decay < 1.0:
         raise ValueError("outer_weight_decay must satisfy 0 <= rho < 1")

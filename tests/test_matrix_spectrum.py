@@ -11,6 +11,34 @@ class MatrixSpectrumTest(unittest.TestCase):
         with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
             report = ms.memory_preflight(1000, 160, 4, reserve_bytes=0)
         self.assertEqual(report['basis_buffer_bytes'], 160 * 1000 * 4)
+        self.assertEqual(report['gram_cache_bytes'], 160 * 160 * 8)
+
+    def test_incremental_gram_reuses_old_old_and_rebuilds_after_restart(self):
+        rng = np.random.default_rng(91)
+        q = rng.normal(size=(40, 37)).astype(np.float32)
+        cache = np.zeros((40, 40), np.float64)
+        cached_count = 0
+        for count in (12, 20, 28, 40):
+            stats = {}
+            cache, cached_count = ms._incremental_gram(
+                q, count, cache, cached_count, chunk=7, stats=stats)
+            expected = q[:count].astype(np.float64) @ q[:count].astype(np.float64).T
+            np.testing.assert_allclose(cache[:count, :count], expected,
+                                       rtol=0, atol=5e-14)
+            self.assertEqual(stats['old_old_rows_recomputed'], 0)
+            self.assertEqual(stats['old_rows_reused'], 0 if count == 12 else previous)
+            previous = count
+
+        coefficients = np.linalg.qr(rng.normal(size=(40, 13)))[0]
+        ms._transform_in_place(q, 40, coefficients, chunk=9)
+        cache.fill(0.)
+        stats = {}
+        cache, cached_count = ms._incremental_gram(
+            q, 13, cache, 0, chunk=7, stats=stats)
+        expected = q[:13].astype(np.float64) @ q[:13].astype(np.float64).T
+        np.testing.assert_allclose(cache[:13, :13], expected, rtol=0, atol=5e-14)
+        self.assertEqual(cached_count, 13)
+        self.assertEqual(stats['old_rows_reused'], 0)
 
     def test_preflight_respects_effective_limit(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=1024):
@@ -215,17 +243,131 @@ class MatrixSpectrumTest(unittest.TestCase):
             if calls in (19, 20):
                 image = image + .1 * np.roll(v, 1)
             return image
-        scalars, table = ms.estimate_top_spectrum(
-            apply, 64, top_k=5, check_every=2, max_basis=24,
-            restart_keep=12, max_products=120, residual_tol=1e-3,
-            stability_tol=1e-3, seed=3)
+        validation_sizes = []
+        incremental = ms._incremental_gram
+        def record_gram(q, count, *args, **kwargs):
+            validation_sizes.append(count)
+            return incremental(q, count, *args, **kwargs)
+        with mock.patch.object(ms, '_incremental_gram', side_effect=record_gram):
+            scalars, table = ms.estimate_top_spectrum(
+                apply, 64, top_k=5, check_every=2, max_basis=48,
+                restart_keep=24, max_products=120, residual_tol=1e-3,
+                stability_tol=1e-3, seed=3)
         self.assertTrue(scalars['accepted'], table)
         self.assertEqual(scalars['validation_attempts'], 2)
+        self.assertGreaterEqual(validation_sizes[1] - validation_sizes[0], 16)
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 120)
         np.testing.assert_allclose(
             table['values'], diagonal[:5], rtol=1e-3, atol=1e-3)
         self.assertLessEqual(scalars['max_direct_residual'], 1e-3)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_persistent_direct_failure_stops_at_attempt_cap(self, _memory):
+        diagonal = np.r_[np.linspace(10., 9., 5),
+                         np.linspace(4., .1, 59)].astype(np.float32)
+        calls = 0
+        original = ms._transform_chunked
+
+        def corrupt(source, coefficients, destination, **kwargs):
+            original(source, coefficients, destination, **kwargs)
+            destination[:] = np.roll(destination, 1, axis=1)
+
+        def apply(vector):
+            nonlocal calls
+            calls += 1
+            return diagonal * vector
+
+        with mock.patch.object(ms, '_transform_chunked', side_effect=corrupt):
+            scalars, table = ms.estimate_top_spectrum(
+                apply, 64, top_k=5, check_every=2, max_basis=24,
+                restart_keep=12, max_products=160, residual_tol=1e-3,
+                stability_tol=1e-3, max_validation_attempts=3, seed=3)
+        self.assertFalse(scalars['accepted'])
+        self.assertEqual(scalars['validation_attempts'], 3)
+        self.assertIn('validation_attempt_budget_exhausted',
+                      table['failure_reasons'])
+        self.assertEqual(calls, scalars['gn_products'])
+        self.assertLessEqual(calls, 160)
+        self.assertIsNone(scalars['lambda_1_est'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_deadline_during_incomplete_validation_publishes_nothing(self, _memory):
+        diagonal = np.arange(8., 0., -1, dtype=np.float32)
+        now = [0.]
+        incremental = ms._incremental_gram
+        def expire_in_gram(*args, **kwargs):
+            now[0] = 2.
+            return incremental(*args, **kwargs)
+        with mock.patch.object(ms, '_incremental_gram',
+                               side_effect=expire_in_gram):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda v: diagonal * v, 8, top_k=4, check_every=2,
+                max_basis=8, restart_keep=6, max_products=30,
+                residual_tol=1e-4, max_seconds=1., clock=lambda: now[0])
+        self.assertFalse(scalars['accepted'])
+        self.assertIn('time_budget_exhausted', table['failure_reasons'])
+        self.assertEqual(table['direct_residuals'], {})
+        self.assertIsNone(scalars['lambda_1_est'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_fake_deadline_inside_restart_transform_is_controlled(self, _memory):
+        diagonal = np.r_[np.linspace(20., 16., 5),
+                         np.linspace(4., .1, 187)].astype(np.float32)
+        now = [0.]
+        transform = ms._transform_in_place
+        def expire_in_restart(*args, **kwargs):
+            now[0] = 2.
+            return transform(*args, **kwargs)
+        with mock.patch.object(ms, '_transform_in_place',
+                               side_effect=expire_in_restart):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda v: diagonal * v, 192, top_k=5, check_every=4,
+                max_basis=12, restart_keep=8, max_products=100,
+                residual_tol=1e-8, stability_tol=1e-8,
+                max_seconds=1., clock=lambda: now[0])
+        self.assertFalse(scalars['accepted'])
+        self.assertEqual(scalars['restart_count'], 0)
+        self.assertIn('time_budget_exhausted', table['failure_reasons'])
+        self.assertIsNone(scalars['lambda_1_est'])
+
+    def test_fake_deadline_interrupts_expansion_and_chunked_cpu_work(self):
+        class Clock:
+            def __init__(self): self.value = 0.
+            def __call__(self):
+                self.value += .1
+                return self.value
+
+        clock = Clock()
+        with mock.patch.object(ms, 'available_host_memory', return_value=10**15):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda v: v, 8, top_k=3, check_every=2, max_basis=8,
+                restart_keep=5, max_products=30, max_seconds=.5, clock=clock)
+        self.assertFalse(scalars['accepted'])
+        self.assertIn('time_budget_exhausted', table['failure_reasons'])
+
+        checks = 0
+        def deadline():
+            nonlocal checks
+            checks += 1
+            if checks == 3:
+                raise ms._TimeBudgetExceeded
+        q = np.ones((4, 16), np.float32)
+        with self.assertRaises(ms._TimeBudgetExceeded):
+            ms._incremental_gram(q, 4, chunk=2, check_deadline=deadline)
+        checks = 0
+        with self.assertRaises(ms._TimeBudgetExceeded):
+            ms._transform_in_place(
+                q, 4, np.eye(4, 2), chunk=2, check_deadline=deadline)
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_zero_seconds_disables_deadline(self, _memory):
+        diagonal = np.arange(8., 0., -1, dtype=np.float32)
+        scalars, table = ms.estimate_top_spectrum(
+            lambda v: diagonal * v, 8, top_k=4, check_every=2,
+            max_basis=8, restart_keep=6, max_products=30,
+            residual_tol=1e-4, max_seconds=0, clock=lambda: 123.)
+        self.assertTrue(scalars['accepted'], table)
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_nonfinite_product_is_unresolved(self, _memory):

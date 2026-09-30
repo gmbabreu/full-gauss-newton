@@ -51,8 +51,9 @@ class ConditionDiagnostics:
                 clear_cache()
         self._power_solvers.clear()
         # The collective helpers construct internal jitted functions that are
-        # not exposed for selective clearing.  This is multi-host-only; the
-        # established single-host diagnostic retains its compiled caches.
+        # not exposed for selective clearing. jax.clear_caches() is global to
+        # this process and can make the next training dispatch recompile. This
+        # is multi-host-only; single-host diagnostics retain compiled caches.
         jax.clear_caches()
         gc.collect()
         print('[spectrum] cleanup: released multi-host diagnostic caches',
@@ -143,6 +144,8 @@ class ConditionDiagnostics:
                 residual_tol=FLAGS.spectrum_residual_tol,
                 stability_tol=FLAGS.spectrum_stability_tol,
                 seed=FLAGS.spectrum_seed,
+                max_validation_attempts=FLAGS.spectrum_max_validation_attempts,
+                max_seconds=FLAGS.spectrum_max_seconds,
                 progress=lambda done, total: print(
                     f'[spectrum] G products {done}/{total}; '
                     f'elapsed={timeit.default_timer() - spectrum_started:.1f}s, '
@@ -193,6 +196,23 @@ class ConditionDiagnostics:
                           + (g_report['operator_matvecs']
                              if g_report is not None else 0))
         direct_residuals = spectrum_table['direct_residuals']
+        rank_one_residual = direct_residuals.get(
+            1, direct_residuals.get('1'))
+        fallback_resolved = bool(g_report is not None
+            and g_report['resolved']
+            and g_report['lambda_max_est'] is not None
+            and np.isfinite(g_report['lambda_max_est']))
+        lambda_from_fallback = not spectrum_scalars['accepted'] and g_report is not None
+        if fallback_resolved:
+            spectrum_max = float(g_report['lambda_max_est'])
+        lambda_resolved = bool(spectrum_scalars['accepted'] or fallback_resolved)
+        lambda_residual = (rank_one_residual if spectrum_scalars['accepted']
+                           else (g_report['lambda_max_residual']
+                                 if g_report is not None else None))
+        lambda_residual_tol = (FLAGS.spectrum_residual_tol
+            if spectrum_scalars['accepted'] else
+            (FLAGS.spectrum_endpoint_residual_tol
+             if g_report is not None else None))
         g_metrics = {
             'accepted': spectrum_scalars['accepted'],
             'gn_products': total_products,
@@ -201,28 +221,43 @@ class ConditionDiagnostics:
             'basis_capacity': spectrum_scalars['basis_capacity'],
             'configured_max_basis': spectrum_scalars['configured_max_basis'],
             'memory_limited': spectrum_scalars['memory_limited'],
+            'validation_attempts': spectrum_scalars['validation_attempts'],
             'orthogonality_error': spectrum_scalars['orthogonality_error'],
             'max_relative_ritz_residual':
                 spectrum_scalars['max_relative_ritz_residual'],
             'max_direct_residual': (max(direct_residuals.values())
                                     if direct_residuals else None),
+            'worst_direct_residual_rank':
+                spectrum_scalars['worst_direct_residual_rank'],
+            'worst_direct_residual':
+                spectrum_scalars['worst_direct_residual'],
             'top10_condition_est': spectrum_scalars['top10_condition_est'],
             'top100_condition_est': spectrum_scalars['top100_condition_est'],
+            'lambda_1_est': spectrum_max,
+            'lambda_1_from_fallback': lambda_from_fallback,
+            'lambda_1_resolved': lambda_resolved,
+            'lambda_1_residual': lambda_residual,
+            'lambda_1_residual_tol': lambda_residual_tol,
         }
+        g_metrics.update({name: value for name, value in spectrum_scalars.items()
+                          if name.startswith('seconds_')})
         g_metrics.update({name: value for name, value in spectrum_scalars.items()
                           if name.startswith('lambda_') and value is not None})
         if not spectrum_scalars['accepted']:
             g_metrics['failure_reasons'] = ','.join(
                 spectrum_table['failure_reasons'])
-            g_metrics.update({
-                'fallback_lambda_max_est': g_report['lambda_max_est'],
-                'fallback_lambda_max_residual':
-                    g_report['lambda_max_residual'],
-                'fallback_resolved': g_report['resolved'],
-            })
+            g_metrics['fallback_resolved'] = fallback_resolved
             if not g_report['resolved']:
                 g_metrics['fallback_failure_reasons'] = ','.join(
                     g_report['failure_reasons'])
+        print('[spectrum] G maximum: ' + str({
+            'lambda_1_est': spectrum_max,
+            'source': ('lanczos' if spectrum_scalars['accepted'] else
+                       ('fallback' if g_report is not None else 'unresolved')),
+            'resolved': lambda_resolved,
+            'residual': lambda_residual,
+            'residual_tol': lambda_residual_tol,
+        }), flush=True)
         metrics_out.update({f'spectrum/G/{name}': value
                             for name, value in g_metrics.items()
                             if value is not None})
