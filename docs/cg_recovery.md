@@ -181,7 +181,7 @@ Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank thro
 not divisible by ten. Intermediate ranks need no additional eigensolve or
 operator products for logging. Unresolved estimates remain withheld. Validation
 attempts, phase and transfer timers, capacity/memory status, maximum direct
-residual, and the worst checked rank/residual are forwarded to metrics.
+residual, and the rank with that worst residual are forwarded to metrics.
 Validation starts/ends, restarts, and long chunked CPU work also produce terminal
 progress so quiet TPU-product periods are distinguishable from a hang.
 

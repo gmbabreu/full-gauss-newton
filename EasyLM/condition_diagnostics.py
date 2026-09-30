@@ -229,8 +229,6 @@ class ConditionDiagnostics:
                                     if direct_residuals else None),
             'worst_direct_residual_rank':
                 spectrum_scalars['worst_direct_residual_rank'],
-            'worst_direct_residual':
-                spectrum_scalars['worst_direct_residual'],
             'top10_condition_est': spectrum_scalars['top10_condition_est'],
             'top100_condition_est': spectrum_scalars['top100_condition_est'],
             'lambda_1_est': spectrum_max,

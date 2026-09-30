@@ -13,32 +13,26 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(report['basis_buffer_bytes'], 160 * 1000 * 4)
         self.assertEqual(report['gram_cache_bytes'], 160 * 160 * 8)
 
-    def test_incremental_gram_reuses_old_old_and_rebuilds_after_restart(self):
+    def test_incremental_gram_matches_dense_and_rebuilds_after_restart(self):
         rng = np.random.default_rng(91)
         q = rng.normal(size=(40, 37)).astype(np.float32)
         cache = np.zeros((40, 40), np.float64)
         cached_count = 0
         for count in (12, 20, 28, 40):
-            stats = {}
             cache, cached_count = ms._incremental_gram(
-                q, count, cache, cached_count, chunk=7, stats=stats)
+                q, count, cache, cached_count, chunk=7)
             expected = q[:count].astype(np.float64) @ q[:count].astype(np.float64).T
             np.testing.assert_allclose(cache[:count, :count], expected,
                                        rtol=0, atol=5e-14)
-            self.assertEqual(stats['old_old_rows_recomputed'], 0)
-            self.assertEqual(stats['old_rows_reused'], 0 if count == 12 else previous)
-            previous = count
 
         coefficients = np.linalg.qr(rng.normal(size=(40, 13)))[0]
         ms._transform_in_place(q, 40, coefficients, chunk=9)
         cache.fill(0.)
-        stats = {}
         cache, cached_count = ms._incremental_gram(
-            q, 13, cache, 0, chunk=7, stats=stats)
+            q, 13, cache, 0, chunk=7)
         expected = q[:13].astype(np.float64) @ q[:13].astype(np.float64).T
         np.testing.assert_allclose(cache[:13, :13], expected, rtol=0, atol=5e-14)
         self.assertEqual(cached_count, 13)
-        self.assertEqual(stats['old_rows_reused'], 0)
 
     def test_preflight_respects_effective_limit(self):
         with mock.patch.object(ms, 'available_host_memory', return_value=1024):

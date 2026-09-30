@@ -52,7 +52,7 @@ class ConditionRoutingTest(unittest.TestCase):
             configured_max_basis=8, memory_limited=False,
             validation_attempts=1, orthogonality_error=1e-6,
             max_direct_residual=2e-4, worst_direct_residual_rank=2,
-            worst_direct_residual=2e-4, max_relative_ritz_residual=1e-5,
+            max_relative_ritz_residual=1e-5,
             memory_required_gib=.01, lambda_1_est=10. if accepted else None,
             lambda_2_est=7. if accepted else None, lambda_10_est=None,
             lambda_100_est=None, top10_condition_est=None,

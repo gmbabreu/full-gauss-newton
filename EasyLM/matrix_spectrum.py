@@ -103,7 +103,6 @@ def unavailable_spectrum_report(top_k, reason, configured_max_basis):
                    memory_limited=True, validation_attempts=0,
                    orthogonality_error=None, max_direct_residual=None,
                    worst_direct_residual_rank=None,
-                   worst_direct_residual=None,
                    max_relative_ritz_residual=None, memory_required_gib=None)
     for name in ('operator', 'orthogonalization', 'gram', 'projection',
                  'eigensolve', 'ritz_residuals', 'expansion', 'restart',
@@ -151,17 +150,13 @@ def _transform_in_place(buffer, count, coefficients, *, chunk=1 << 20,
 
 
 def _incremental_gram(q, count, cache=None, cached_count=0, *, chunk=1 << 20,
-                      check_deadline=None, heartbeat=None, stats=None):
+                      check_deadline=None, heartbeat=None):
     """Extend an FP64 Gram cache without recomputing its old-old block."""
     if cache is None:
         cache = np.zeros((q.shape[0], q.shape[0]), np.float64)
         cached_count = 0
     if not 0 <= cached_count <= count or cache.shape[0] < count:
         raise ValueError('invalid Gram cache state')
-    if stats is not None:
-        stats['old_old_rows_recomputed'] = 0
-        stats['old_rows_reused'] = cached_count
-        stats['new_rows'] = count - cached_count
     if cached_count == count:
         return cache, count
     for start in range(0, q.shape[1], chunk):
@@ -180,12 +175,6 @@ def _incremental_gram(q, count, cache=None, cached_count=0, *, chunk=1 << 20,
         if heartbeat:
             heartbeat('Gram', stop, q.shape[1])
     return cache, count
-
-
-def _gram(q, count, *, chunk=1 << 20):
-    """Independent full FP64 Gram calculation, retained for checks/tests."""
-    cache, _ = _incremental_gram(q, count, chunk=chunk)
-    return cache[:count, :count].copy()
 
 
 def _norm(vector):
@@ -515,8 +504,6 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                    max_direct_residual=(float(max(direct.values()))
                        if direct else None),
                    worst_direct_residual_rank=worst_rank,
-                   worst_direct_residual=(float(direct[worst_rank])
-                       if worst_rank is not None else None),
                    max_relative_ritz_residual=(float(np.max(candidate_residuals))
                        if candidate_residuals is not None else None),
                    memory_required_gib=memory['required_bytes'] / 2**30)

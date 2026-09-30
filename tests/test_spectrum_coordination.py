@@ -33,18 +33,22 @@ def test_controller_owns_estimator_and_releases_peers(failure):
     apply = jax.jit(lambda v: jnp.asarray(jacobian).T @ (jnp.asarray(jacobian) @ v))
     apply(jnp.ones(128)).block_until_ready()
     counts = [0, 0]
+    class FakeClock:
+        value = 0.
+        def __call__(self):
+            return self.value
+    clock = FakeClock()
     def product(vector):
         counts[local.rank] += 1
-        return np.asarray(apply(vector))
+        image = np.asarray(apply(vector))
+        if failure == 'controlled' and local.rank == 0 and counts[0] == 1:
+            clock.value = 2.
+        return image
     def estimate(apply, dimension, **kwargs):
         assert local.rank == 0
         if failure == 'controlled':
-            return matrix_spectrum.unavailable_spectrum_report(
-                100, 'time budget', 128)[0], dict(
-                    values=[], residuals=[], direct_residuals={},
-                    failure_reasons=['time_budget_exhausted'],
-                    orthogonality_error=None, restart_count=0,
-                    memory_preflight=None)
+            return matrix_spectrum.estimate_top_spectrum(
+                apply, dimension, max_seconds=1., clock=clock, **kwargs)
         if failure:
             if failure == 'after_product':
                 apply(np.ones(dimension, np.float32))
@@ -68,13 +72,29 @@ def test_controller_owns_estimator_and_releases_peers(failure):
          ThreadPoolExecutor(2) as pool:
         futures = [pool.submit(run, rank) for rank in range(2)]
         results = [future.result(timeout=30) for future in futures]
+        if failure == 'controlled':
+            timeout_counts = counts.copy()
+            def recover(rank):
+                local.rank = rank
+                def one_product(apply, dimension, **unused):
+                    image = apply(np.ones(dimension, np.float32))
+                    return {'sum': float(np.sum(image))}
+                return transport.run_spectrum(one_product, product, 128)
+            futures = [pool.submit(recover, rank) for rank in range(2)]
+            recovered = [future.result(timeout=30) for future in futures]
     assert results[0] == results[1]
     assert counts[0] == counts[1]
     if failure == 'controlled':
         scalars, table = results[0]
         assert not scalars['accepted']
         assert table['failure_reasons'] == ['time_budget_exhausted']
-        assert counts == [0, 0]
+        assert scalars['gn_products'] == 1
+        assert timeout_counts == [scalars['gn_products']] * 2
+        assert all(value is None for name, value in scalars.items()
+                   if name.startswith('lambda_') and name.endswith('_est'))
+        assert counts == [2, 2]
+        assert recovered[0] == recovered[1]
+        assert recovered[0]['sum'] > 0
     elif failure:
         assert results == ['released', 'released']
     else:
