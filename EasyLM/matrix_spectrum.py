@@ -239,6 +239,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     previous = None
     stable = accepted = False
     failure, direct = [], {}
+    validated_values = validated_residuals = None
+    validated_orthogonality_error = None
     validation_attempts = 0
     next_validation_expansion = top_k
     candidate_values = candidate_residuals = vectors = None
@@ -265,7 +267,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
             last_heartbeat = now
 
     def progress_line(event, *, attempt=None, recurrence=None, direct_value=None,
-                      worst_rank=None):
+                      worst_rank=None, direct_residuals=None):
         fields = [f'[spectrum] {event}',
                   f'attempt={validation_attempts + 1 if attempt is None else attempt}',
                   f'products={products}', f'basis={count}/{max_basis}',
@@ -274,7 +276,16 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                   f'direct_residual={direct_value if direct_value is not None else "n/a"}']
         if worst_rank is not None:
             fields.append(f'worst_rank={worst_rank}')
+        if direct_residuals is not None:
+            fields.append(f'direct_residuals={direct_residuals}')
         print(' '.join(fields), flush=True)
+
+    def clear_validated_snapshot():
+        nonlocal validated_values, validated_residuals
+        nonlocal validated_orthogonality_error, direct
+        validated_values = validated_residuals = None
+        validated_orthogonality_error = None
+        direct = {}
 
     def random_direction():
         for _ in range(8):
@@ -306,6 +317,8 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
         """Freshly check published Ritz pairs; return False to keep expanding."""
         nonlocal orthogonality_error, direct, validation_attempts
         nonlocal gram_cache, gram_cached_count
+        nonlocal validated_values, validated_residuals
+        nonlocal validated_orthogonality_error
         validation_attempts += 1
         recurrence = (float(np.max(candidate_residuals))
                       if candidate_residuals is not None else None)
@@ -324,6 +337,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
         gram_cached_count = new_cached_count
         check_deadline()
         if not math.isfinite(orthogonality_error) or orthogonality_error > 1e-3:
+            clear_validated_snapshot()
             failure.append('invalid_orthonormal_basis')
             progress_line('validation end', attempt=validation_attempts,
                           recurrence=recurrence)
@@ -350,6 +364,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                 except ValueError as error:
                     if str(error) != 'invalid_operator_product':
                         raise
+                    clear_validated_snapshot()
                     failure.append(str(error))
                     return False
                 timer = clock()
@@ -364,11 +379,14 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                 check_deadline()
         # Publish only a complete attempt; deadline exits leave the prior result.
         direct = attempt
+        validated_values = candidate_values.copy()
+        validated_residuals = candidate_residuals.copy()
+        validated_orthogonality_error = orthogonality_error
         worst_rank = max(attempt, key=attempt.get) if attempt else None
         progress_line('validation end', attempt=validation_attempts,
                       recurrence=recurrence,
                       direct_value=attempt.get(worst_rank) if worst_rank else None,
-                      worst_rank=worst_rank)
+                      worst_rank=worst_rank, direct_residuals=attempt)
         return bool(valid)
 
     try:
@@ -384,6 +402,7 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
             except ValueError as error:
                 if str(error) != 'invalid_operator_product':
                     raise
+                clear_validated_snapshot()
                 failure.append(str(error)); break
             timer = clock()
             image_norm = _norm(w)
@@ -423,6 +442,9 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                 timer = clock()
                 candidate_residuals = beta * np.abs(vectors[-1, :top_k]) / np.maximum(
                     np.abs(candidate_values), np.finfo(np.float64).eps)
+                if (not np.all(np.isfinite(candidate_values))
+                        or not np.all(np.isfinite(candidate_residuals))):
+                    clear_validated_snapshot()
                 stable = previous is not None and bool(np.all(
                     np.abs(candidate_values - previous) / np.maximum(
                         np.abs(candidate_values), 1e-30) <= stability_tol))
@@ -492,7 +514,12 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
     if not accepted and not failure:
         failure.append('direct_residual_failed' if validation_attempts
                        else 'product_budget_exhausted')
-    worst_rank = max(direct, key=direct.get) if direct else None
+    report_direct = direct
+    report_orthogonality = (validated_orthogonality_error
+        if validated_values is not None else orthogonality_error)
+    report_residuals = (validated_residuals if validated_values is not None
+                        else candidate_residuals)
+    worst_rank = max(report_direct, key=report_direct.get) if report_direct else None
     scalars = dict(accepted=bool(accepted), gn_products=products,
                    seconds=elapsed(),
                    restart_count=restart_count, basis_size=count,
@@ -500,25 +527,27 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
                    configured_max_basis=memory['requested_max_basis'],
                    memory_limited=memory['memory_limited'],
                    validation_attempts=validation_attempts,
-                   orthogonality_error=orthogonality_error,
-                   max_direct_residual=(float(max(direct.values()))
-                       if direct else None),
+                   orthogonality_error=report_orthogonality,
+                   max_direct_residual=(float(max(report_direct.values()))
+                       if report_direct else None),
                    worst_direct_residual_rank=worst_rank,
-                   max_relative_ritz_residual=(float(np.max(candidate_residuals))
-                       if candidate_residuals is not None else None),
+                   max_relative_ritz_residual=(float(np.max(report_residuals))
+                       if report_residuals is not None else None),
                    memory_required_gib=memory['required_bytes'] / 2**30)
     scalars.update({f'seconds_{name}': value for name, value in timings.items()})
     # Keep legacy absent-rank fields for dashboard compatibility.
     for rank in sorted({1, 10, 100, top_k, *range(10, top_k + 1, 10)}):
-        scalars[f'lambda_{rank}_est'] = (float(candidate_values[rank - 1])
-            if accepted and rank <= top_k else None)
+        scalars[f'lambda_{rank}_est'] = (float(validated_values[rank - 1])
+            if validated_values is not None and rank <= top_k else None)
     for rank in (10, 100):
         endpoint = scalars[f'lambda_{rank}_est']
         scalars[f'top{rank}_condition_est'] = (
-            scalars['lambda_1_est'] / endpoint if endpoint is not None else None)
-    table = dict(values=candidate_values.tolist() if candidate_values is not None else [],
-                 residuals=candidate_residuals.tolist() if candidate_residuals is not None else [],
-                 direct_residuals=direct, failure_reasons=failure,
-                 orthogonality_error=orthogonality_error,
+            scalars['lambda_1_est'] / endpoint
+            if accepted and endpoint is not None else None)
+    table = dict(values=validated_values.tolist() if validated_values is not None else [],
+                 residuals=(validated_residuals.tolist()
+                            if validated_residuals is not None else []),
+                 direct_residuals=report_direct, failure_reasons=failure,
+                 orthogonality_error=report_orthogonality,
                  restart_count=restart_count, memory_preflight=memory)
     return scalars, table

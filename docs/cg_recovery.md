@@ -55,7 +55,9 @@ inner training solve.
 `spectrum/G/lambda_1_est` is the one canonical maximum series. An accepted
 top-k result supplies it directly. If full top-k acceptance fails, a bounded
 power estimate supplies the same series only when that endpoint is resolved and
-finite; there is no duplicate fallback-value series. `lambda_1_from_fallback`,
+finite. If the fallback is unresolved, the last completely direct-checked
+Lanczos maximum may be reported as unresolved; there is no duplicate
+fallback-value series. `lambda_1_from_fallback`,
 `lambda_1_resolved`, `lambda_1_residual`, and `lambda_1_residual_tol` make the
 source and validation standard explicit. The top-k direct tolerance defaults to
 0.01, while the maximum-only fallback defaults to 0.05. A maximum-only fallback
@@ -176,10 +178,13 @@ existing bounded maximum fallback. All validation products count against
 `spectrum_max_gn_products`.
 
 All products use the same frozen parameters, batch and microbatch weighting.
-Accepted scalar metrics include `spectrum/G/lambda_1_est`, every tenth rank through top-k
-(`lambda_10_est`, `lambda_20_est`, ...), and the top-k endpoint even if it is
-not divisible by ten. Intermediate ranks need no additional eigensolve or
-operator products for logging. Unresolved estimates remain withheld. Validation
+The existing `spectrum/G/lambda_*_est` series report the last complete direct
+validation attempt, even when its residual threshold fails; interpret them with
+`accepted`, `max_direct_residual`, and the residual tolerance. Values remain
+withheld when validation did not complete or found an invalid/nonfinite basis,
+candidate, or operator product. Every tenth rank through top-k and the top-k
+endpoint are reported without extra operator products. Condition ratios still
+require full spectrum acceptance. Validation
 attempts, phase and transfer timers, capacity/memory status, maximum direct
 residual, and the rank with that worst residual are forwarded to metrics.
 Validation starts/ends, restarts, and long chunked CPU work also produce terminal

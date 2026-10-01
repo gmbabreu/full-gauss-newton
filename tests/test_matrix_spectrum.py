@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
+import io
 
 import numpy as np
 
@@ -127,6 +129,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 8)
         self.assertIn('product_budget_exhausted', table['failure_reasons'])
+        self.assertEqual(table['values'], [])
+        self.assertIsNone(scalars['lambda_1_est'])
 
     def test_top100_exceeds_basis_capacity_and_restarts(self):
         diagonal = np.concatenate((
@@ -215,12 +219,16 @@ class MatrixSpectrumTest(unittest.TestCase):
             nonlocal calls
             calls += 1
             return diagonal * v + (v if calls > 8 else 0)
-        scalars, table = ms.estimate_top_spectrum(
-            apply, 8, top_k=4, max_basis=8, restart_keep=6,
-            max_products=30, residual_tol=1e-4)
+        with redirect_stdout(io.StringIO()) as output:
+            scalars, table = ms.estimate_top_spectrum(
+                apply, 8, top_k=4, max_basis=8, restart_keep=6,
+                max_products=30, residual_tol=1e-4)
         self.assertFalse(scalars['accepted'])
         self.assertIn('direct_residual_failed', table['failure_reasons'])
-        self.assertIsNone(scalars['lambda_1_est'])
+        self.assertAlmostEqual(scalars['lambda_1_est'], 8., places=4)
+        self.assertGreater(scalars['max_direct_residual'], 1e-4)
+        self.assertIn('direct_residuals={', output.getvalue())
+        self.assertIsNone(scalars['top10_condition_est'])
         self.assertEqual(scalars['gn_products'], calls)
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
@@ -283,7 +291,49 @@ class MatrixSpectrumTest(unittest.TestCase):
                       table['failure_reasons'])
         self.assertEqual(calls, scalars['gn_products'])
         self.assertLessEqual(calls, 160)
-        self.assertIsNone(scalars['lambda_1_est'])
+        self.assertIsNotNone(scalars['lambda_1_est'])
+        self.assertGreater(scalars['max_direct_residual'], 1e-3)
+        self.assertIsNone(scalars['top10_condition_est'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_timeout_on_later_attempt_retains_completed_snapshot(self, _memory):
+        diagonal = np.r_[np.linspace(10., 9., 5),
+                         np.linspace(4., .1, 59)].astype(np.float32)
+        calls = 0
+        now = [0.]
+        gram_calls = 0
+        incremental = ms._incremental_gram
+        def apply(vector):
+            nonlocal calls
+            calls += 1
+            image = diagonal * vector
+            if calls in (19, 20):
+                image = image + .1 * np.roll(vector, 1)
+            return image
+        def expire_second_validation(*args, **kwargs):
+            nonlocal gram_calls
+            gram_calls += 1
+            if gram_calls == 2:
+                now[0] = 2.
+            return incremental(*args, **kwargs)
+        with mock.patch.object(ms, '_incremental_gram',
+                               side_effect=expire_second_validation):
+            scalars, table = ms.estimate_top_spectrum(
+                apply, 64, top_k=5, check_every=2, max_basis=48,
+                restart_keep=24, max_products=120, residual_tol=1e-3,
+                stability_tol=1e-3, seed=3, max_seconds=1.,
+                clock=lambda: now[0])
+        self.assertFalse(scalars['accepted'])
+        self.assertEqual(scalars['validation_attempts'], 2)
+        self.assertIn('time_budget_exhausted', table['failure_reasons'])
+        self.assertEqual(calls, scalars['gn_products'])
+        self.assertGreater(max(table['direct_residuals'].values()), 1e-3)
+        self.assertEqual(scalars['max_direct_residual'],
+                         max(table['direct_residuals'].values()))
+        self.assertEqual(scalars['lambda_1_est'], table['values'][0])
+        self.assertEqual(scalars['max_relative_ritz_residual'],
+                         max(table['residuals']))
+        self.assertIsNone(scalars['top10_condition_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_deadline_during_incomplete_validation_publishes_nothing(self, _memory):
@@ -301,6 +351,26 @@ class MatrixSpectrumTest(unittest.TestCase):
                 residual_tol=1e-4, max_seconds=1., clock=lambda: now[0])
         self.assertFalse(scalars['accepted'])
         self.assertIn('time_budget_exhausted', table['failure_reasons'])
+        self.assertEqual(table['direct_residuals'], {})
+        self.assertIsNone(scalars['lambda_1_est'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_invalid_basis_does_not_publish_estimates(self, _memory):
+        diagonal = np.arange(8., 0., -1, dtype=np.float32)
+        incremental = ms._incremental_gram
+        def invalidate_basis(*args, **kwargs):
+            cache, count = incremental(*args, **kwargs)
+            cache[0, 0] += 1.
+            return cache, count
+        with mock.patch.object(ms, '_incremental_gram',
+                               side_effect=invalidate_basis):
+            scalars, table = ms.estimate_top_spectrum(
+                lambda vector: diagonal * vector, 8, top_k=4,
+                check_every=2, max_basis=8, restart_keep=6,
+                max_products=30, residual_tol=1e-4)
+        self.assertFalse(scalars['accepted'])
+        self.assertIn('invalid_orthonormal_basis', table['failure_reasons'])
+        self.assertEqual(table['values'], [])
         self.assertEqual(table['direct_residuals'], {})
         self.assertIsNone(scalars['lambda_1_est'])
 
@@ -371,6 +441,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertFalse(scalars['accepted'])
         self.assertEqual(scalars['gn_products'], 1)
         self.assertIn('invalid_operator_product', table['failure_reasons'])
+        self.assertEqual(table['values'], [])
+        self.assertIsNone(scalars['lambda_1_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_jax_gn_matches_explicit_jacobian(self, _memory):

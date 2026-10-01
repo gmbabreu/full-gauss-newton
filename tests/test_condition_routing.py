@@ -46,15 +46,16 @@ class ConditionRoutingTest(unittest.TestCase):
         return result
 
     @staticmethod
-    def spectrum_result(*, accepted, reason=(), direct=None):
+    def spectrum_result(*, accepted, reason=(), direct=None, estimates=False):
+        publish = accepted or estimates
         scalars = dict(accepted=accepted, gn_products=7, seconds=.5,
             restart_count=0, basis_size=6, basis_capacity=8,
             configured_max_basis=8, memory_limited=False,
             validation_attempts=1, orthogonality_error=1e-6,
             max_direct_residual=2e-4, worst_direct_residual_rank=2,
             max_relative_ritz_residual=1e-5,
-            memory_required_gib=.01, lambda_1_est=10. if accepted else None,
-            lambda_2_est=7. if accepted else None, lambda_10_est=None,
+            memory_required_gib=.01, lambda_1_est=10. if publish else None,
+            lambda_2_est=7. if publish else None, lambda_10_est=None,
             lambda_100_est=None, top10_condition_est=None,
             top100_condition_est=None)
         for name in ('operator', 'orthogonalization', 'gram', 'projection',
@@ -116,6 +117,49 @@ class ConditionRoutingTest(unittest.TestCase):
                          'time_budget_exhausted')
         self.assertEqual(result['spectrum/G/fallback_failure_reasons'],
                          'eigenpair_residual')
+
+    def test_resolved_fallback_is_not_overwritten_by_unaccepted_lanczos(self):
+        spectrum = self.spectrum_result(
+            accepted=False, estimates=True, reason=('direct_residual_failed',),
+            direct={1: .02, 2: .03})
+        fallback = dict(lambda_max_est=11., lambda_max_residual=.01,
+                        resolved=True, failure_reasons=(), operator_matvecs=4)
+        with patch.object(condition_diagnostics, 'run_spectrum',
+                          return_value=spectrum), \
+                patch.object(matrix_condition, 'condition_diagnostic',
+                             return_value=fallback):
+            result = self.run_controller()
+        self.assertFalse(result['spectrum/G/accepted'])
+        self.assertEqual(result['spectrum/G/lambda_1_est'], 11.)
+        self.assertEqual(result['spectrum/G/lambda_2_est'], 7.)
+        self.assertTrue(result['spectrum/G/lambda_1_from_fallback'])
+        self.assertTrue(result['spectrum/G/lambda_1_resolved'])
+        self.assertEqual(result['spectrum/G/lambda_1_residual'], .01)
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], 1e-4)
+        self.assertEqual(result['spectrum/G/gn_products'], 11)
+        self.assertNotIn('spectrum/G/top10_condition_est', result)
+
+    def test_unresolved_fallback_uses_checked_lanczos_maximum(self):
+        spectrum = self.spectrum_result(
+            accepted=False, estimates=True, reason=('direct_residual_failed',),
+            direct={'1': .02, '2': .03})
+        fallback = dict(lambda_max_est=None, lambda_max_residual=.2,
+                        resolved=False, failure_reasons=('eigenpair_residual',),
+                        operator_matvecs=4)
+        with patch.object(condition_diagnostics, 'run_spectrum',
+                          return_value=spectrum), \
+                patch.object(matrix_condition, 'condition_diagnostic',
+                             return_value=fallback):
+            result = self.run_controller()
+        self.assertFalse(result['spectrum/G/accepted'])
+        self.assertEqual(result['spectrum/G/lambda_1_est'], 10.)
+        self.assertEqual(result['spectrum/G/lambda_2_est'], 7.)
+        self.assertFalse(result['spectrum/G/lambda_1_from_fallback'])
+        self.assertFalse(result['spectrum/G/lambda_1_resolved'])
+        self.assertEqual(result['spectrum/G/lambda_1_residual'], .02)
+        self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], .01)
+        self.assertEqual(result['spectrum/G/gn_products'], 11)
+        self.assertNotIn('spectrum/G/top10_condition_est', result)
 
     def test_cg_damped_endpoints_and_compiled_reuse_with_new_diagonal(self):
         for scale in (1., 2.):

@@ -202,17 +202,26 @@ class ConditionDiagnostics:
             and g_report['resolved']
             and g_report['lambda_max_est'] is not None
             and np.isfinite(g_report['lambda_max_est']))
-        lambda_from_fallback = not spectrum_scalars['accepted'] and g_report is not None
+        lanczos_max = spectrum_scalars.get('lambda_1_est')
+        lanczos_max_eligible = (lanczos_max is not None
+                                and np.isfinite(lanczos_max))
         if fallback_resolved:
             spectrum_max = float(g_report['lambda_max_est'])
+        elif not spectrum_scalars['accepted'] and lanczos_max_eligible:
+            spectrum_max = float(lanczos_max)
+        lambda_from_fallback = bool(not spectrum_scalars['accepted']
+            and g_report is not None
+            and (fallback_resolved or not lanczos_max_eligible))
         lambda_resolved = bool(spectrum_scalars['accepted'] or fallback_resolved)
-        lambda_residual = (rank_one_residual if spectrum_scalars['accepted']
-                           else (g_report['lambda_max_residual']
-                                 if g_report is not None else None))
+        lanczos_selected = bool(spectrum_scalars['accepted']
+                                or (not fallback_resolved
+                                    and lanczos_max_eligible))
+        lambda_residual = (rank_one_residual if lanczos_selected else
+                           (g_report['lambda_max_residual']
+                            if g_report is not None else None))
         lambda_residual_tol = (FLAGS.spectrum_residual_tol
-            if spectrum_scalars['accepted'] else
-            (FLAGS.spectrum_endpoint_residual_tol
-             if g_report is not None else None))
+            if lanczos_selected else (FLAGS.spectrum_endpoint_residual_tol
+                                      if g_report is not None else None))
         g_metrics = {
             'accepted': spectrum_scalars['accepted'],
             'gn_products': total_products,
@@ -240,7 +249,8 @@ class ConditionDiagnostics:
         g_metrics.update({name: value for name, value in spectrum_scalars.items()
                           if name.startswith('seconds_')})
         g_metrics.update({name: value for name, value in spectrum_scalars.items()
-                          if name.startswith('lambda_') and value is not None})
+                          if name.startswith('lambda_')
+                          and name != 'lambda_1_est' and value is not None})
         if not spectrum_scalars['accepted']:
             g_metrics['failure_reasons'] = ','.join(
                 spectrum_table['failure_reasons'])
@@ -251,7 +261,9 @@ class ConditionDiagnostics:
         print('[spectrum] G maximum: ' + str({
             'lambda_1_est': spectrum_max,
             'source': ('lanczos' if spectrum_scalars['accepted'] else
-                       ('fallback' if g_report is not None else 'unresolved')),
+                       ('fallback' if fallback_resolved else
+                        ('lanczos_unaccepted' if lanczos_selected
+                         else 'unresolved'))),
             'resolved': lambda_resolved,
             'residual': lambda_residual,
             'residual_tol': lambda_residual_tol,
