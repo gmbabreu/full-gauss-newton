@@ -33,15 +33,20 @@ requesting constant lambda.
 
 ## Condition diagnostics
 
-`--condition_log=True` enables all spectral diagnostics at outer step 0 and every
-`condition_every` updates (default 100). `condition_log=False` disables all of
-these diagnostics.
+`--condition_log=True` runs spectral diagnostics after the first successfully
+completed outer update of each invocation and whenever the completed-update
+number is divisible by `condition_every` (default 100). Thus a fresh run with
+the default cadence diagnoses updates 1, 100, 200, and so on; initial or loaded
+weights are not diagnosed before an update. `condition_log=False` disables all
+of these diagnostics.
 
 Every supported solver (CG, Adam-GN, Muon-GN) estimates the leading
-`spectrum_top_k` eigenvalues of raw `G`, including its largest eigenvalue. CG
-additionally estimates both endpoints of the actual damped solve matrix
-`A=lambda*G+(1-lambda)/eta*D`, using the effective lambda, safe Adam learning
-rate, and bias-corrected diagonal from that update. The existing maximum of
+`spectrum_top_k` eigenvalues of raw `G` at the committed post-update raw model
+weights, including its largest eigenvalue. CG additionally estimates both
+endpoints of `A=lambda*G+(1-lambda)/eta*D` at those post-update weights, using
+the effective lambda, safe Adam learning rate, and bias-corrected diagonal from
+the just-completed solve. Consequently `spectrum/A` is not the exact operator
+used during that preceding solve. The existing maximum of
 symmetric `P=D^-1/2*A*D^-1/2` and its damping proxy are retained. The new minimum
 estimate is for `A`, not `P`.
 
@@ -51,6 +56,13 @@ and Muon-GN with multiple inner batches, the first already-fetched inner batch
 is used. Dropout and FCM must be disabled. `cg_n_micro` microbatches diagnostic
 `Gv` for every supported solver, including Muon; it does not microbatch Muon's
 inner training solve.
+
+When diagnostic and checkpoint cadences coincide, both refer to the same raw
+model parameters; for example, the row after zero-based loop step 99 aligns with
+checkpoint 100. The completed-update and checkpoint recovery axes are unchanged.
+Curvature comparisons between Muon and PCG also require matching diagnostic
+data: equal weights alone do not imply equal spectra when the retained solve
+batches differ.
 
 `spectrum/G/lambda_1_est` is the one canonical maximum series. An accepted
 top-k result supplies it directly. If full top-k acceptance fails, a bounded

@@ -17,6 +17,16 @@ from EasyLM.condition_diagnostics import ConditionDiagnostics
 TRAINER = Path(__file__).resolve().parents[1] / 'EasyLM/models/llama/llama_train_gn.py'
 
 
+def trainer_function(name):
+    tree = ast.parse(TRAINER.read_text())
+    node = next(item for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(
+        ast.Module(body=[node], type_ignores=[])), str(TRAINER), 'exec'), namespace)
+    return namespace[name]
+
+
 class ConditionRoutingTest(unittest.TestCase):
     def setUp(self):
         self.calls = []
@@ -283,7 +293,50 @@ class ConditionRoutingTest(unittest.TestCase):
             controller.run(self.params, {}, step=0)
         release.assert_not_called()
 
-    def test_single_switch_and_cadence_at_all_training_call_sites(self):
+    def test_completed_update_condition_schedule(self):
+        scheduled = trainer_function('should_run_condition_diagnostics')
+        self.assertEqual(
+            [step for step in range(201)
+             if scheduled(True, step, 0, 100)], [0, 99, 199])
+        self.assertEqual(
+            [step for step in range(100, 201)
+             if scheduled(True, step, 100, 100)], [100, 199])
+        self.assertEqual(
+            [step for step in range(201)
+             if scheduled(True, step, 0, 100) and (step + 1) % 100 == 0],
+            [99, 199])
+        self.assertTrue(scheduled(True, 99, 99, 100))  # deduplicated boolean
+        self.assertFalse(scheduled(False, 0, 0, 100))
+
+    def test_post_update_wrapper_uses_raw_params_batch_and_solve_metadata(self):
+        run = trainer_function('run_post_update_condition_diagnostics')
+        node = next(item for item in ast.parse(TRAINER.read_text()).body
+                    if isinstance(item, ast.FunctionDef)
+                    and item.name == 'run_post_update_condition_diagnostics')
+        names = {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+        self.assertTrue(names.isdisjoint(
+            {'next_rng', 'sharded_rng', 'dataset', 'pull_training_batch'}))
+        updated = object()
+        state = SimpleNamespace(params=updated)
+        batch = object()
+        diagonal = object()
+        for solver, kwargs in (
+                ('cg', dict(cg_diagonal=diagonal, effective_lambda=.3,
+                            safe_adam_lr=.01)),
+                ('adaptive', {}), ('regular', {})):
+            with self.subTest(solver=solver):
+                diagnostics = Mock()
+                diagnostics.run.return_value = {'ok': True}
+                self.assertEqual(
+                    run(diagnostics, state, batch, step=99, **kwargs),
+                    {'ok': True})
+                diagnostics.run.assert_called_once_with(
+                    updated, batch, step=99,
+                    cg_diagonal=kwargs.get('cg_diagonal'),
+                    effective_lambda=kwargs.get('effective_lambda'),
+                    safe_adam_lr=kwargs.get('safe_adam_lr'))
+
+    def test_single_post_update_call_aligns_logging_and_checkpoints(self):
         tree = ast.parse(TRAINER.read_text())
         defaults = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                         and isinstance(n.func, ast.Attribute)
@@ -296,16 +349,84 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertIn('spectrum_check_every', names)
         self.assertIn('spectrum_max_validation_attempts', names)
         self.assertIn('spectrum_max_seconds', names)
-        schedules = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
-                     and any(isinstance(t, ast.Name) and t.id == 'do_condition'
-                             for t in n.targets)]
-        self.assertEqual(len(schedules), 3)  # CG, adaptive inner, regular inner.
-        for expression in schedules:
-            compiled = compile(ast.Expression(expression), str(TRAINER), 'eval')
-            for enabled, step, expected in ((False, 0, False), (True, 0, True),
-                                            (True, 49, False), (True, 50, True)):
-                flags = SimpleNamespace(condition_log=enabled, condition_every=50)
-                self.assertEqual(eval(compiled, dict(FLAGS=flags, step=step)), expected)
+        main = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        outer_loop = next(node for node in ast.walk(main)
+            if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+            and node.target.id == 'step' and isinstance(node.iter, ast.Name)
+            and node.iter.id == 'step_counter')
+        schedules = [node for node in ast.walk(outer_loop)
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name)
+                             and target.id == 'do_condition'
+                             for target in node.targets)]
+        self.assertEqual(len(schedules), 1)
+        post_calls = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'run_post_update_condition_diagnostics']
+        self.assertEqual(len(post_calls), 1)
+        post_line = post_calls[0].lineno
+        completed = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'complete_update']
+        self.assertEqual(len(completed), 1)
+        self.assertLess(completed[0].lineno, post_line)
+        aborted = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'stop_train_interval'
+            and any(keyword.arg == 'completed_update'
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is False
+                    for keyword in node.keywords)]
+        self.assertTrue(aborted)
+        self.assertTrue(all(node.lineno < post_line for node in aborted))
+        parents = {child: parent for parent in ast.walk(outer_loop)
+                   for child in ast.iter_child_nodes(parent)}
+        retained_batches = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == 'condition_batch' for target in node.targets)
+            and isinstance(node.value, ast.Name) and node.value.id == 'batch']
+        self.assertEqual(len(retained_batches), 3)
+        for assignment in retained_batches:
+            branch = parents[assignment]
+            while not isinstance(branch, ast.If):
+                branch = parents[branch]
+            self.assertIn('do_condition', {node.id for node in ast.walk(branch.test)
+                                           if isinstance(node, ast.Name)})
+        for stop in aborted:
+            branch = parents[stop]
+            while not isinstance(branch, ast.If):
+                branch = parents[branch]
+            self.assertTrue(any(isinstance(node, ast.Break)
+                                for node in ast.walk(branch)))
+            self.assertTrue(any(isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name)
+                        and target.id == 'condition_batch'
+                        for target in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is None for node in ast.walk(branch)))
+        checkpoints = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'save_checkpoint']
+        self.assertTrue(checkpoints)
+        self.assertTrue(all(post_line < node.lineno for node in checkpoints))
+        first_checkpoint = min(node.lineno for node in checkpoints)
+        later_param_updates = [node for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Call) and post_line < node.lineno < first_checkpoint
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'replace']
+        self.assertEqual(later_param_updates, [])
+        should_log = next(node.value for node in ast.walk(outer_loop)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'should_log'
+                    for target in node.targets))
+        self.assertIn('do_condition', {node.id for node in ast.walk(should_log)
+                                      if isinstance(node, ast.Name)})
+        self.assertEqual(sum(1 for node in ast.walk(main)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'diagnostics' and node.func.attr == 'run'), 0)
 
     def test_spectrum_reporting_flags_are_resume_compatible(self):
         cg_resume.validate_flags(

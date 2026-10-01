@@ -180,6 +180,20 @@ def supports_condition_diagnostics(optimizer_type, gauss_newton):
         gauss_newton and optimizer_type in ('adamw', 'muon'))
 
 
+def should_run_condition_diagnostics(enabled, step, start_step, every):
+    """Schedule post-update diagnostics by completed-update number."""
+    return enabled and (step == start_step or (step + 1) % every == 0)
+
+
+def run_post_update_condition_diagnostics(
+        diagnostics, train_state, batch, *, step, cg_diagonal=None,
+        effective_lambda=None, safe_adam_lr=None):
+    """Diagnose committed raw model parameters on an already-fetched batch."""
+    return diagnostics.run(
+        train_state.params, batch, step=step, cg_diagonal=cg_diagonal,
+        effective_lambda=effective_lambda, safe_adam_lr=safe_adam_lr)
+
+
 def microbatch_groups(batch_size, n_requested, data_shards):
     if batch_size <= 0 or data_shards <= 0 or batch_size % data_shards:
         raise ValueError('Batch must be positive and divisible by data shards')
@@ -1565,6 +1579,9 @@ def main(argv):
             actual_solve_batch_size = None
             pending_record = {}
             inner_diagnostic_rows = []
+            do_condition = should_run_condition_diagnostics(
+                FLAGS.condition_log, step, start_step, FLAGS.condition_every)
+            condition_batch = None
 
             def defer_wandb(values, *args, **kwargs):
                 values = jax.device_get(values)
@@ -1709,6 +1726,8 @@ def main(argv):
                     lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                     batch_
                 )
+                if do_condition:
+                    condition_batch = batch
                 scheduled_lambda = FLAGS.cg_interpolation_lambda
                 if FLAGS.cg_lambda_batch_denominator > 0:
                     scheduled_lambda = cg_resume.batch_lambda(
@@ -1737,22 +1756,6 @@ def main(argv):
                     FLAGS.inner_loop_wd,
                     jnp.asarray(scheduled_lambda, dtype=jnp.float32),
                 )
-                do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
-                if do_condition:
-                    beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
-                        jax.device_get(cg_adam_step))
-                    adam_diagonal = jax.tree.map(
-                        lambda moment: jnp.sqrt(moment / beta2_correction) + 1e-8,
-                        cg_second_moment)
-                    condition_metrics = diagnostics.run(
-                        train_state.params, batch, step=step,
-                        cg_diagonal=adam_diagonal,
-                        effective_lambda=float(jax.device_get(
-                            cg_metrics['cg_lambda_effective'])),
-                        safe_adam_lr=max(float(jax.device_get(
-                            cg_metrics['adamw_learning_rate'])), 1e-12))
-                    defer_wandb(condition_metrics, step=step)
-                
                 ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                     sharded_rng, train_state.params, dataset
                 )
@@ -1761,6 +1764,7 @@ def main(argv):
                                            cg_first_moment, cg_second_moment,
                                            cg_x0, cg_adam_step, cg_metrics))
                     timing.stop_train_interval(completed_update=False)
+                    condition_batch = None
                     break
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -1852,13 +1856,10 @@ def main(argv):
                             lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                             batch_
                         )
-                        do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
                         if i == 0 and do_condition:
-                            # Deterministic diagnostic of the first already-fetched
-                            # Muon solve batch; training RNG and cursor are untouched.
-                            condition_metrics = diagnostics.run(
-                                train_state.params, batch, step=step)
-                            defer_wandb(condition_metrics, step=step)
+                            # Retain the first already-fetched Muon solve batch;
+                            # training RNG and cursor are untouched.
+                            condition_batch = batch
                         # is_last_step deliberately always False here -- see explanation
                         inner_state, sharded_rng, metrics = sharded_train_step(
                             inner_state, train_state.params, sharded_rng, batch,
@@ -1899,6 +1900,7 @@ def main(argv):
                 if exit_training:
                     jax.block_until_ready((train_state, inner_state, sharded_rng))
                     timing.stop_train_interval(completed_update=False)
+                    condition_batch = None
                     break  # dataset exhausted; end training, same as the non-adaptive path
 
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, best_inner_state.params, train_state.params)
@@ -1934,11 +1936,8 @@ def main(argv):
                         lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
                         batch_
                     )
-                    do_condition = FLAGS.condition_log and step % FLAGS.condition_every == 0
                     if i == 0 and do_condition:
-                        condition_metrics = diagnostics.run(
-                            train_state.params, batch, step=step)
-                        defer_wandb(condition_metrics, step=step)
+                        condition_batch = batch
                     is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
@@ -1965,6 +1964,7 @@ def main(argv):
                         jax.block_until_ready(
                             (train_state, inner_state, sharded_rng, metrics))
                         timing.stop_train_interval(completed_update=False)
+                        condition_batch = None
                         break
                     print(f"\nTrue model loss: {baseline_loss:.6f}")
 
@@ -2027,6 +2027,26 @@ def main(argv):
                                      cg_x0, cg_adam_step))
             jax.block_until_ready(live_results)
             del live_results
+            if do_condition:
+                condition_kwargs = {}
+                if FLAGS.optimizer_type == 'cg':
+                    beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
+                        jax.device_get(cg_adam_step))
+                    condition_kwargs = dict(
+                        cg_diagonal=jax.tree.map(
+                            lambda moment: jnp.sqrt(moment / beta2_correction) + 1e-8,
+                            cg_second_moment),
+                        effective_lambda=float(jax.device_get(
+                            cg_metrics['cg_lambda_effective'])),
+                        safe_adam_lr=max(float(jax.device_get(
+                            cg_metrics['adamw_learning_rate'])), 1e-12))
+                try:
+                    condition_metrics = run_post_update_condition_diagnostics(
+                        diagnostics, train_state, condition_batch,
+                        step=step, **condition_kwargs)
+                    defer_wandb(condition_metrics, step=step)
+                finally:
+                    condition_batch = None
             timing.stop_train_interval(completed_update=True)
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
@@ -2049,8 +2069,7 @@ def main(argv):
                 step % FLAGS.log_freq == 0
                 or FLAGS.train_batch_growth_interval > 0
                 or FLAGS.optimizer_type == 'cg'
-                or (FLAGS.condition_log
-                    and step % FLAGS.condition_every == 0))
+                or do_condition)
             if should_log:
                 log_metrics = {}
                 stop_after_log = False
