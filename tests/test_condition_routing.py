@@ -132,6 +132,7 @@ class ConditionRoutingTest(unittest.TestCase):
         spectrum = self.spectrum_result(
             accepted=False, estimates=True, reason=('direct_residual_failed',),
             direct={1: .02, 2: .03})
+        spectrum[0].update(lambda_10_est=2., top10_condition_est=5.)
         fallback = dict(lambda_max_est=11., lambda_max_residual=.01,
                         resolved=True, failure_reasons=(), operator_matvecs=4)
         with patch.object(condition_diagnostics, 'run_spectrum',
@@ -147,7 +148,7 @@ class ConditionRoutingTest(unittest.TestCase):
         self.assertEqual(result['spectrum/G/lambda_1_residual'], .01)
         self.assertEqual(result['spectrum/G/lambda_1_residual_tol'], 1e-4)
         self.assertEqual(result['spectrum/G/gn_products'], 11)
-        self.assertNotIn('spectrum/G/top10_condition_est', result)
+        self.assertEqual(result['spectrum/G/top10_condition_est'], 5.)
 
     def test_unresolved_fallback_uses_checked_lanczos_maximum(self):
         spectrum = self.spectrum_result(

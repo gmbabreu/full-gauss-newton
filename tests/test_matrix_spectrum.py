@@ -296,6 +296,34 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertIsNone(scalars['top10_condition_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
+    def test_unaccepted_top40_snapshot_reports_top10_condition(self, _memory):
+        diagonal = np.arange(50., 10., -1., dtype=np.float32)
+        calls = 0
+        original = ms._transform_chunked
+
+        def corrupt(source, coefficients, destination, **kwargs):
+            original(source, coefficients, destination, **kwargs)
+            destination[:] = np.roll(destination, 1, axis=1)
+
+        def apply(vector):
+            nonlocal calls
+            calls += 1
+            return diagonal * vector
+
+        with mock.patch.object(ms, '_transform_chunked', side_effect=corrupt):
+            scalars, table = ms.estimate_top_spectrum(
+                apply, 40, top_k=40, check_every=4, max_basis=41,
+                restart_keep=40, max_products=45, residual_tol=1e-4,
+                stability_tol=1e-4, seed=3)
+        self.assertFalse(scalars['accepted'])
+        self.assertIn('direct_residual_failed', table['failure_reasons'])
+        self.assertGreater(scalars['max_direct_residual'], 1e-4)
+        self.assertAlmostEqual(
+            scalars['top10_condition_est'], diagonal[0] / diagonal[9], places=5)
+        self.assertIsNone(scalars['top100_condition_est'])
+        self.assertEqual(calls, scalars['gn_products'])
+
+    @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_timeout_on_later_attempt_retains_completed_snapshot(self, _memory):
         diagonal = np.r_[np.linspace(10., 9., 5),
                          np.linspace(4., .1, 59)].astype(np.float32)
@@ -353,6 +381,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertIn('time_budget_exhausted', table['failure_reasons'])
         self.assertEqual(table['direct_residuals'], {})
         self.assertIsNone(scalars['lambda_1_est'])
+        self.assertIsNone(scalars['top10_condition_est'])
+        self.assertIsNone(scalars['top100_condition_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_invalid_basis_does_not_publish_estimates(self, _memory):
@@ -373,6 +403,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertEqual(table['values'], [])
         self.assertEqual(table['direct_residuals'], {})
         self.assertIsNone(scalars['lambda_1_est'])
+        self.assertIsNone(scalars['top10_condition_est'])
+        self.assertIsNone(scalars['top100_condition_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_fake_deadline_inside_restart_transform_is_controlled(self, _memory):
@@ -443,6 +475,8 @@ class MatrixSpectrumTest(unittest.TestCase):
         self.assertIn('invalid_operator_product', table['failure_reasons'])
         self.assertEqual(table['values'], [])
         self.assertIsNone(scalars['lambda_1_est'])
+        self.assertIsNone(scalars['top10_condition_est'])
+        self.assertIsNone(scalars['top100_condition_est'])
 
     @mock.patch.object(ms, 'available_host_memory', return_value=10**15)
     def test_jax_gn_matches_explicit_jacobian(self, _memory):

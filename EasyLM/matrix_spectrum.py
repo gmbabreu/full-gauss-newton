@@ -540,10 +540,13 @@ def estimate_top_spectrum(apply_operator, dimension, *, top_k=100, check_every=4
         scalars[f'lambda_{rank}_est'] = (float(validated_values[rank - 1])
             if validated_values is not None and rank <= top_k else None)
     for rank in (10, 100):
+        maximum = scalars['lambda_1_est']
         endpoint = scalars[f'lambda_{rank}_est']
         scalars[f'top{rank}_condition_est'] = (
-            scalars['lambda_1_est'] / endpoint
-            if accepted and endpoint is not None else None)
+            maximum / endpoint
+            if maximum is not None and endpoint is not None
+            and math.isfinite(maximum) and math.isfinite(endpoint)
+            and endpoint > 0 else None)
     table = dict(values=validated_values.tolist() if validated_values is not None else [],
                  residuals=(validated_residuals.tolist()
                             if validated_residuals is not None else []),

@@ -195,8 +195,10 @@ validation attempt, even when its residual threshold fails; interpret them with
 `accepted`, `max_direct_residual`, and the residual tolerance. Values remain
 withheld when validation did not complete or found an invalid/nonfinite basis,
 candidate, or operator product. Every tenth rank through top-k and the top-k
-endpoint are reported without extra operator products. Condition ratios still
-require full spectrum acceptance. Validation
+endpoint are reported without extra operator products. Condition ratios use
+the matching Lanczos values from that completed validation snapshot, even
+when it is unaccepted; they never mix a fallback maximum with a Lanczos
+endpoint and should also be interpreted with `accepted`. Validation
 attempts, phase and transfer timers, capacity/memory status, maximum direct
 residual, and the rank with that worst residual are forwarded to metrics.
 Validation starts/ends, restarts, and long chunked CPU work also produce terminal
