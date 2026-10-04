@@ -39,7 +39,8 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 /test/
-/tests/
+/tests/*
+!/tests/test_damped_pcg.py
 htmlcov/
 .tox/
 .nox/

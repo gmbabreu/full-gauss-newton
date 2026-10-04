@@ -30,6 +30,7 @@ import optax
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM import cg_resume
+from EasyLM import pcg
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
@@ -150,6 +151,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
     cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
+    cg_damping_mu=0.0,
+    cg_preconditioner='adam_diag',
+    cg_gn_jacobi_probes=4,
 
     # Observational spectral diagnostics.  They run only at the requested
     # cadence and never alter the solve operator or effective lambda.
@@ -277,6 +281,16 @@ def get_tpu_metrics():
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    pcg.validate_damped_pcg(
+        FLAGS.cg_damping_mu, FLAGS.cg_preconditioner,
+        FLAGS.cg_gn_jacobi_probes,
+        interpolation_lambda=FLAGS.cg_interpolation_lambda,
+        lambda_batch_denominator=FLAGS.cg_lambda_batch_denominator,
+        lambda_final=FLAGS.cg_lambda_final,
+        lambda_ramp_steps=FLAGS.cg_lambda_ramp_steps,
+        adam_b1=FLAGS.optimizer.adamw_optimizer.b1,
+        condition_log=FLAGS.condition_log)
 
     if FLAGS.condition_log:
         if not supports_condition_diagnostics(
@@ -976,32 +990,51 @@ def main(argv):
                 new_second_moment,
             )
 
+        if FLAGS.cg_damping_mu > 0:
+            # apply_G already contains the complete weighted microbatch sum, so
+            # scalar damping is added exactly once at the full-batch boundary.
+            solved_operator = pcg.damped_operator(apply_G, FLAGS.cg_damping_mu)
+        else:
+            # Keep the legacy interpolated operator completely untouched.
+            solved_operator = Av
+
+        jacobi_diagonal = None
+        if FLAGS.cg_preconditioner == 'gn_jacobi':
+            probe_rng = jax.random.fold_in(rng, 0x474E4A43)
+            jacobi_diagonal = pcg.estimate_gn_diagonal(
+                apply_G, params0, probe_rng, FLAGS.cg_gn_jacobi_probes)
+            apply_preconditioner = pcg.gn_jacobi_preconditioner(
+                jacobi_diagonal, FLAGS.cg_damping_mu)
+        else:
+            apply_preconditioner = apply_D_inv
+
         # ── Run preconditioned CG ─────────────────────────────────────
         #
-        # Solve the original interpolated system:
+        # Solve either the original interpolated system (mu == 0) or the
+        # explicitly damped pure-GN system (mu > 0):
         #
         #     A_t x = rhs
         #
         # where
         #
-        #     A_t = λ G + (1-λ)/η * D_t.
+        #     A_t = λ G + (1-λ)/η * D_t, or A = G + mu I.
         #
-        # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
+        # JAX CG uses the selected fixed inverse diagonal as M ≈ A^{-1}.
         x, _ = cg(
-            Av,
+            solved_operator,
             rhs,
             x0=cg_x0,
             tol=FLAGS.cg_tol,
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
-            M=apply_D_inv,
+            M=apply_preconditioner,
         )
 
         # Compute residual for logging 
         # relative_residual = ||A x - rhs|| / ||rhs||
         residual = jax.tree_util.tree_map(
             lambda ax, rhs_leaf: ax - rhs_leaf,
-            Av(x),
+            solved_operator(x),
             rhs,
         )
         
@@ -1050,7 +1083,23 @@ def main(argv):
                 (1.0 - interpolation_lambda) /
                 (safe_adam_lr * interpolation_lambda),
                 jnp.asarray(jnp.nan, dtype=jnp.float32)),
+            'cg_damping_mu': jnp.asarray(FLAGS.cg_damping_mu, dtype=jnp.float32),
+            'cg_preconditioner_gv_products': jnp.asarray(
+                FLAGS.cg_gn_jacobi_probes
+                if FLAGS.cg_preconditioner == 'gn_jacobi' else 0,
+                dtype=jnp.int32),
         }
+        if jacobi_diagonal is not None:
+            diagonal_leaves = jax.tree.leaves(jacobi_diagonal)
+            metrics.update({
+                'cg_gn_jacobi_diag_min': jnp.min(jnp.stack([
+                    jnp.min(leaf) for leaf in diagonal_leaves])),
+                'cg_gn_jacobi_diag_max': jnp.max(jnp.stack([
+                    jnp.max(leaf) for leaf in diagonal_leaves])),
+                'cg_gn_jacobi_clipped_fraction': (
+                    sum(jnp.sum(leaf < 0) for leaf in diagonal_leaves)
+                    / sum(leaf.size for leaf in diagonal_leaves)),
+            })
 
         return (
             new_params,
@@ -2063,6 +2112,13 @@ def main(argv):
                     'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
                     'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
                     'cg_relative_damping': cg_metrics['cg_relative_damping'],
+                    'cg_damping_mu': cg_metrics['cg_damping_mu'],
+                    'cg_preconditioner_gv_products':
+                        cg_metrics['cg_preconditioner_gv_products'],
+                    **({key: cg_metrics[key] for key in (
+                        'cg_gn_jacobi_diag_min', 'cg_gn_jacobi_diag_max',
+                        'cg_gn_jacobi_clipped_fraction')}
+                       if FLAGS.cg_preconditioner == 'gn_jacobi' else {}),
                     **({'cg_relative_damping': None} if scheduled_lambda == 0.0 else {}),
                 }, step=step)
             should_log = (

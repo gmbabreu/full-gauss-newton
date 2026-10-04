@@ -53,8 +53,20 @@ class RecoveryTests(unittest.TestCase):
         saved = {'optimizer_type': 'cg', 'condition_log': False}
         current = dict(saved, condition_log=True,
                        spectrum_endpoint_maxiter=48,
-                       spectrum_check_every=8)
+                       spectrum_check_every=8,
+                       cg_damping_mu=0.0,
+                       cg_preconditioner='adam_diag',
+                       cg_gn_jacobi_probes=4)
         cg.validate_flags(saved, current)
+
+    def test_old_resume_implies_legacy_damped_pcg_defaults(self):
+        saved = {'optimizer_type': 'cg'}
+        current = dict(saved, cg_damping_mu=0.0,
+                       cg_preconditioner='adam_diag',
+                       cg_gn_jacobi_probes=4)
+        cg.validate_flags(saved, current)
+        with self.assertRaisesRegex(ValueError, 'cg_damping_mu'):
+            cg.validate_flags(saved, dict(current, cg_damping_mu=.1))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

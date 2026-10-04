@@ -1,5 +1,31 @@
 # CG batch lambda and recovery
 
+## Explicit scalar damping and preconditioning
+
+Setting `cg_damping_mu` to a positive finite value replaces the legacy
+interpolated CG system with
+
+```text
+(G + mu I) x = -g.
+```
+
+Here `g` and `G` are computed on the same full frozen solve batch. Scalar
+damping changes the system and therefore its solution. In contrast,
+`cg_preconditioner=adam_diag` applies the inverse bias-corrected Adam
+second-moment diagonal only as a PCG preconditioner, while
+`cg_preconditioner=gn_jacobi` applies the inverse of
+`maximum(d_hat, 0) + mu`, where `d_hat` is a sequential Hutchinson estimate of
+`diag(G)`. These preconditioners can change convergence speed but not the
+converged solution. `cg_x0` remains the warm start; `reset_start=True` retains
+its existing zero-start behavior.
+
+The damped system requires fixed pure-GN interpolation flags and Adam `b1=0`,
+so its right-hand side is the current full-batch gradient rather than a
+momentum average. `gn_jacobi` additionally requires positive scalar damping.
+Condition diagnostics are temporarily rejected with positive scalar damping:
+the existing `spectrum/A` diagnostics describe the legacy interpolated
+operator, not `G + mu I`.
+
 ## Lambda
 
 The default `cg_lambda_batch_denominator=0` preserves the existing constant or
