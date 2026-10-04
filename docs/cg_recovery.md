@@ -26,6 +26,19 @@ Condition diagnostics are temporarily rejected with positive scalar damping:
 the existing `spectrum/A` diagnostics describe the legacy interpolated
 operator, not `G + mu I`.
 
+The damped solve reports two distinct, unpreconditioned residuals:
+
+```text
+relative_residual = ||(G + mu I)x + g|| / ||g||
+cg_raw_gn_relative_residual = ||Gx + g|| / ||g||
+```
+
+The first measures convergence of the damped system actually passed to CG. The
+second measures violation of the original undamped GN equation and need not
+vanish: an exact damped solution satisfies `Gx + g = -mu*x`. Neither metric is
+a preconditioned residual, and choosing `adam_diag` versus `gn_jacobi` does not
+change either definition.
+
 ## Lambda
 
 The default `cg_lambda_batch_denominator=0` preserves the existing constant or

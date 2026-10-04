@@ -49,6 +49,19 @@ def damped_operator(apply_g, damping_mu):
     return apply_a
 
 
+def damped_residuals(apply_g, solution, gradient, damping_mu):
+    """Return damped-system and raw-GN residuals using one G product."""
+    gx = apply_g(solution)
+    raw_residual = jax.tree.map(
+        lambda gx_leaf, g_leaf: gx_leaf + g_leaf, gx, gradient)
+    mu = jnp.asarray(damping_mu)
+    damped_residual = jax.tree.map(
+        lambda residual, value: (
+            residual + mu.astype(residual.dtype) * value),
+        raw_residual, solution)
+    return damped_residual, raw_residual
+
+
 def estimate_gn_diagonal(apply_g, template, rng, probes):
     """Estimate diag(G) sequentially with deterministic Rademacher probes.
 

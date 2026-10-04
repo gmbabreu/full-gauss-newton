@@ -61,12 +61,17 @@ class RecoveryTests(unittest.TestCase):
 
     def test_old_resume_implies_legacy_damped_pcg_defaults(self):
         saved = {'optimizer_type': 'cg'}
+        cg.validate_flags(saved, dict(saved))
         current = dict(saved, cg_damping_mu=0.0,
                        cg_preconditioner='adam_diag',
                        cg_gn_jacobi_probes=4)
         cg.validate_flags(saved, current)
         with self.assertRaisesRegex(ValueError, 'cg_damping_mu'):
             cg.validate_flags(saved, dict(current, cg_damping_mu=.1))
+        with self.assertRaisesRegex(ValueError, 'cg_preconditioner'):
+            cg.validate_flags(saved, dict(current, cg_preconditioner='gn_jacobi'))
+        with self.assertRaisesRegex(ValueError, 'cg_gn_jacobi_probes'):
+            cg.validate_flags(saved, dict(current, cg_gn_jacobi_probes=8))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

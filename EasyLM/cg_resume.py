@@ -139,12 +139,15 @@ def validate_flags(saved, current):
     # Everything is trajectory-affecting unless explicitly operational/reporting.
     # Checkpoints predating explicit damping imply the legacy defaults.
     saved = dict(saved)
-    for key, value in {
+    current = dict(current)
+    defaults = {
         'cg_damping_mu': 0.0,
         'cg_preconditioner': 'adam_diag',
         'cg_gn_jacobi_probes': 4,
-    }.items():
-        saved.setdefault(key, value)
+    }
+    for flags in (saved, current):
+        for key, value in defaults.items():
+            flags.setdefault(key, value)
     ignored = {'cg_resume_state', 'load_dataset_state', 'wandb_run_id', 'wandb_dir',
         'wandb_project', 'wandb_entity', 'output_dir', 'tmp_dir', 'experiment_id',
         'notes', 'logger', 'log_all_worker', 'save_model_freq', 'save_milestone_freq',

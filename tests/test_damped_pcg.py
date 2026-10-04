@@ -63,6 +63,38 @@ class DampedPCGTest(unittest.TestCase):
                 atol=1e-12, maxiter=40)
             np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
 
+    def test_damped_and_raw_residuals_share_one_g_product(self):
+        matrix = jnp.array([[3., 1.], [1., 2.]], dtype=jnp.float64)
+        gradient = jnp.array([.5, -1.25], dtype=jnp.float64)
+        solution = jnp.array([.2, -.4], dtype=jnp.float64)
+        mu = .3
+        calls = []
+
+        def apply_g(value):
+            calls.append(1)
+            return matrix @ value
+
+        damped, raw = pcg.damped_residuals(
+            apply_g, solution, gradient, mu)
+        self.assertEqual(len(calls), 1)
+        np.testing.assert_allclose(raw, matrix @ solution + gradient,
+                                   rtol=0, atol=0)
+        np.testing.assert_allclose(
+            damped, matrix @ solution + mu * solution + gradient,
+            rtol=0, atol=0)
+        expected_relative = (jnp.linalg.norm(matrix @ solution + gradient)
+                             / (jnp.linalg.norm(gradient) + 1e-12))
+        np.testing.assert_allclose(
+            jnp.linalg.norm(raw) / (jnp.linalg.norm(gradient) + 1e-12),
+            expected_relative, rtol=1e-14)
+
+        exact = jnp.linalg.solve(matrix + mu * jnp.eye(2), -gradient)
+        exact_damped, exact_raw = pcg.damped_residuals(
+            lambda value: matrix @ value, exact, gradient, mu)
+        self.assertLess(float(jnp.linalg.norm(exact_damped)), 1e-12)
+        np.testing.assert_allclose(exact_raw, -mu * exact,
+                                   rtol=1e-12, atol=1e-12)
+
     def test_diagonal_estimator_exact_preconditioner_and_deterministic(self):
         diagonal = jnp.array([.25, 2., 5.], dtype=jnp.float64)
         key = jax.random.PRNGKey(17)

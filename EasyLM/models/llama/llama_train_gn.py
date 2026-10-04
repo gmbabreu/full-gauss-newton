@@ -1030,17 +1030,25 @@ def main(argv):
             M=apply_preconditioner,
         )
 
-        # Compute residual for logging 
-        # relative_residual = ||A x - rhs|| / ||rhs||
-        residual = jax.tree_util.tree_map(
-            lambda ax, rhs_leaf: ax - rhs_leaf,
-            solved_operator(x),
-            rhs,
-        )
+        # Compute residuals for logging. The damped branch reuses one Gx for
+        # both the solved-system and raw-GN diagnostics.
+        if FLAGS.cg_damping_mu > 0:
+            residual, raw_gn_residual = pcg.damped_residuals(
+                apply_G, x, b_param, FLAGS.cg_damping_mu)
+        else:
+            # Preserve the legacy residual path without another G product.
+            residual = jax.tree_util.tree_map(
+                lambda ax, rhs_leaf: ax - rhs_leaf,
+                Av(x),
+                rhs,
+            )
         
         residual_norm = global_norm(residual)
         rhs_norm = global_norm(rhs)
         relative_residual = residual_norm / (rhs_norm + 1e-12)        
+        if FLAGS.cg_damping_mu > 0:
+            raw_gn_relative_residual = (
+                global_norm(raw_gn_residual) / (global_norm(b_param) + 1e-12))
 
         # ── Apply update with decoupled weight decay ──────────────────
         #
@@ -1089,6 +1097,8 @@ def main(argv):
                 if FLAGS.cg_preconditioner == 'gn_jacobi' else 0,
                 dtype=jnp.int32),
         }
+        if FLAGS.cg_damping_mu > 0:
+            metrics['cg_raw_gn_relative_residual'] = raw_gn_relative_residual
         if jacobi_diagonal is not None:
             diagonal_leaves = jax.tree.leaves(jacobi_diagonal)
             metrics.update({
@@ -2115,6 +2125,9 @@ def main(argv):
                     'cg_damping_mu': cg_metrics['cg_damping_mu'],
                     'cg_preconditioner_gv_products':
                         cg_metrics['cg_preconditioner_gv_products'],
+                    **({'cg_raw_gn_relative_residual':
+                        cg_metrics['cg_raw_gn_relative_residual']}
+                       if FLAGS.cg_damping_mu > 0 else {}),
                     **({key: cg_metrics[key] for key in (
                         'cg_gn_jacobi_diag_min', 'cg_gn_jacobi_diag_max',
                         'cg_gn_jacobi_clipped_fraction')}
