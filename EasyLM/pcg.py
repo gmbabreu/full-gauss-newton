@@ -9,7 +9,12 @@ import jax.numpy as jnp
 PRECONDITIONERS = ('adam_diag', 'gn_jacobi')
 
 
-def validate_damped_pcg(damping_mu, preconditioner, probes, *,
+def effective_gn_jacobi_floor(damping_mu, jacobi_floor):
+    """Resolve zero as the legacy behavior of inheriting scalar damping."""
+    return damping_mu if jacobi_floor == 0 else jacobi_floor
+
+
+def validate_damped_pcg(damping_mu, preconditioner, probes, jacobi_floor, *,
                         interpolation_lambda, lambda_batch_denominator,
                         lambda_final, lambda_ramp_steps, adam_b1,
                         condition_log):
@@ -22,8 +27,16 @@ def validate_damped_pcg(damping_mu, preconditioner, probes, *,
     if (isinstance(probes, bool) or not isinstance(probes, numbers.Integral)
             or probes <= 0):
         raise ValueError('cg_gn_jacobi_probes must be a positive integer')
+    if not math.isfinite(jacobi_floor) or jacobi_floor < 0:
+        raise ValueError('cg_gn_jacobi_floor must be finite and nonnegative')
+    if jacobi_floor > 0 and preconditioner != 'gn_jacobi':
+        raise ValueError(
+            'nonzero cg_gn_jacobi_floor requires gn_jacobi preconditioner')
     if preconditioner == 'gn_jacobi' and damping_mu <= 0:
         raise ValueError('gn_jacobi requires cg_damping_mu > 0')
+    if (preconditioner == 'gn_jacobi'
+            and effective_gn_jacobi_floor(damping_mu, jacobi_floor) <= 0):
+        raise ValueError('gn_jacobi effective preconditioner floor must be positive')
     if damping_mu > 0:
         if (interpolation_lambda != 1
                 or lambda_batch_denominator != 0
@@ -90,10 +103,10 @@ def estimate_gn_diagonal(apply_g, template, rng, probes):
     return jax.tree.map(lambda value: value / scale, diagonal_sum)
 
 
-def gn_jacobi_preconditioner(diagonal_estimate, damping_mu):
-    """Return inverse application for max(diag estimate, 0) + damping."""
+def gn_jacobi_preconditioner(diagonal_estimate, preconditioner_floor):
+    """Return inverse application for max(diag estimate, 0) + floor."""
     denominator = jax.tree.map(
-        lambda diagonal: jnp.maximum(diagonal, 0) + damping_mu,
+        lambda diagonal: jnp.maximum(diagonal, 0) + preconditioner_floor,
         diagonal_estimate)
 
     def apply_inverse(tree):

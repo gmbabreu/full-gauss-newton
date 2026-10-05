@@ -14,10 +14,13 @@ damping changes the system and therefore its solution. In contrast,
 `cg_preconditioner=adam_diag` applies the inverse bias-corrected Adam
 second-moment diagonal only as a PCG preconditioner, while
 `cg_preconditioner=gn_jacobi` applies the inverse of
-`maximum(d_hat, 0) + mu`, where `d_hat` is a sequential Hutchinson estimate of
-`diag(G)`. These preconditioners can change convergence speed but not the
-converged solution. `cg_x0` remains the warm start; `reset_start=True` retains
-its existing zero-start behavior.
+`maximum(d_hat, 0) + nu`, where `d_hat` is a sequential Hutchinson estimate of
+`diag(G)`. The operator damping `mu` (`cg_damping_mu`) changes the solved
+system. The Jacobi floor `nu` (`cg_gn_jacobi_floor`) changes only the
+preconditioner; its default value zero means to inherit `cg_damping_mu`,
+preserving the original behavior. These preconditioners can change convergence
+speed but not the converged solution. `cg_x0` remains the warm start;
+`reset_start=True` retains its existing zero-start behavior.
 
 The damped system requires fixed pure-GN interpolation flags and Adam `b1=0`,
 so its right-hand side is the current full-batch gradient rather than a

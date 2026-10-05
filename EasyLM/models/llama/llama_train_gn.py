@@ -154,6 +154,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_damping_mu=0.0,
     cg_preconditioner='adam_diag',
     cg_gn_jacobi_probes=4,
+    cg_gn_jacobi_floor=0.0,
 
     # Observational spectral diagnostics.  They run only at the requested
     # cadence and never alter the solve operator or effective lambda.
@@ -284,13 +285,15 @@ def main(argv):
 
     pcg.validate_damped_pcg(
         FLAGS.cg_damping_mu, FLAGS.cg_preconditioner,
-        FLAGS.cg_gn_jacobi_probes,
+        FLAGS.cg_gn_jacobi_probes, FLAGS.cg_gn_jacobi_floor,
         interpolation_lambda=FLAGS.cg_interpolation_lambda,
         lambda_batch_denominator=FLAGS.cg_lambda_batch_denominator,
         lambda_final=FLAGS.cg_lambda_final,
         lambda_ramp_steps=FLAGS.cg_lambda_ramp_steps,
         adam_b1=FLAGS.optimizer.adamw_optimizer.b1,
         condition_log=FLAGS.condition_log)
+    effective_cg_gn_jacobi_floor = pcg.effective_gn_jacobi_floor(
+        FLAGS.cg_damping_mu, FLAGS.cg_gn_jacobi_floor)
 
     if FLAGS.condition_log:
         if not supports_condition_diagnostics(
@@ -1004,7 +1007,7 @@ def main(argv):
             jacobi_diagonal = pcg.estimate_gn_diagonal(
                 apply_G, params0, probe_rng, FLAGS.cg_gn_jacobi_probes)
             apply_preconditioner = pcg.gn_jacobi_preconditioner(
-                jacobi_diagonal, FLAGS.cg_damping_mu)
+                jacobi_diagonal, effective_cg_gn_jacobi_floor)
         else:
             apply_preconditioner = apply_D_inv
 
@@ -1109,6 +1112,8 @@ def main(argv):
                 'cg_gn_jacobi_clipped_fraction': (
                     sum(jnp.sum(leaf < 0) for leaf in diagonal_leaves)
                     / sum(leaf.size for leaf in diagonal_leaves)),
+                'cg_gn_jacobi_floor': jnp.asarray(
+                    effective_cg_gn_jacobi_floor, dtype=jnp.float32),
             })
 
         return (
@@ -2130,7 +2135,8 @@ def main(argv):
                        if FLAGS.cg_damping_mu > 0 else {}),
                     **({key: cg_metrics[key] for key in (
                         'cg_gn_jacobi_diag_min', 'cg_gn_jacobi_diag_max',
-                        'cg_gn_jacobi_clipped_fraction')}
+                        'cg_gn_jacobi_clipped_fraction',
+                        'cg_gn_jacobi_floor')}
                        if FLAGS.cg_preconditioner == 'gn_jacobi' else {}),
                     **({'cg_relative_damping': None} if scheduled_lambda == 0.0 else {}),
                 }, step=step)

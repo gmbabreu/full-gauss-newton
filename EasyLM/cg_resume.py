@@ -144,6 +144,7 @@ def validate_flags(saved, current):
         'cg_damping_mu': 0.0,
         'cg_preconditioner': 'adam_diag',
         'cg_gn_jacobi_probes': 4,
+        'cg_gn_jacobi_floor': 0.0,
     }
     for flags in (saved, current):
         for key, value in defaults.items():

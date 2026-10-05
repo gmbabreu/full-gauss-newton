@@ -63,6 +63,47 @@ class DampedPCGTest(unittest.TestCase):
                 atol=1e-12, maxiter=40)
             np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
 
+    def test_jacobi_floor_inheritance_and_explicit_override(self):
+        estimate = jnp.array([-2., .5, 3.])
+        mu = .2
+        inherited = pcg.effective_gn_jacobi_floor(mu, 0)
+        explicit = pcg.effective_gn_jacobi_floor(mu, .7)
+        np.testing.assert_allclose(
+            pcg.gn_jacobi_preconditioner(estimate, inherited)(jnp.ones(3)),
+            1 / (jnp.maximum(estimate, 0) + mu))
+        np.testing.assert_allclose(
+            pcg.gn_jacobi_preconditioner(estimate, explicit)(jnp.ones(3)),
+            1 / (jnp.maximum(estimate, 0) + .7))
+
+    def test_floor_does_not_change_system_rhs_residuals_or_solution(self):
+        matrix = jnp.array([[5., 1.], [1., 1.]], dtype=jnp.float64)
+        gradient = jnp.array([1.5, -.25], dtype=jnp.float64)
+        mu = .1
+        operator = pcg.damped_operator(lambda value: matrix @ value, mu)
+        rhs = -gradient
+        exact = np.linalg.solve(
+            np.asarray(matrix + mu * jnp.eye(2)), np.asarray(rhs))
+        probe = jnp.array([.3, -.8], dtype=jnp.float64)
+        operator_value = operator(probe)
+        residuals = pcg.damped_residuals(
+            lambda value: matrix @ value, probe, gradient, mu)
+
+        for floor in (.02, 3.0):
+            preconditioner = pcg.gn_jacobi_preconditioner(
+                jnp.diag(matrix), floor)
+            actual, _ = jax.scipy.sparse.linalg.cg(
+                operator, rhs, M=preconditioner, tol=1e-12,
+                atol=1e-12, maxiter=40)
+            np.testing.assert_allclose(actual, exact, rtol=1e-10, atol=1e-10)
+            np.testing.assert_array_equal(operator(probe), operator_value)
+            np.testing.assert_array_equal(rhs, -gradient)
+            for actual_residual, expected_residual in zip(
+                    pcg.damped_residuals(
+                        lambda value: matrix @ value, probe, gradient, mu),
+                    residuals):
+                np.testing.assert_array_equal(actual_residual,
+                                              expected_residual)
+
     def test_damped_and_raw_residuals_share_one_g_product(self):
         matrix = jnp.array([[3., 1.], [1., 2.]], dtype=jnp.float64)
         gradient = jnp.array([.5, -1.25], dtype=jnp.float64)
@@ -166,14 +207,18 @@ class DampedPCGTest(unittest.TestCase):
         valid = dict(interpolation_lambda=1, lambda_batch_denominator=0,
                      lambda_final=-1, lambda_ramp_steps=0, adam_b1=0,
                      condition_log=False)
-        pcg.validate_damped_pcg(.1, 'adam_diag', 1, **valid)
-        pcg.validate_damped_pcg(.1, 'gn_jacobi', 1, **valid)
+        pcg.validate_damped_pcg(.1, 'adam_diag', 1, 0, **valid)
+        pcg.validate_damped_pcg(.1, 'gn_jacobi', 1, 0, **valid)
+        pcg.validate_damped_pcg(.1, 'gn_jacobi', 1, .03, **valid)
         invalid = [
             (dict(damping_mu=-1), 'finite and nonnegative'),
             (dict(damping_mu=float('nan')), 'finite and nonnegative'),
             (dict(preconditioner='identity'), 'must be one of'),
             (dict(probes=0), 'positive integer'),
             (dict(probes=1.5), 'positive integer'),
+            (dict(jacobi_floor=-1), 'finite and nonnegative'),
+            (dict(jacobi_floor=float('inf')), 'finite and nonnegative'),
+            (dict(jacobi_floor=.1), 'requires gn_jacobi'),
             (dict(interpolation_lambda=.9), 'fixed pure-GN'),
             (dict(lambda_batch_denominator=10), 'fixed pure-GN'),
             (dict(lambda_final=.5), 'fixed pure-GN'),
@@ -182,6 +227,7 @@ class DampedPCGTest(unittest.TestCase):
             (dict(condition_log=True), 'condition_log'),
         ]
         base = dict(damping_mu=.1, preconditioner='adam_diag', probes=1,
+                    jacobi_floor=0,
                     **valid)
         for changes, message in invalid:
             arguments = dict(base, **changes)
@@ -190,10 +236,11 @@ class DampedPCGTest(unittest.TestCase):
                 pcg.validate_damped_pcg(
                     arguments.pop('damping_mu'),
                     arguments.pop('preconditioner'), arguments.pop('probes'),
+                    arguments.pop('jacobi_floor'),
                     **arguments)
         with self.assertRaisesRegex(ValueError, 'requires cg_damping_mu > 0'):
             pcg.validate_damped_pcg(
-                0, 'gn_jacobi', 1, **dict(valid, adam_b1=.9))
+                0, 'gn_jacobi', 1, .1, **dict(valid, adam_b1=.9))
 
 
 if __name__ == '__main__':
