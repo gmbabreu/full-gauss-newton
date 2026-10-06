@@ -177,7 +177,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 def supports_condition_diagnostics(optimizer_type, gauss_newton):
     """Whether the selected solver exposes the frozen Gauss--Newton operator."""
     return optimizer_type == 'cg' or (
-        gauss_newton and optimizer_type in ('adamw', 'muon'))
+        gauss_newton and optimizer_type in ('adamw', 'muon', 'sgd'))
 
 
 def should_run_condition_diagnostics(enabled, step, start_step, every):
@@ -282,7 +282,7 @@ def main(argv):
         if not supports_condition_diagnostics(
                 FLAGS.optimizer_type, FLAGS.gauss_newton):
             raise ValueError(
-                'Condition diagnostics support CG, Adam-GN, and Muon-GN only')
+                'Condition diagnostics support CG, Adam-GN, Muon-GN, and SGD-GN only')
         if FLAGS.condition_every <= 0:
             raise ValueError('condition cadence must be positive')
         if (FLAGS.spectrum_endpoint_maxiter < 3
@@ -445,7 +445,7 @@ def main(argv):
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
     if (FLAGS.condition_log
-            and FLAGS.optimizer_type in ('adamw', 'muon')):
+            and FLAGS.optimizer_type in ('adamw', 'muon', 'sgd')):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
@@ -641,6 +641,20 @@ def main(argv):
                 return create_param_selector(params)
             
             optimizer = optax.multi_transform(transform_dict, param_selector)
+        elif optimizer_type == 'sgd':
+            if grad_clip:
+                raise ValueError(
+                    "Plain SGD requires inner_clip_gradient=0"
+                )
+            if wd != 0.0:
+                raise ValueError(
+                    "Plain SGD requires optimizer_wd=0"
+                )
+            optimizer = optax.sgd(
+                learning_rate=lr_sched,
+                momentum=None,
+                nesterov=False,
+            )
         elif optimizer_type == 'cg':
             # CG doesn't use an optax optimizer at all -- inert placeholder
             # so tayl_solver.init(...) still produces a validly-shaped opt_state.
