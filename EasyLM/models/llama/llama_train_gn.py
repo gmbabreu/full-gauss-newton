@@ -175,6 +175,66 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 )
 
 
+@jax.jit
+def update_balance_metrics(direction):
+    flat = flatten_dict(direction)
+    metrics = {}
+    groups = {"all": [], "hidden": []}
+
+    for path, value in flat.items():
+        x = value.astype(jnp.float32)
+        special = (
+            path[-1] == "embedding"
+            or "lm_head" in path
+        )
+        groups["all"].append(x)
+        if not special:
+            groups["hidden"].append(x)
+
+        if x.ndim == 2:
+            name = "/".join(path)
+            metrics[f"update_balance/matrix_rms/{name}"] = (
+                jnp.sqrt(jnp.mean(jnp.square(x)))
+            )
+
+    def cv2(variance, mean):
+        # Define zero-update imbalance as zero; avoid an arbitrary epsilon.
+        denominator = jnp.where(mean > 0, mean * mean, 1.0)
+        return variance / denominator
+
+    for group, leaves in groups.items():
+        if not leaves:
+            continue
+
+        prefix = f"update_balance/{group}"
+        count = sum(x.size for x in leaves)
+        mean_abs = sum(jnp.sum(jnp.abs(x)) for x in leaves) / count
+        mean_square = sum(jnp.sum(jnp.square(x)) for x in leaves) / count
+        coordinate_variance = jnp.maximum(
+            mean_square - mean_abs * mean_abs, 0.0
+        )
+        metrics[f"{prefix}/coordinate_abs_variance"] = coordinate_variance
+        metrics[f"{prefix}/coordinate_abs_cv2"] = cv2(
+            coordinate_variance, mean_abs
+        )
+
+        matrices = [x for x in leaves if x.ndim == 2]
+        if matrices:
+            norms = jnp.stack([
+                jnp.sqrt(jnp.sum(jnp.square(x))) for x in matrices
+            ])
+            rms = jnp.stack([
+                norm / jnp.sqrt(float(x.size))
+                for norm, x in zip(norms, matrices)
+            ])
+            metrics[f"{prefix}/matrix_frobenius_variance"] = jnp.var(norms)
+            metrics[f"{prefix}/matrix_rms_cv2"] = cv2(
+                jnp.var(rms), jnp.mean(rms)
+            )
+
+    return metrics
+
+
 def supports_condition_diagnostics(optimizer_type, gauss_newton):
     """Whether the selected solver exposes the frozen Gauss--Newton operator."""
     return optimizer_type == 'cg' or (
@@ -1784,6 +1844,11 @@ def main(argv):
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, candidate_params, train_state.params)
+                if step % FLAGS.log_freq == 0:
+                    defer_wandb(
+                        jax.device_get(update_balance_metrics(dir)),
+                        step=step,
+                    )
                 if FLAGS.normalize_step:
                     dir_norm_val = global_norm(dir)
                     dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
@@ -1984,6 +2049,11 @@ def main(argv):
                     print(f"\nTrue model loss: {baseline_loss:.6f}")
 
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
+                    if step % FLAGS.log_freq == 0:
+                        defer_wandb(
+                            jax.device_get(update_balance_metrics(dir)),
+                            step=step,
+                        )
                     if FLAGS.normalize_step:
                         dir_norm_val = global_norm(dir)
                         dir = jax.tree_util.tree_map(lambda x: x / (dir_norm_val + 1e-8), dir)
@@ -2022,6 +2092,11 @@ def main(argv):
                 else:
                     dir = jax.tree.map(lambda inner, outer: inner - outer,
                                        inner_state.params, train_state.params)
+                    if step % FLAGS.log_freq == 0:
+                        defer_wandb(
+                            jax.device_get(update_balance_metrics(dir)),
+                            step=step,
+                        )
                     effective_step_size = 1.0
                     updated_params = apply_outer_decay(train_state.params, inner_state.params)
                     train_state = train_state.replace(
