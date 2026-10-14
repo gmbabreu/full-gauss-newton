@@ -62,6 +62,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_resume_state='',  # Internal: complete CG bundle selected by the launcher.
     load_dataset_state='',
     log_freq=50,
+    log_update_balance=False,
     log_step_offset=-1,
     log_token_offset=-1,
     log_time_offset_s=0.0,
@@ -1844,7 +1845,7 @@ def main(argv):
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, candidate_params, train_state.params)
-                if step % FLAGS.log_freq == 0:
+                if FLAGS.log_update_balance and step % FLAGS.log_freq == 0:
                     defer_wandb(
                         jax.device_get(update_balance_metrics(dir)),
                         step=step,
@@ -2049,7 +2050,7 @@ def main(argv):
                     print(f"\nTrue model loss: {baseline_loss:.6f}")
 
                     dir = jax.tree_util.tree_map(lambda x, y: x - y, inner_state.params, train_state.params)
-                    if step % FLAGS.log_freq == 0:
+                    if FLAGS.log_update_balance and step % FLAGS.log_freq == 0:
                         defer_wandb(
                             jax.device_get(update_balance_metrics(dir)),
                             step=step,
@@ -2092,7 +2093,7 @@ def main(argv):
                 else:
                     dir = jax.tree.map(lambda inner, outer: inner - outer,
                                        inner_state.params, train_state.params)
-                    if step % FLAGS.log_freq == 0:
+                    if FLAGS.log_update_balance and step % FLAGS.log_freq == 0:
                         defer_wandb(
                             jax.device_get(update_balance_metrics(dir)),
                             step=step,
