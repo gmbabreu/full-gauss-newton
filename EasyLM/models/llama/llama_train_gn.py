@@ -95,6 +95,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_loop_warmup=0.0,
 
     optimizer_type='adamw',
+    inner_sgd_momentum=0.0,
     inner_b1=0.9,
     inner_b2=0.999,
     inner_clip_gradient=0.0,
@@ -652,7 +653,7 @@ def main(argv):
                 )
             optimizer = optax.sgd(
                 learning_rate=lr_sched,
-                momentum=None,
+                momentum=FLAGS.inner_sgd_momentum,
                 nesterov=False,
             )
         elif optimizer_type == 'cg':
