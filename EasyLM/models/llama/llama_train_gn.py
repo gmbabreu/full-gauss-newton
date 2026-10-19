@@ -1483,6 +1483,8 @@ def main(argv):
                   f'wandb_run_id={wandb.run.id}', flush=True)
 
         configure_wandb_run(wandb.run)
+        if jax.process_index() == 0:
+            wandb.define_metric('inner_relative_residual', step_metric='inner_step')
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
         wandb.config.update({
             'log_time_offset_s': FLAGS.log_time_offset_s,
@@ -1635,7 +1637,7 @@ def main(argv):
             jax.block_until_ready((initial_eval_rng, initial_record))
             timing.stop_eval()
             initial_record.update(timing.metrics())
-            wandb.log(initial_record, step=initial_record['completed_updates'], commit=True)
+            wandb.log(initial_record, commit=True)
 
         if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_metadata is None:
             progress.dataset_total_tokens = dataset_object.get_state_dict()['metadata']['dataset_total_tokens']
@@ -2029,6 +2031,12 @@ def main(argv):
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
                         print(f"inner_step={i} relative_residual={float(metrics['relative_residual']):.6e}", flush=True)
+                        if jax.process_index() == 0 and (
+                                (i + 1) % 10 == 0 or (i + 1) == FLAGS.inner_loop_iter):
+                            wandb.log({
+                                'inner_step': step * FLAGS.inner_loop_iter + i,
+                                'inner_relative_residual': float(metrics['relative_residual']),
+                            })
                         log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                         log_metrics['inner_loss'] = metrics['linear_model_loss']
                         log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
@@ -2225,7 +2233,7 @@ def main(argv):
                         train_state, ema=ema if FLAGS.weight_average else None,
                         milestone=(FLAGS.save_milestone_freq > 0
                                    and (step + 1) % FLAGS.save_milestone_freq == 0))
-                wandb.log(log_metrics, step=log_metrics['completed_updates'], commit=True)
+                wandb.log(log_metrics, commit=True)
                 console_metrics = {k: v for k, v in log_metrics.items()
                     if not k.startswith('spectrum/')}
                 tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
