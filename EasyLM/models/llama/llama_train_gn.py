@@ -2019,16 +2019,20 @@ def main(argv):
                     )
                     if i == 0 and do_condition:
                         condition_batch = batch
-                    is_last_step = jnp.bool_((i + 1) == FLAGS.inner_loop_iter)
+                    is_last_step = jnp.bool_(
+                        FLAGS.log_inner_steps or (i + 1) == FLAGS.inner_loop_iter
+                    )
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                     )
                     if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
+                        print(f"inner_step={i} relative_residual={float(metrics['relative_residual']):.6e}", flush=True)
                         log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                         log_metrics['inner_loss'] = metrics['linear_model_loss']
                         log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
+                        log_metrics['inner_relative_residual'] = metrics['relative_residual']
                         log_metrics['inner_param_norm'] = metrics['param_norm']
                         log_metrics['inner_gpu_memory'] = metrics['gpu_memory']
                         log_metrics['inner_learning_rate'] = metrics['learning_rate']
