@@ -1483,8 +1483,9 @@ def main(argv):
                   f'wandb_run_id={wandb.run.id}', flush=True)
 
         configure_wandb_run(wandb.run)
-        if jax.process_index() == 0:
-            wandb.define_metric('inner_relative_residual', step_metric='inner_step')
+        # Every worker owns a W&B run; publish inner scalars to that same run.
+        wandb.define_metric('inner_step', hidden=True)
+        wandb.define_metric('inner_relative_residual', step_metric='inner_step', hidden=False)
         wandb.config.update({'training_progress': progress.state_dict()}, allow_val_change=True)
         wandb.config.update({
             'log_time_offset_s': FLAGS.log_time_offset_s,
@@ -2031,12 +2032,11 @@ def main(argv):
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
                         print(f"inner_step={i} relative_residual={float(metrics['relative_residual']):.6e}", flush=True)
-                        if jax.process_index() == 0 and (
-                                (i + 1) % 10 == 0 or (i + 1) == FLAGS.inner_loop_iter):
+                        if i == 0 or (i + 1) % 10 == 0 or (i + 1) == FLAGS.inner_loop_iter:
                             wandb.log({
                                 'inner_step': step * FLAGS.inner_loop_iter + i,
                                 'inner_relative_residual': float(metrics['relative_residual']),
-                            })
+                            }, commit=True)
                         log_metrics = {"inner_step": step*FLAGS.inner_loop_iter + i}
                         log_metrics['inner_loss'] = metrics['linear_model_loss']
                         log_metrics['inner_gradient_norm'] = metrics['gradient_norm']
