@@ -291,6 +291,27 @@ def weighted_microbatch_sum(batch, groups, contribution_fn, zero):
         total = jax.lax.fori_loop(0, count, body, total)
     return total
 
+def plain_gn_linesearch_scale(base_params, direction, proposed_scale, losses,
+                              baseline_loss, direction_valid, evaluate_loss):
+    """Accept only a finite plain-GN candidate that improves the fixed baseline."""
+    scale = float(jax.device_get(proposed_scale))
+    if (not bool(jax.device_get(direction_valid)) or not np.isfinite(scale)
+            or scale <= 0 or not np.isfinite(baseline_loss)):
+        return 0.0
+    candidate = jax.tree.map(lambda p, d: p + scale * d, base_params, direction)
+    finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
+                                for x in jax.tree.leaves((direction, candidate))]))
+    if not bool(jax.device_get(finite)):
+        return 0.0
+    # A fixed-step override must be checked at its own scale, on the same batches.
+    candidate_loss = next((loss for step, loss in losses
+                           if float(jax.device_get(step)) == scale), None)
+    if candidate_loss is None:
+        candidate_loss = evaluate_loss(candidate)
+    candidate_loss = float(jax.device_get(candidate_loss))
+    return scale if np.isfinite(candidate_loss) and candidate_loss < baseline_loss else 0.0
+
+
 def get_gpu_memory():
     try:
         command = "nvidia-smi --query-gpu=memory.free --format=csv"
@@ -997,8 +1018,20 @@ def main(argv):
                     stop_reason=jnp.where(~finite, 3, jnp.where(converged, 0, 4)),
                     relative_residual=residual_norm / jnp.where(rhs_norm > 0, rhs_norm, 1.),
                     quadratic_change=.5 * tree_dot(direction, ad) - tree_dot(rhs, direction))
-            new_params = jax.tree.map(lambda p, d: p + d, params0, direction)
+            gradient_dot_direction = tree_dot(b_param, direction)
+            nonzero = jnp.any(jnp.stack([jnp.any(d != 0)
+                                        for d in jax.tree.leaves(direction)]))
+            candidate = jax.tree.map(lambda p, d: p + d, params0, direction)
+            finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
+                                       for x in jax.tree.leaves((direction, candidate))]))
+            direction_valid = (finite & jnp.isfinite(gradient_dot_direction)
+                               & (~nonzero | (gradient_dot_direction < 0)))
+            # Select the base parameters directly: multiplying NaN by zero is unsafe.
+            new_params = jax.tree.map(lambda p, q: jnp.where(direction_valid, q, p),
+                                      params0, candidate)
             metrics = dict(
+                cg_direction_valid=direction_valid,
+                cg_gradient_dot_direction=gradient_dot_direction,
                 param_norm=global_norm(new_params), b_norm=global_norm(rhs),
                 relative_residual=solve_info['relative_residual'],
                 cg_true_residual=solve_info['true_residual_norm'],
@@ -1930,6 +1963,23 @@ def main(argv):
 
                 step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
                 effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                if FLAGS.cg_plain_gn:
+                    def evaluate_plain_candidate(candidate):
+                        total = 0.0
+                        for ls_batch, ls_rng in zip(ls_batches, ls_rngs):
+                            loss, _ = microbatched_loss_fn(
+                                candidate, ls_batch, ls_rng, FLAGS.cg_n_micro)
+                            total += loss
+                        return total / len(ls_batches)
+
+                    effective_step_size = plain_gn_linesearch_scale(
+                        train_state.params, dir, effective_step_size, losses,
+                        baseline_loss, cg_metrics['cg_direction_valid'],
+                        evaluate_plain_candidate)
+                    cg_metrics['cg_step_rejected'] = effective_step_size == 0.0
+                    if effective_step_size == 0.0:
+                        # Also clears any invalid direction introduced by outer momentum.
+                        dir = jax.tree.map(jnp.zeros_like, dir)
                 print("Step size:", effective_step_size)
 
                 if FLAGS.outer_momentum_beta > 0.0:

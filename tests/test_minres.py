@@ -38,6 +38,18 @@ class MinresTest(unittest.TestCase):
             np.testing.assert_allclose(info['true_residual_norm'], np.linalg.norm(
                 a.astype('float32') @ actual - b.astype('float32')), atol=2e-6)
 
+    def test_breakdown_is_invariant_to_rhs_scale(self):
+        diagonal = jnp.array([1., 2., 3.], dtype=jnp.float32)
+        for scale in (1e-8, 1., 1e8):
+            with self.subTest(scale=scale):
+                b = jnp.ones(3, dtype=jnp.float32) * scale
+                x, info = jax.jit(lambda rhs: minres(
+                    lambda v: diagonal * v, rhs, tol=1e-6, maxiter=10))(b)
+                self.assertTrue(info['converged'])
+                self.assertEqual(int(info['iterations']), 3)
+                self.assertLess(float(info['relative_residual']), 1e-6)
+                np.testing.assert_allclose(x / scale, 1 / diagonal, rtol=1e-6)
+
     def test_zero_rhs_and_iteration_limit(self):
         calls = []
         def operator(v):

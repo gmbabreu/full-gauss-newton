@@ -30,11 +30,19 @@ A final product recomputes the true residual. Success requires
 the recurrence residual optimistic; this is reported as failure, with no
 restart or QLP fallback. Singular inconsistent systems need not produce a
 minimum-norm least-squares solution. A numerical failure retains the last
-finite iterate. The existing line search still evaluates the resulting candidate.
+finite iterate. Plain mode rejects nonfinite solver directions and nonzero
+solver directions with `g^T d >= 0`. Rejected directions return the base parameters.
+After the existing line search, plain mode accepts a step only if its actual
+candidate is finite and its loss on the same search batches is strictly below
+the baseline. A fixed-step override is checked at its own scale. Otherwise the
+update is zero, including any outer-momentum contribution, while counters
+continue to advance normally. Legacy PCG keeps its existing acceptance behavior.
 
 Plain-mode metrics include `cg_true_residual`, `cg_estimated_residual`,
 `relative_residual`, `cg_converged`, `cg_stop_reason`, `cg_stop_reason_name`,
-`minres_iterations`, `cg_damping`, and `cg_quadratic_change`. The quadratic
+`minres_iterations`, `cg_damping`, and `cg_quadratic_change`. Direction guards
+also log `cg_direction_valid`, `cg_gradient_dot_direction`, and `cg_step_rejected`.
+Solver residuals and quadratic change describe the raw solve before rejection. The quadratic
 change is `g^T d + 0.5 d^T (G+mu I)d`, before line-search scaling. Stop codes
 are 0=converged, 1=iteration_limit, 2=breakdown, 3=nonfinite, and
 4=true_residual_above_tolerance. JAX CG does not expose an iteration count or

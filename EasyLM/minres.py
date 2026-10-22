@@ -80,7 +80,9 @@ def minres(A, b, *, tol=1e-5, atol=0.0, maxiter=100):
         finite = (_finite((av, y, w, candidate)) & jnp.isfinite(gamma)
                   & jnp.isfinite(next_phibar))
         # A vanishing Lanczos subdiagonal exhausts the available Krylov space.
-        exhausted = next_beta <= jnp.finfo(bnorm.dtype).eps * (jnp.abs(alpha) + beta)
+        # On the first iteration beta is ||b||, not an operator coefficient.
+        exhausted = next_beta <= jnp.finfo(bnorm.dtype).eps * (
+            jnp.abs(alpha) + jnp.where(k > 0, beta, scalar(0)))
         reason = jnp.where(~finite, NONFINITE,
                    jnp.where(gamma == 0, BREAKDOWN,
                    jnp.where(jnp.abs(next_phibar) <= threshold, CONVERGED,

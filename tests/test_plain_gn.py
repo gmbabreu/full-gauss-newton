@@ -112,6 +112,97 @@ class PlainGNTest(unittest.TestCase):
         np.testing.assert_allclose(d, np.linalg.pinv(G, rcond=1e-6) @ -g, atol=3e-6)
         np.testing.assert_allclose(d, reference(G, -g), atol=3e-6)
 
+    def test_invalid_solver_directions_are_discarded(self):
+        g, _ = assembled(self.params, self.batch)
+        _, unravel = ravel_pytree(self.params)
+        for solver in ('cg', 'minres'):
+            self.flags.cg_solver = solver
+            for values, valid in ((g, False), (np.full_like(g, np.nan), False),
+                                  (np.full_like(g, np.inf), False),
+                                  (np.zeros_like(g), True)):
+                with self.subTest(solver=solver, values=values):
+                    direction = unravel(jnp.asarray(values, dtype=jnp.float32))
+                    fn = kernel(self.flags)
+                    def fake_solver(*args, **kwargs):
+                        if solver == 'cg':
+                            return direction, None
+                        return direction, dict(relative_residual=0., true_residual_norm=0.,
+                            estimated_residual_norm=0., converged=True, stop_reason=0,
+                            iterations=1, quadratic_change=0.)
+                    fn.__globals__[solver] = fake_solver
+                    params, first, second, warm, count, _, metrics = jax.jit(fn)(
+                        self.params, self.first, self.second, self.warm,
+                        jnp.int32(4), jnp.int32(4), jax.random.PRNGKey(3),
+                        self.batch, .7, .37)
+                    np.testing.assert_array_equal(ravel_pytree(params)[0], ravel_pytree(self.params)[0])
+                    self.assertEqual(bool(metrics['cg_direction_valid']), valid)
+                    self.assertEqual(int(count), 5)
+                    for actual, expected in ((first, self.first), (second, self.second), (warm, self.warm)):
+                        np.testing.assert_array_equal(ravel_pytree(actual)[0], ravel_pytree(expected)[0])
+
+    def test_plain_linesearch_requires_finite_improvement_at_actual_scale(self):
+        tree = ast.parse(TRAINER.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'plain_gn_linesearch_scale')
+        namespace = dict(jax=jax, jnp=jnp, np=np)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(TRAINER), 'exec'), namespace)
+        choose = namespace['plain_gn_linesearch_scale']
+        calls = []
+        def evaluate(candidate):
+            calls.append(candidate)
+            return .5
+        direction = jax.tree.map(jnp.ones_like, self.params)
+        for losses, expected in (([(1., 2.), (.5, 1.5)], 0.),
+                                 ([(1., 1.)], 0.), ([(1., float('nan'))], 0.),
+                                 ([(1., float('inf'))], 0.), ([(1., .7)], 1.)):
+            self.assertEqual(choose(self.params, direction, 1., losses, 1., True, evaluate), expected)
+        self.assertEqual(calls, [])
+        # The fixed step is not allowed to inherit a different scale's measured loss.
+        self.assertEqual(choose(self.params, direction, .25, [(1., 2.)], 1., True, evaluate), .25)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(choose(self.params, direction, .25, [(1., .2)], 1., True, lambda p: 2.), 0.)
+        for scale, baseline, valid, d in (
+                (1., 1., False, direction), (float('nan'), 1., True, direction),
+                (1., float('nan'), True, direction),
+                (1., 1., True, jax.tree.map(lambda x: x * jnp.nan, direction))):
+            self.assertEqual(choose(self.params, d, scale, [(1., .1)], baseline, valid,
+                                    lambda p: self.fail('invalid direction evaluated')), 0.)
+
+    def test_plain_zero_step_fallback_preserves_params_and_advances_counter(self):
+        tree = ast.parse(TRAINER.read_text())
+        helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == 'plain_gn_linesearch_scale')
+        guard = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+                     and any(isinstance(c, ast.FunctionDef) and c.name == 'evaluate_plain_candidate'
+                             for c in n.body))
+        for parent in ast.walk(tree):
+            statements = getattr(parent, 'body', [])
+            if isinstance(statements, list) and guard in statements:
+                tail = statements[statements.index(guard):]
+                break
+        update = next(n for n in tail if isinstance(n, ast.If)
+                      and ast.unparse(n.test) == 'FLAGS.outer_momentum_beta > 0.0')
+        advance = next(n for n in tail if isinstance(n, ast.Assign)
+                       and ast.unparse(n.targets[0]) == 'train_state')
+        for momentum in (0., .5):
+            for loss, bad_direction in ((2., False), (float('nan'), False), (.1, True)):
+                state = NS(params=self.params, step=4)
+                state.replace = lambda **kwargs: NS(**kwargs)
+                namespace = dict(jax=jax, jnp=jnp, np=np,
+                    FLAGS=NS(cg_plain_gn=True, outer_momentum_beta=momentum),
+                    train_state=state, cg_metrics=dict(cg_direction_valid=True),
+                    dir=jax.tree.map(lambda x: jnp.full_like(x, jnp.inf if bad_direction else 1.), self.params),
+                    effective_step_size=1., losses=[(1., loss)], baseline_loss=1.)
+                exec(compile(ast.Module(body=[helper, guard, update, advance], type_ignores=[]),
+                             str(TRAINER), 'exec'), namespace)
+                self.assertEqual(namespace['effective_step_size'], 0.)
+                self.assertTrue(namespace['cg_metrics']['cg_step_rejected'])
+                self.assertEqual(namespace['train_state'].step, 5)
+                np.testing.assert_array_equal(ravel_pytree(namespace['train_state'].params)[0],
+                                              ravel_pytree(self.params)[0])
+                if momentum:
+                    np.testing.assert_array_equal(ravel_pytree(namespace['outer_prev_update'])[0], 0.)
+
     def test_legacy_pcg_moments_preconditioner_and_warm_start(self):
         self.flags.cg_plain_gn = False
         g, G = assembled(self.params, self.batch)
