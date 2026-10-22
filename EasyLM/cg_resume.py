@@ -142,6 +142,10 @@ def validate_flags(saved, current):
         'notes', 'logger', 'log_all_worker', 'save_model_freq', 'save_milestone_freq',
         'checkpointer', 'param_count', 'param_count_nonembed', 'training_progress',
         'log_time_offset_s'}
+    # Checkpoints predating plain GN imply the legacy PCG settings.
+    defaults = dict(cg_solver='cg', cg_plain_gn=False, cg_damping=0.0)
+    saved = dict(defaults, **saved)
+    current = dict(defaults, **current)
     changed = sorted(k for k in set(saved) | set(current)
                      if k not in ignored
                      and not k.startswith(('condition_', 'spectrum_'))

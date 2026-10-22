@@ -30,6 +30,7 @@ import optax
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM import cg_resume
+from EasyLM.minres import minres, STOP_REASONS
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
@@ -144,6 +145,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     patience=1,
 
+    cg_solver='cg',  # cg or minres; MINRES requires plain GN.
+    cg_plain_gn=False,
+    cg_damping=0.0,  # Additive mu I, applied once to the aggregated plain GN.
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
@@ -338,6 +342,18 @@ def get_tpu_metrics():
 
 
 def main(argv):
+    if FLAGS.cg_solver not in ('cg', 'minres'):
+        raise ValueError('cg_solver must be cg or minres')
+    if FLAGS.cg_solver == 'minres' and not FLAGS.cg_plain_gn:
+        raise ValueError('MINRES requires cg_plain_gn=True')
+    if not np.isfinite(FLAGS.cg_damping) or FLAGS.cg_damping < 0:
+        raise ValueError('cg_damping must be finite and nonnegative')
+    if FLAGS.cg_damping and not FLAGS.cg_plain_gn:
+        raise ValueError('cg_damping requires cg_plain_gn=True')
+    if FLAGS.optimizer_type == 'cg' and (
+            FLAGS.cg_maxiter < 0 or not np.isfinite(FLAGS.cg_tol)
+            or not np.isfinite(FLAGS.cg_atol) or FLAGS.cg_tol < 0 or FLAGS.cg_atol < 0):
+        raise ValueError('CG tolerances and iteration limit must be nonnegative and finite')
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.condition_log:
@@ -928,6 +944,74 @@ def main(argv):
             batch_, groups, gradient_contribution,
             jax.tree.map(jnp.zeros_like, params0))
 
+        def apply_G(v):
+            """Apply the weighted full-batch Gauss--Newton operator."""
+            def curvature_contribution(mb):
+                def f_mb(p):
+                    return model.apply(p, mb['input_tokens'], deterministic=True).logits
+
+                def scalar_loss_mb(logits):
+                    return cross_entropy_loss_and_accuracy_with_weight_decay(
+                        logits, mb['target_tokens'], params0, params0,
+                        mb['loss_masks'], weight_decay=wd)[0]
+
+                logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+                grad_loss = jax.grad(scalar_loss_mb)
+                jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
+                logits_v_mb = jvp_fn_mb(v)
+                _, hv_mb = jax.jvp(grad_loss, (logits0_mb,), (logits_v_mb,))
+                return jt_fn_mb(hv_mb)[0]
+
+            return weighted_microbatch_sum(
+                batch_, groups, curvature_contribution,
+                jax.tree.map(jnp.zeros_like, params0))
+
+        if FLAGS.cg_plain_gn:
+            rhs = jax.tree.map(lambda g: -g, b_param)
+
+            def Av(v):
+                return jax.tree.map(lambda gv, vi: gv + FLAGS.cg_damping * vi,
+                                    apply_G(v), v)
+
+            if FLAGS.cg_solver == 'minres':
+                direction, solve_info = minres(
+                    Av, rhs, tol=FLAGS.cg_tol, atol=FLAGS.cg_atol,
+                    maxiter=FLAGS.cg_maxiter)
+            else:
+                direction, _ = cg(
+                    Av, rhs, x0=None, M=None, tol=FLAGS.cg_tol,
+                    atol=FLAGS.cg_atol, maxiter=FLAGS.cg_maxiter)
+                ad = Av(direction)
+                residual = jax.tree.map(lambda a, b: a - b, ad, rhs)
+                residual_norm = global_norm(residual)
+                rhs_norm = global_norm(rhs)
+                finite = (jnp.isfinite(residual_norm) & jnp.isfinite(rhs_norm)
+                          & jnp.isfinite(global_norm(direction)))
+                converged = finite & (residual_norm <= jnp.maximum(
+                    FLAGS.cg_atol, FLAGS.cg_tol * rhs_norm))
+                solve_info = dict(
+                    # JAX CG exposes neither its count nor recurrence residual.
+                    iterations=jnp.int32(-1),
+                    estimated_residual_norm=jnp.float32(jnp.nan),
+                    true_residual_norm=residual_norm, converged=converged,
+                    stop_reason=jnp.where(~finite, 3, jnp.where(converged, 0, 4)),
+                    relative_residual=residual_norm / jnp.where(rhs_norm > 0, rhs_norm, 1.),
+                    quadratic_change=.5 * tree_dot(direction, ad) - tree_dot(rhs, direction))
+            new_params = jax.tree.map(lambda p, d: p + d, params0, direction)
+            metrics = dict(
+                param_norm=global_norm(new_params), b_norm=global_norm(rhs),
+                relative_residual=solve_info['relative_residual'],
+                cg_true_residual=solve_info['true_residual_norm'],
+                cg_estimated_residual=solve_info['estimated_residual_norm'],
+                cg_converged=solve_info['converged'],
+                cg_stop_reason=solve_info['stop_reason'],
+                minres_iterations=solve_info['iterations'],
+                cg_damping=jnp.asarray(FLAGS.cg_damping, dtype=jnp.float32),
+                cg_quadratic_change=solve_info['quadratic_change'])
+            # Compatibility slots stay inert; the counter still matches train_state.step.
+            return (new_params, first_moment, second_moment, cg_x0,
+                    adam_step + 1, rng_generator(), metrics)
+
         # ── Adam EMA updates ──────────────────────────────────────────
         #
         # Both moments are updated once per outer step  using the full-batch gradient b_param
@@ -1005,28 +1089,6 @@ def main(argv):
                 tree,
                 new_second_moment,
             )
-
-        def apply_G(v):
-            """Apply the weighted full-batch Gauss--Newton operator."""
-            def curvature_contribution(mb):
-                def f_mb(p):
-                    return model.apply(p, mb['input_tokens'], deterministic=True).logits
-
-                def scalar_loss_mb(logits):
-                    return cross_entropy_loss_and_accuracy_with_weight_decay(
-                        logits, mb['target_tokens'], params0, params0,
-                        mb['loss_masks'], weight_decay=wd)[0]
-
-                logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
-                grad_loss = jax.grad(scalar_loss_mb)
-                jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
-                logits_v_mb = jvp_fn_mb(v)
-                _, hv_mb = jax.jvp(grad_loss, (logits0_mb,), (logits_v_mb,))
-                return jt_fn_mb(hv_mb)[0]
-
-            return weighted_microbatch_sum(
-                batch_, groups, curvature_contribution,
-                jax.tree.map(jnp.zeros_like, params0))
 
         # ── CG operator Av ────────────────────────────────
         # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
@@ -2132,7 +2194,7 @@ def main(argv):
             del live_results
             if do_condition:
                 condition_kwargs = {}
-                if FLAGS.optimizer_type == 'cg':
+                if FLAGS.optimizer_type == 'cg' and not FLAGS.cg_plain_gn:
                     beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
                         jax.device_get(cg_adam_step))
                     condition_kwargs = dict(
@@ -2157,17 +2219,23 @@ def main(argv):
                     actual_solve_batch_size, FLAGS.cg_n_micro, data_shards)
                 local_sizes = [mb_size // data_shards
                                for _, count, mb_size in groups for _ in range(count)]
-                defer_wandb({
+                micro_metrics = {
                     'cg_n_micro_requested': FLAGS.cg_n_micro,
                     'cg_n_micro': n_actual,
                     'cg_microbatch_per_device_min': min(local_sizes),
                     'cg_microbatch_per_device_max': max(local_sizes),
-                    'cg_lambda_scheduled': cg_metrics['cg_lambda_scheduled'],
-                    'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
-                    'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
-                    'cg_relative_damping': cg_metrics['cg_relative_damping'],
-                    **({'cg_relative_damping': None} if scheduled_lambda == 0.0 else {}),
-                }, step=step)
+                }
+                if FLAGS.cg_plain_gn:
+                    micro_metrics.update(cg_metrics)
+                    micro_metrics['cg_stop_reason_name'] = STOP_REASONS[
+                        int(jax.device_get(cg_metrics['cg_stop_reason']))]
+                else:
+                    micro_metrics.update({key: cg_metrics[key] for key in (
+                        'cg_lambda_scheduled', 'cg_lambda_effective',
+                        'adamw_learning_rate', 'cg_relative_damping')})
+                    if scheduled_lambda == 0.0:
+                        micro_metrics['cg_relative_damping'] = None
+                defer_wandb(micro_metrics, step=step)
             should_log = (
                 step % FLAGS.log_freq == 0
                 or FLAGS.train_batch_growth_interval > 0
