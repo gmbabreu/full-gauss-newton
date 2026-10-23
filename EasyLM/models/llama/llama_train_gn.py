@@ -248,9 +248,11 @@ def gn_quadratic_summary(direction, gradient, g_direction):
     finite = jnp.isfinite(a) & jnp.isfinite(b)
     positive = finite & (b > 0)
     alpha = jnp.maximum(0.0, -a / jnp.where(positive, b, 1.0))
+    optimal_positive = (-0.5 * a) * alpha
     optimal = jnp.where(
-        positive, -alpha * a - 0.5 * alpha * alpha * b,
+        positive, optimal_positive,
         jnp.where(finite & (b == 0) & (a >= 0), 0.0, jnp.nan))
+    optimal = jnp.where(jnp.isfinite(optimal), optimal, jnp.nan)
     residual = jax.tree.map(
         lambda g, gd: g.astype(jnp.float32) + gd.astype(jnp.float32),
         gradient, g_direction)
