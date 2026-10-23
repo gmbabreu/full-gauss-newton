@@ -387,11 +387,11 @@ def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.log_gn_quadratic:
-        if (not FLAGS.gauss_newton
-                or FLAGS.optimizer_type not in ('adamw', 'muon', 'sgd')
+        if ((not FLAGS.gauss_newton and FLAGS.optimizer_type != 'cg')
+                or FLAGS.optimizer_type not in ('adamw', 'muon', 'sgd', 'cg')
                 or FLAGS.adaptive_inner_loop or not FLAGS.single_batch_inner):
-            raise ValueError('GN quadratic logging requires ordinary non-adaptive '
-                             'GN with single_batch_inner=True; CG is unsupported')
+            raise ValueError('GN quadratic logging requires non-adaptive '
+                             'GN with single_batch_inner=True')
         if FLAGS.inner_loop_iter <= 0 or FLAGS.log_freq <= 0:
             raise ValueError('GN quadratic logging requires positive inner_loop_iter and log_freq')
 
@@ -1207,6 +1207,21 @@ def main(argv):
                 jnp.asarray(jnp.nan, dtype=jnp.float32)),
         }
 
+        if FLAGS.log_gn_quadratic:
+            def measure_candidate():
+                # Measure the rounded, decayed candidate against pure data loss.
+                d = jax.tree.map(lambda p, p0: p - p0, new_params, params0)
+                return gn_quadratic_summary(d, b_param, apply_G(d))
+
+            diagnostic_metrics = jax.lax.cond(
+                outer_step % FLAGS.log_freq == 0,
+                measure_candidate,
+                lambda: {f'gn_quad/{name}': jnp.float32(jnp.nan) for name in (
+                    'g_dot_d', 'd_G_d', 'loss_improvement',
+                    'optimal_scaled_loss_improvement', 'final_relative_residual')},
+            )
+            metrics.update(diagnostic_metrics)
+
         return (
             new_params,
             new_first_moment,
@@ -1300,7 +1315,7 @@ def main(argv):
             # donate_argnums=(0, 1),
         )
 
-    if FLAGS.log_gn_quadratic:
+    if FLAGS.log_gn_quadratic and FLAGS.optimizer_type != 'cg':
         sharded_gn_quadratic_metrics = pjit(
             gn_quadratic_metrics,
             in_shardings=(train_state_partition.params, train_state_partition.params,
