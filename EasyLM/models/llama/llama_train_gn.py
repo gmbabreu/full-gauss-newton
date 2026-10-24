@@ -1284,12 +1284,13 @@ def main(argv):
             'adam_step': new_adam_step,
             'cg_lambda_scheduled': scheduled_lambda,
             'cg_lambda_effective': interpolation_lambda,
-            'cg_relative_damping': jnp.where(
+        }
+        if FLAGS.cg_preconditioner == 'adam_diag':
+            metrics['cg_relative_damping'] = jnp.where(
                 interpolation_lambda > 0.0,
                 (1.0 - interpolation_lambda) /
                 (safe_adam_lr * interpolation_lambda),
-                jnp.asarray(jnp.nan, dtype=jnp.float32)),
-        }
+                jnp.asarray(jnp.nan, dtype=jnp.float32))
 
         metrics.update({
             'cg_damping_mu': jnp.asarray(FLAGS.cg_damping_mu, dtype=jnp.float32),
@@ -2389,8 +2390,10 @@ def main(argv):
                     'cg_lambda_scheduled': cg_metrics['cg_lambda_scheduled'],
                     'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
                     'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
-                    'cg_relative_damping': cg_metrics['cg_relative_damping'],
-                    **({'cg_relative_damping': None} if scheduled_lambda == 0.0 else {}),
+                    **({'cg_relative_damping': (
+                        None if scheduled_lambda == 0.0
+                        else cg_metrics['cg_relative_damping'])}
+                       if FLAGS.cg_preconditioner == 'adam_diag' else {}),
                 }, step=step)
             should_log = (
                 step % FLAGS.log_freq == 0

@@ -118,6 +118,7 @@ class TrainerSolveTest(unittest.TestCase):
                 x = result[3]['w']
                 np.testing.assert_allclose(x, expected, atol=2e-6)
                 metrics = result[-1]
+                self.assertNotIn('cg_relative_damping', metrics)
                 residual = np.linalg.norm(expected_A @ x + self.g) / np.linalg.norm(self.g)
                 self.assertAlmostEqual(float(metrics['relative_residual']), residual, places=6)
                 d = np.array(result[0]['w'] - self.params['w'])
@@ -158,6 +159,7 @@ class TrainerSolveTest(unittest.TestCase):
         config.optimizer.adamw_optimizer.b1 = .4
         result, captured = self.solve(config, inspect=True)
         self.assertNotIn('estimates', captured)
+        self.assertAlmostEqual(float(result[-1]['cg_relative_damping']), .4 / (.03 * .6), places=5)
         m = .4 * np.ones(2) + .6 * self.g
         v = .9 * np.ones(2) + .1 * self.g ** 2
         D = np.sqrt(v / (1 - .9 ** 3)) + 1e-8
