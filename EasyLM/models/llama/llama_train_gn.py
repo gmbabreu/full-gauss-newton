@@ -1,4 +1,5 @@
 import pprint
+import warnings
 from functools import partial
 
 from google.cloud import storage
@@ -63,6 +64,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_dataset_state='',
     log_freq=50,
     log_update_balance=False,
+    log_gn_quadratic=True,
     log_step_offset=-1,
     log_token_offset=-1,
     log_time_offset_s=0.0,
@@ -236,6 +238,81 @@ def update_balance_metrics(direction):
     return metrics
 
 
+def gn_quadratic_summary(direction, gradient, g_direction):
+    """Predicted data-loss improvements for a raw displacement; no applied scale."""
+    def dot(left, right):
+        return sum(jnp.sum(x.astype(jnp.float32) * y.astype(jnp.float32))
+                   for x, y in zip(jax.tree.leaves(left), jax.tree.leaves(right)))
+
+    a = dot(gradient, direction)
+    b = dot(direction, g_direction)
+    finite = jnp.isfinite(a) & jnp.isfinite(b)
+    positive = finite & (b > 0)
+    alpha = jnp.maximum(0.0, -a / jnp.where(positive, b, 1.0))
+    optimal_positive = (-0.5 * a) * alpha
+    optimal = jnp.where(
+        positive, optimal_positive,
+        jnp.where(finite & (b == 0) & (a >= 0), 0.0, jnp.nan))
+    optimal = jnp.where(jnp.isfinite(optimal), optimal, jnp.nan)
+    residual = jax.tree.map(
+        lambda g, gd: g.astype(jnp.float32) + gd.astype(jnp.float32),
+        gradient, g_direction)
+    g_norm = jnp.sqrt(dot(gradient, gradient))
+    relative_residual = jnp.where(
+        g_norm > 0,
+        jnp.sqrt(dot(residual, residual)) / jnp.where(g_norm > 0, g_norm, 1.0),
+        jnp.nan)
+    return {
+        'gn_quad/g_dot_d': a,
+        'gn_quad/d_G_d': b,
+        'gn_quad/loss_improvement': -a - 0.5 * b,
+        'gn_quad/optimal_scaled_loss_improvement': optimal,
+        'gn_quad/final_relative_residual': relative_residual,
+    }
+
+
+def measure_gn_quadratic(logits_fn, logits_loss, params0, final_params):
+    """Read the final iterate against the frozen, penalty-free GN quadratic."""
+    direction = jax.tree.map(lambda p, p0: p - p0, final_params, params0)
+    logits0, jvp_fn = linearize(logits_fn, params0)
+    grad_loss = jax.grad(logits_loss)
+    logit_gradient, h_jd = jax.jvp(grad_loss, (logits0,), (jvp_fn(direction),))
+    pullback = linear_transpose(jvp_fn, params0)
+    gradient = pullback(logit_gradient)[0]
+    g_direction = pullback(h_jd)[0]
+    return gn_quadratic_summary(direction, gradient, g_direction)
+
+
+def accepted_gn_comparison(metrics, base_params, updated_params, solve_batch,
+                           solve_rng, effective_step_size, microbatched_loss_fn,
+                           n_micro, *, losses=None, baseline_loss=None,
+                           ls_batches=None, ls_rngs=None):
+    """Compare the accepted raw-direction step without consuming data or RNG."""
+    alpha = float(jax.device_get(effective_step_size))
+    a = metrics['gn_quad/g_dot_d']
+    b = metrics['gn_quad/d_G_d']
+    base_loss, _ = microbatched_loss_fn(
+        base_params, solve_batch, solve_rng, n_micro)
+    accepted_loss, _ = microbatched_loss_fn(
+        updated_params, solve_batch, solve_rng, n_micro)
+    comparison = {
+        'gn_quad/accepted_predicted_improvement': -alpha * (a + 0.5 * alpha * b),
+        'gn_quad/accepted_actual_improvement_solve': base_loss - accepted_loss,
+    }
+    if losses is not None:
+        # Compare the numeric scale, never the rounded W&B metric tag.
+        candidate_loss = next((loss for scale, loss in losses
+                               if float(jax.device_get(scale)) == alpha), None)
+        if candidate_loss is None:
+            # A fixed-step override may not have been tested by line search.
+            candidate_loss = sum(microbatched_loss_fn(
+                updated_params, batch, rng, n_micro)[0]
+                for batch, rng in zip(ls_batches, ls_rngs)) / len(ls_batches)
+        comparison['gn_quad/accepted_actual_improvement_linesearch'] = (
+            baseline_loss - float(jax.device_get(candidate_loss)))
+    return comparison
+
+
 def supports_condition_diagnostics(optimizer_type, gauss_newton):
     """Whether the selected solver exposes the frozen Gauss--Newton operator."""
     return optimizer_type == 'cg' or (
@@ -339,6 +416,23 @@ def get_tpu_metrics():
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    if FLAGS.log_gn_quadratic:
+        if ((not FLAGS.gauss_newton and FLAGS.optimizer_type != 'cg')
+                or FLAGS.optimizer_type not in ('adamw', 'muon', 'sgd', 'cg')
+                or FLAGS.adaptive_inner_loop or not FLAGS.single_batch_inner):
+            raise ValueError('GN quadratic logging requires non-adaptive '
+                             'GN with single_batch_inner=True')
+        if FLAGS.inner_loop_iter <= 0 or FLAGS.log_freq <= 0:
+            raise ValueError('GN quadratic logging requires positive inner_loop_iter and log_freq')
+
+    log_accepted_gn = FLAGS.log_gn_quadratic and (
+        not FLAGS.normalize_step and FLAGS.outer_momentum_beta == 0.0
+        and FLAGS.outer_weight_decay == 0.0)
+    if FLAGS.log_gn_quadratic and not log_accepted_gn:
+        warnings.warn('Skipping accepted GN comparison metrics: requires '
+                      'normalize_step=False, outer_momentum_beta=0, and '
+                      'outer_weight_decay=0; existing GN diagnostics remain enabled.')
 
     if FLAGS.condition_log:
         if not supports_condition_diagnostics(
@@ -506,6 +600,13 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+    if FLAGS.log_gn_quadratic:
+        stochastic = ('embedding_dropout', 'feedforward_dropout',
+                      'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
+                      'fcm_max_ratio')
+        if any(float(getattr(llama_config, name, 0.0)) != 0.0
+               for name in stochastic):
+            raise ValueError('GN quadratic logging requires zero dropout and FCM')
     if (FLAGS.condition_log
             and FLAGS.optimizer_type in ('adamw', 'muon', 'sgd')):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
@@ -857,6 +958,23 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
+    def gn_quadratic_metrics(params0, final_params, rng, batch):
+        # Local reuse of the last solve RNG; no training RNG is returned or advanced.
+        rng_generator = JaxRNG(rng)
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
+        def logits_fn(params):
+            return model.apply(
+                params, batch['input_tokens'], deterministic=False,
+                rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+            ).logits
+
+        def logits_loss(logits):
+            return cross_entropy_loss_and_accuracy(
+                logits, batch['target_tokens'], batch['loss_masks'])[0]
+
+        return measure_gn_quadratic(logits_fn, logits_loss, params0, final_params)
+
     def loss_fn(params, batch, rng):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -1128,6 +1246,21 @@ def main(argv):
                 jnp.asarray(jnp.nan, dtype=jnp.float32)),
         }
 
+        if FLAGS.log_gn_quadratic:
+            def measure_candidate():
+                # Measure the rounded, decayed candidate against pure data loss.
+                d = jax.tree.map(lambda p, p0: p - p0, new_params, params0)
+                return gn_quadratic_summary(d, b_param, apply_G(d))
+
+            diagnostic_metrics = jax.lax.cond(
+                outer_step % FLAGS.log_freq == 0,
+                measure_candidate,
+                lambda: {f'gn_quad/{name}': jnp.float32(jnp.nan) for name in (
+                    'g_dot_d', 'd_G_d', 'loss_improvement',
+                    'optimal_scaled_loss_improvement', 'final_relative_residual')},
+            )
+            metrics.update(diagnostic_metrics)
+
         return (
             new_params,
             new_first_moment,
@@ -1219,6 +1352,14 @@ def main(argv):
             in_shardings=(train_state_partition, train_state_partition.params, PS(), batch_partition, PS()),
             out_shardings=(train_state_partition, PS(), PS()),
             # donate_argnums=(0, 1),
+        )
+
+    if FLAGS.log_gn_quadratic and FLAGS.optimizer_type != 'cg':
+        sharded_gn_quadratic_metrics = pjit(
+            gn_quadratic_metrics,
+            in_shardings=(train_state_partition.params, train_state_partition.params,
+                          PS(), batch_partition),
+            out_shardings=PS(),
         )
 
     if FLAGS.optimizer_type == 'cg':
@@ -1792,6 +1933,7 @@ def main(argv):
                 baseline_loss = float(jax.device_get(baseline_loss / len(ls_batches)))
                 return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
 
+            do_accepted_gn = log_accepted_gn and step % FLAGS.log_freq == 0
             if FLAGS.single_batch_inner:
                 single_batch_, single_dataset_metrics_ = pull_training_batch('solve')
 
@@ -1815,6 +1957,8 @@ def main(argv):
                     fraction = min(max(step / FLAGS.cg_lambda_ramp_steps, 0.0), 1.0)
                     scheduled_lambda += fraction * (
                         FLAGS.cg_lambda_final - FLAGS.cg_interpolation_lambda)
+                if do_accepted_gn:
+                    gn_quadratic_rng = sharded_rng
                 (
                     candidate_params,
                     cg_first_moment,
@@ -1887,9 +2031,15 @@ def main(argv):
                         train_state.params,
                         dir,
                     )
+                metrics = dict(cg_metrics)
+                if do_accepted_gn:
+                    metrics.update(accepted_gn_comparison(
+                        metrics, train_state.params, updated_params, batch,
+                        gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
+                        FLAGS.cg_n_micro, losses=losses, baseline_loss=baseline_loss,
+                        ls_batches=ls_batches, ls_rngs=ls_rngs))
                 train_state = train_state.replace(step=train_state.step + 1, params=updated_params)
 
-                metrics = dict(cg_metrics)
                 metrics['param_norm'] = global_norm(updated_params)
 
                 if step % FLAGS.log_freq == 0:
@@ -2011,6 +2161,7 @@ def main(argv):
             else:
                 # ---------------- Existing (non-adaptive) behavior, unchanged math ----------------
                 outer_params_before = train_state.params
+                do_gn_quadratic = FLAGS.log_gn_quadratic and step % FLAGS.log_freq == 0
                 for i in range(FLAGS.inner_loop_iter):
                     if FLAGS.single_batch_inner:
                         batch_, dataset_metrics_ = single_batch_, single_dataset_metrics_
@@ -2025,6 +2176,8 @@ def main(argv):
                     is_last_step = jnp.bool_(
                         FLAGS.log_inner_steps or (i + 1) == FLAGS.inner_loop_iter
                     )
+                    if do_gn_quadratic and (i + 1) == FLAGS.inner_loop_iter:
+                        gn_quadratic_rng = sharded_rng
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                     )
@@ -2048,6 +2201,10 @@ def main(argv):
                     if FLAGS.weight_average and not FLAGS.linesearch:
                         alpha = FLAGS.weight_average_decay
                         ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, inner_state.params)
+
+                if do_gn_quadratic:
+                    metrics.update(sharded_gn_quadratic_metrics(
+                        train_state.params, inner_state.params, gn_quadratic_rng, batch))
 
                 if FLAGS.linesearch:
                     ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
@@ -2093,6 +2250,12 @@ def main(argv):
 
                     updated_params = jax.tree_util.tree_map(lambda x, y: x + effective_step_size*y, train_state.params, dir)
                     updated_params = apply_outer_decay(train_state.params, updated_params)
+                    if do_accepted_gn:
+                        metrics.update(accepted_gn_comparison(
+                            metrics, train_state.params, updated_params, batch,
+                            gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
+                            FLAGS.cg_n_micro, losses=losses, baseline_loss=baseline_loss,
+                            ls_batches=ls_batches, ls_rngs=ls_rngs))
                     train_state = train_state.replace(
                         step=train_state.step+1,
                         opt_state=inner_state.opt_state,
@@ -2112,6 +2275,11 @@ def main(argv):
                         )
                     effective_step_size = 1.0
                     updated_params = apply_outer_decay(train_state.params, inner_state.params)
+                    if do_accepted_gn:
+                        metrics.update(accepted_gn_comparison(
+                            metrics, train_state.params, updated_params, batch,
+                            gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
+                            FLAGS.cg_n_micro))
                     train_state = train_state.replace(
                         step=train_state.step+1,
                         opt_state=inner_state.opt_state,
