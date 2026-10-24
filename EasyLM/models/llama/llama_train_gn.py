@@ -1,4 +1,6 @@
 import pprint
+import math
+import numbers
 import warnings
 from functools import partial
 
@@ -30,6 +32,7 @@ import optax
 
 from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
+from EasyLM.pcg import estimate_gn_diagonal, gn_jacobi_preconditioner
 from EasyLM import cg_resume
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
@@ -146,6 +149,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     patience=1,
 
+    cg_preconditioner='adam_diag',
+    cg_damping_mu=0.0,
+    cg_gn_jacobi_probes=4,
     cg_tol=1e-5,   # Relative Residual Tolerance for CG
     cg_atol=0.0,    # Absolute residual tolerance for CG
     cg_maxiter=100, # Maximum number of CG iterations
@@ -364,6 +370,34 @@ def weighted_microbatch_sum(batch, groups, contribution_fn, zero):
         total = jax.lax.fori_loop(0, count, body, total)
     return total
 
+
+def validate_cg_preconditioner(flags):
+    """Reject combinations outside the fixed damped GN Jacobi system."""
+    if flags.cg_preconditioner not in ('adam_diag', 'gn_jacobi'):
+        raise ValueError('cg_preconditioner must be adam_diag or gn_jacobi')
+    if not math.isfinite(flags.cg_damping_mu) or flags.cg_damping_mu < 0:
+        raise ValueError('cg_damping_mu must be finite and nonnegative')
+    probes = flags.cg_gn_jacobi_probes
+    if isinstance(probes, bool) or not isinstance(probes, numbers.Integral) or probes <= 0:
+        raise ValueError('cg_gn_jacobi_probes must be a positive integer')
+    if flags.cg_preconditioner == 'adam_diag':
+        if flags.cg_damping_mu != 0:
+            raise ValueError('cg_damping_mu requires cg_preconditioner=gn_jacobi')
+        return
+    if flags.optimizer_type != 'cg':
+        raise ValueError('gn_jacobi requires optimizer_type=cg')
+    if flags.cg_damping_mu <= 0:
+        raise ValueError('gn_jacobi requires positive finite cg_damping_mu')
+    if (flags.cg_interpolation_lambda != 1
+            or flags.cg_lambda_batch_denominator != 0
+            or flags.cg_lambda_final != -1 or flags.cg_lambda_ramp_steps != 0):
+        raise ValueError('gn_jacobi requires fixed cg_interpolation_lambda=1 and disabled schedules')
+    if flags.optimizer.adamw_optimizer.b1 != 0:
+        raise ValueError('gn_jacobi requires nested Adam b1=0')
+    if flags.condition_log:
+        raise ValueError('condition_log is not supported with gn_jacobi')
+
+
 def get_gpu_memory():
     try:
         command = "nvidia-smi --query-gpu=memory.free --format=csv"
@@ -475,6 +509,7 @@ def main(argv):
         raise ValueError("outer decay requires non-adaptive Muon-GN and weight_average=False")
     if FLAGS.train_batch_growth_interval < 0:
         raise ValueError("train_batch_growth_interval must be nonnegative")
+    validate_cg_preconditioner(FLAGS)
     cg_resume.validate_batch_lambda(
         FLAGS.cg_lambda_batch_denominator, FLAGS.optimizer_type,
         FLAGS.cg_lambda_final, FLAGS.cg_lambda_ramp_steps,
@@ -1013,7 +1048,7 @@ def main(argv):
         params0,          # base parameters θ_0 for this outer step
         first_moment,     # persistent Adam first moment m_{t-1}
         second_moment,    # persistent Adam second moment s_{t-1}
-        cg_x0,            # warm-start for CG (previous step's solution y, in preconditioned space)
+        cg_x0,            # warm-start for CG (previous parameter-space solution)
         adam_step,        # outer step count, used for bias correction
         outer_step,       # same counter, used for the LR schedule
         rng,
@@ -1170,17 +1205,24 @@ def main(argv):
                 new_second_moment,
             )
 
-        # ── Run preconditioned CG ─────────────────────────────────────
-        #
-        # Solve the original interpolated system:
-        #
-        #     A_t x = rhs
-        #
-        # where
-        #
-        #     A_t = λ G + (1-λ)/η * D_t.
-        #
-        # JAX CG uses D_t^{-1} as the preconditioner M ≈ A_t^{-1}.
+        apply_preconditioner = apply_D_inv
+        if FLAGS.cg_preconditioner == 'gn_jacobi':
+            # Derive probes without consuming the training RNG stream. Estimate
+            # raw G once, outside CG; damping is added after batch reduction.
+            probe_rng = jax.random.fold_in(rng, 0x474E4A)
+            diagonal = estimate_gn_diagonal(
+                apply_G, params0, probe_rng, FLAGS.cg_gn_jacobi_probes)
+            apply_preconditioner = gn_jacobi_preconditioner(
+                diagonal, FLAGS.cg_damping_mu)
+            rhs = jax.tree.map(lambda g: -g, b_param)
+
+            def Av(v):
+                return jax.tree.map(
+                    lambda gv, vi: gv + FLAGS.cg_damping_mu * vi,
+                    apply_G(v), v)
+
+        # Solve with the fixed inverse preconditioner selected above. The
+        # default uses Adam interpolation; Jacobi uses (G + mu I)x = -g.
         x, _ = cg(
             Av,
             rhs,
@@ -1188,7 +1230,7 @@ def main(argv):
             tol=FLAGS.cg_tol,
             atol=FLAGS.cg_atol,
             maxiter=FLAGS.cg_maxiter,
-            M=apply_D_inv,
+            M=apply_preconditioner,
         )
 
         # Compute residual for logging 
@@ -1214,14 +1256,17 @@ def main(argv):
             FLAGS.optimizer.adamw_optimizer.weight_decay,
             dtype=jnp.float32,
         )
-        # Fused: avoids materializing an intermediate parameter pytree for p + update.
-        new_params = jax.tree_util.tree_map(
-            lambda p, update: p
-            + update
-            - adam_fraction * adam_lr * weight_decay * p,
-            params0,
-            x,
-        )
+        if FLAGS.cg_preconditioner == 'gn_jacobi':
+            new_params = jax.tree.map(lambda p, update: p + update, params0, x)
+        else:
+            # Fused update and decoupled decay for the legacy Adam path.
+            new_params = jax.tree_util.tree_map(
+                lambda p, update: p
+                + update
+                - adam_fraction * adam_lr * weight_decay * p,
+                params0,
+                x,
+            )
 
         # ── Collect metrics ──────────────────────────────────────────
         metrics = {
@@ -1245,6 +1290,14 @@ def main(argv):
                 (safe_adam_lr * interpolation_lambda),
                 jnp.asarray(jnp.nan, dtype=jnp.float32)),
         }
+
+        metrics.update({
+            'cg_damping_mu': jnp.asarray(FLAGS.cg_damping_mu, dtype=jnp.float32),
+            'cg_gn_jacobi_probes': jnp.int32(
+                FLAGS.cg_gn_jacobi_probes if FLAGS.cg_preconditioner == 'gn_jacobi' else 0),
+            'cg_gn_jacobi_gvp_count': jnp.int32(
+                FLAGS.cg_gn_jacobi_probes if FLAGS.cg_preconditioner == 'gn_jacobi' else 0),
+        })
 
         if FLAGS.log_gn_quadratic:
             def measure_candidate():
@@ -2326,6 +2379,9 @@ def main(argv):
                 local_sizes = [mb_size // data_shards
                                for _, count, mb_size in groups for _ in range(count)]
                 defer_wandb({
+                    'cg_damping_mu': cg_metrics['cg_damping_mu'],
+                    'cg_gn_jacobi_probes': cg_metrics['cg_gn_jacobi_probes'],
+                    'cg_gn_jacobi_gvp_count': cg_metrics['cg_gn_jacobi_gvp_count'],
                     'cg_n_micro_requested': FLAGS.cg_n_micro,
                     'cg_n_micro': n_actual,
                     'cg_microbatch_per_device_min': min(local_sizes),
