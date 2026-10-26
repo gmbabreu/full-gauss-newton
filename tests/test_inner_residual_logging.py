@@ -35,17 +35,33 @@ def emit(wandb, *, rank=0, enabled=True, count=25, outer_steps=(0, 1)):
         FLAGS=SimpleNamespace(log_inner_steps=enabled, inner_loop_iter=count),
         metrics=dict(relative_residual=0.25, linear_model_loss=1.0,
                      gradient_norm=0.1, param_norm=2.0, gpu_memory=0,
-                     learning_rate=0.01), defer_wandb=lambda values: None,
+                     learning_rate=0.01), defer_wandb=Mock(),
     )
     execute(setup, namespace)
-    with redirect_stdout(io.StringIO()):
+    output = io.StringIO()
+    with redirect_stdout(output):
         for step in outer_steps:
             for i in range(count):
                 namespace.update(step=step, i=i)
                 execute([block], namespace)
+    return output.getvalue(), namespace['defer_wandb']
 
 
 class InnerResidualLoggingTest(unittest.TestCase):
+    def test_residual_prints_share_scalar_cadence_and_keep_deferred_logging(self):
+        for count in (1, 25, 50):
+            with self.subTest(count=count):
+                wandb = Mock()
+                output, deferred = emit(wandb, count=count, outer_steps=(0,))
+                expected = sorted({0, count - 1, *range(9, count, 10)})
+                self.assertEqual(output.splitlines(), [
+                    f'inner_step={i} relative_residual=2.500000e-01' for i in expected])
+                self.assertEqual(
+                    [c.args[0]['inner_step'] for c in wandb.log.call_args_list], expected)
+                self.assertEqual(
+                    [c.args[0]['inner_step'] for c in deferred.call_args_list],
+                    list(range(count)))
+
     def test_each_workers_existing_run_receives_the_complete_scalar_trajectory(self):
         for rank in (0, 1, 3):
             with self.subTest(rank=rank):

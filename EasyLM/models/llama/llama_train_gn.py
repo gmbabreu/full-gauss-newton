@@ -2238,8 +2238,8 @@ def main(argv):
                     if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
-                        print(f"inner_step={i} relative_residual={float(metrics['relative_residual']):.6e}", flush=True)
                         if i == 0 or (i + 1) % 10 == 0 or (i + 1) == FLAGS.inner_loop_iter:
+                            print(f"inner_step={i} relative_residual={float(metrics['relative_residual']):.6e}", flush=True)
                             wandb.log({
                                 'inner_step': step * FLAGS.inner_loop_iter + i,
                                 'inner_relative_residual': float(metrics['relative_residual']),
@@ -2327,8 +2327,14 @@ def main(argv):
                             jax.device_get(update_balance_metrics(dir)),
                             step=step,
                         )
-                    effective_step_size = 1.0
-                    updated_params = apply_outer_decay(train_state.params, inner_state.params)
+                    effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else 1.0
+                    if FLAGS.fixed_step_size > 0.0:
+                        updated_params = jax.tree_util.tree_map(
+                            lambda outer, direction: outer + effective_step_size * direction,
+                            train_state.params, dir)
+                    else:
+                        updated_params = inner_state.params
+                    updated_params = apply_outer_decay(train_state.params, updated_params)
                     if do_accepted_gn:
                         metrics.update(accepted_gn_comparison(
                             metrics, train_state.params, updated_params, batch,
