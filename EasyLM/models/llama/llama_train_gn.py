@@ -301,9 +301,25 @@ def accepted_gn_comparison(metrics, base_params, updated_params, solve_batch,
         base_params, solve_batch, solve_rng, n_micro)
     accepted_loss, _ = microbatched_loss_fn(
         updated_params, solve_batch, solve_rng, n_micro)
+                               
+    predicted_improvement = -alpha * (a + 0.5 * alpha * b)
+    actual_improvement = base_loss - accepted_loss
+
+    # A ratio is meaningful only for a finite, appreciable predicted decrease.
+    valid = (
+        jnp.isfinite(predicted_improvement)
+        & jnp.isfinite(actual_improvement)
+        & (predicted_improvement > 1e-6)
+    )
+    safe_denominator = jnp.where(valid, predicted_improvement, 1.0)
+    quadratic_fidelity = jnp.where(
+        valid, actual_improvement / safe_denominator, jnp.nan
+    )
+
     comparison = {
-        'gn_quad/accepted_predicted_improvement': -alpha * (a + 0.5 * alpha * b),
-        'gn_quad/accepted_actual_improvement_solve': base_loss - accepted_loss,
+        'gn_quad/accepted_predicted_improvement': predicted_improvement,
+        'gn_quad/accepted_actual_improvement_solve': actual_improvement,
+        'gn_quad/quadratic_fidelity': quadratic_fidelity,
     }
     if losses is not None:
         # Compare the numeric scale, never the rounded W&B metric tag.
