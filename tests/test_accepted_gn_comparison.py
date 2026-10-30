@@ -49,8 +49,10 @@ class State:
 
 class AcceptedGNComparisonTest(unittest.TestCase):
     def run_update(self, solver='cg', *, enabled=True, step=0, fixed=0.,
-                   linesearch=True, armijo=False, restricted=None):
+                   linesearch=True, armijo=False, restricted=None, export=False,
+                   exported=False):
         flags = SimpleNamespace(
+            export_update_geometry=export,
             optimizer_type=solver, log_gn_quadratic=enabled, log_freq=2,
             normalize_step=False, outer_momentum_beta=0., outer_weight_decay=0.,
             single_batch_inner=True, inner_loop_iter=1, inner_loop_wd=0.,
@@ -67,7 +69,7 @@ class AcceptedGNComparisonTest(unittest.TestCase):
                      target_tokens=jnp.array([[0, 1], [1, 0], [0, 0], [1, 1], [0, 0]]),
                      loss_masks=jnp.array([[1, 0], [1, 0], [1, 1], [1, 1], [0, 0]]))
         ls = [dict(solve, input_tokens=solve['input_tokens'] * s) for s in (.5, 1.5)]
-        evaluations, pulls, records = [], [], []
+        evaluations, pulls, records, captures = [], [], [], []
         ns = dict(jax=jax, jnp=jnp, linearize=jax.linearize,
                   linear_transpose=jax.linear_transpose, FLAGS=flags,
                   warnings=warnings, data_shards=1)
@@ -116,6 +118,9 @@ class AcceptedGNComparisonTest(unittest.TestCase):
 
         # Use the actual source's local helpers and scheduling gates.
         ns.update(microbatched_loss_fn=counted_loss,
+                  geometry_exported=exported,
+                  geometry_captures=captures,
+                  capture_update_geometry=lambda *args: captures.append(args),
                   apply_outer_decay=lambda base, updated: updated,
                   pull_training_batch=pull, dataset=None, step=step,
                   train_state=State(jnp.array(1.)), inner_state=State(jnp.array(1.)),
@@ -228,6 +233,26 @@ class AcceptedGNComparisonTest(unittest.TestCase):
         self.assertIn('gn_quad/accepted_predicted_improvement', ns['metrics'])
         self.assertIn('gn_quad/accepted_actual_improvement_solve', ns['metrics'])
         self.assertNotIn('gn_quad/accepted_actual_improvement_linesearch', ns['metrics'])
+
+    def test_export_gate_and_raw_candidate_for_both_solvers(self):
+        for solver in ('cg', 'adamw'):
+            for linesearch in (False, True):
+                # CG always uses its existing line-search route.
+                with self.subTest(solver=solver, linesearch=linesearch):
+                    off, _, _, _, _, _, _ = self.run_update(solver, fixed=.125, linesearch=linesearch)
+                    on, _, _, _, _, _, solve = self.run_update(
+                        solver, fixed=.125, linesearch=linesearch, export=True)
+                    self.assertEqual(off['geometry_captures'], [])
+                    self.assertEqual(len(on['geometry_captures']), 1)
+                    base, candidate, batch = on['geometry_captures'][0]
+                    self.assertEqual(float(base), 1.)
+                    self.assertEqual(float(candidate), -3.)
+                    for key in solve:
+                        np.testing.assert_array_equal(batch[key], solve[key])
+                    self.assertEqual(on['train_state'], off['train_state'])
+                    later, _, _, _, _, _, _ = self.run_update(
+                        solver, fixed=.125, linesearch=linesearch, export=True, exported=True)
+                    self.assertEqual(later['geometry_captures'], [])
 
 
 if __name__ == '__main__':

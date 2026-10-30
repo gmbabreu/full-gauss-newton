@@ -42,6 +42,7 @@ pip-delete-this-directory.txt
 /tests/*
 !/tests/test_accepted_gn_comparison.py
 !/tests/test_gn_jacobi_pcg.py
+!/tests/test_update_geometry.py
 htmlcov/
 .tox/
 .nox/

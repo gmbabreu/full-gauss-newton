@@ -2,6 +2,7 @@ import pprint
 import math
 import numbers
 import warnings
+import json
 from functools import partial
 
 from google.cloud import storage
@@ -34,6 +35,7 @@ from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM.pcg import estimate_gn_diagonal, gn_jacobi_preconditioner
 from EasyLM import cg_resume
+from EasyLM import update_geometry
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
 from EasyLM.checkpoint import StreamingCheckpointer
@@ -68,6 +70,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_freq=50,
     log_update_balance=False,
     log_gn_quadratic=True,
+    export_update_geometry=False,
+    stop_after_first_outer_step=False,
     log_step_offset=-1,
     log_token_offset=-1,
     log_time_offset_s=0.0,
@@ -467,6 +471,23 @@ def get_tpu_metrics():
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
+    if FLAGS.export_update_geometry:
+        if (not supports_condition_diagnostics(FLAGS.optimizer_type, FLAGS.gauss_newton)
+                or not FLAGS.single_batch_inner or FLAGS.adaptive_inner_loop):
+            raise ValueError('Update geometry requires non-adaptive CG or GN '
+                             'with single_batch_inner=True')
+        if (FLAGS.normalize_step or FLAGS.outer_momentum_beta != 0.0
+                or FLAGS.outer_weight_decay != 0.0):
+            raise ValueError('Update geometry requires normalize_step=False, '
+                             'outer_momentum_beta=0, and outer_weight_decay=0')
+        if (FLAGS.cg_resume_state or not FLAGS.load_checkpoint.startswith(
+                ('trainstate_params::', 'params::', 'flax_params::'))):
+            raise ValueError('Update geometry requires params-only checkpoint '
+                             'loading with fresh solver state')
+        budget = FLAGS.cg_maxiter if FLAGS.optimizer_type == 'cg' else FLAGS.inner_loop_iter
+        if budget <= 0 or FLAGS.log_freq <= 0:
+            raise ValueError('Update geometry requires a positive iteration budget and log_freq')
+
     if FLAGS.log_gn_quadratic:
         if ((not FLAGS.gauss_newton and FLAGS.optimizer_type != 'cg')
                 or FLAGS.optimizer_type not in ('adamw', 'muon', 'sgd', 'cg')
@@ -651,13 +672,13 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    if FLAGS.log_gn_quadratic:
+    if FLAGS.log_gn_quadratic or FLAGS.export_update_geometry:
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
         if any(float(getattr(llama_config, name, 0.0)) != 0.0
                for name in stochastic):
-            raise ValueError('GN quadratic logging requires zero dropout and FCM')
+            raise ValueError('GN quadratic logging/update geometry requires zero dropout and FCM')
     if (FLAGS.condition_log
             and FLAGS.optimizer_type in ('adamw', 'muon', 'sgd')):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
@@ -1387,6 +1408,11 @@ def main(argv):
     )
     diagnostic_param_shards, _ = make_shard_and_gather_fns(
         train_state_partition.params)
+    if FLAGS.export_update_geometry:
+        # No dtype specs: fingerprint the actual base dtype, and preserve the
+        # direction/product until the serializer explicitly converts to FP32.
+        _, geometry_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
+        _, geometry_batch_gathers = make_shard_and_gather_fns(batch_partition)
     if FLAGS.optimizer_type == 'cg':
         cg_param_shards, cg_param_gathers = make_shard_and_gather_fns(train_state_partition.params)
 
@@ -1465,6 +1491,72 @@ def main(argv):
                       train_state_partition.params, PS()),
         out_shardings=train_state_partition.params,
     )
+
+    def capture_update_geometry(base_params, candidate_params, solve_batch):
+        """One extra raw Gv, outside both solvers' iteration loops.
+
+        All hosts use the same deterministic leaf order for the replication
+        gathers. Only the checkpoint writer serializes files. No non-addressable
+        array is transferred to host before a gather has replicated it.
+        """
+        direction = jax.tree.map(lambda p, p0: p - p0, candidate_params, base_params)
+        g_direction = sharded_condition_apply_g(
+            base_params, solve_batch, direction, jnp.float32(0.0))
+
+        def fingerprint(tree, gathers):
+            flat_gathers = flatten_dict(gathers)
+            return update_geometry.fingerprint_leaves(
+                (path, flat_gathers[path](value))
+                for path, value in sorted(flatten_dict(tree).items()))
+
+        base_fingerprint = fingerprint(base_params, geometry_param_gathers)
+        batch_fingerprint = fingerprint(
+            {name: solve_batch[name] for name in ('input_tokens', 'target_tokens', 'loss_masks')},
+            geometry_batch_gathers)
+        bundle_dir = os.path.join(output_dir, 'update_geometry')
+        if checkpointer.enable and not bundle_dir.startswith('gs://'):
+            os.makedirs(bundle_dir, exist_ok=True)
+        for tree, filename in ((direction, update_geometry.DIRECTION_FILE),
+                               (g_direction, update_geometry.PRODUCT_FILE)):
+            update_geometry.save_parameter_tree(
+                tree, os.path.join(bundle_dir, filename), geometry_param_gathers,
+                writer=checkpointer.enable)
+        _, groups = microbatch_groups(
+            solve_batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+        try:
+            commit = sp.check_output(
+                ['git', 'rev-parse', 'HEAD'], cwd=os.path.dirname(__file__),
+                stderr=sp.DEVNULL, text=True).strip()
+        except (OSError, sp.CalledProcessError):
+            commit = None
+        solver_keys = (
+            'optimizer_type', 'optimizer', 'inner_loop_iter', 'inner_loop_lr',
+            'inner_loop_wd', 'inner_sgd_momentum', 'inner_b1', 'inner_b2',
+            'inner_clip_gradient', 'optimizer_wd', 'lr_sched', 'total_steps',
+            'global_warmup', 'inner_loop_warmup', 'end_lr', 'reset_start',
+            'cg_preconditioner', 'cg_damping_mu', 'cg_gn_jacobi_probes',
+            'cg_tol', 'cg_atol', 'cg_maxiter', 'cg_interpolation_lambda',
+            'cg_lambda_batch_denominator', 'cg_lambda_final', 'cg_lambda_ramp_steps',
+            'seed', 'linesearch', 'fixed_step_size', 'ls_range', 'ls_lambdas',
+            'armijo_linesearch', 'armijo_alpha', 'armijo_beta', 'armijo_init_step')
+        solver_config = flags_config_dict.to_dict()
+        return dict(
+            format_version=update_geometry.FORMAT_VERSION,
+            checkpoint_uri=init_checkpoint_path, repository_commit=commit,
+            base_parameters=base_fingerprint, solve_batch=batch_fingerprint,
+            parameters=[dict(path=list(path), shape=list(value.shape), dtype='float32')
+                        for path, value in flatten_dict(direction).items()],
+            gn_operator=dict(
+                implementation='condition_apply_g/v1', damping=0.0,
+                preconditioning=False, deterministic=True,
+                loss='cross_entropy_loss_and_accuracy_with_weight_decay; wd=0',
+                model_config=llama_config.to_dict(), compute_dtype=FLAGS.dtype,
+                parameter_dtype=FLAGS.param_dtype, cg_n_micro=FLAGS.cg_n_micro,
+                data_shards=data_shards, microbatch_groups=[list(group) for group in groups]),
+            solver={key: solver_config[key] for key in solver_keys},
+            iteration_budget=(FLAGS.cg_maxiter if FLAGS.optimizer_type == 'cg'
+                              else FLAGS.inner_loop_iter))
+
     sharded_eval_step = pjit(
         eval_step,
         in_shardings=(train_state_partition.params, PS(), PS()),
@@ -1854,8 +1946,10 @@ def main(argv):
         if FLAGS.optimizer_type == 'cg' and FLAGS.save_model_freq > 0 and cg_metadata is None:
             progress.dataset_total_tokens = dataset_object.get_state_dict()['metadata']['dataset_total_tokens']
             save_checkpoint(train_state, ema=ema if FLAGS.weight_average else None)
+        geometry_exported = False
         cg_checkpoint_safe = True
         for step in step_counter:
+            geometry_capture = None
             cg_checkpoint_safe = False
             timing.start()
             k = FLAGS.train_batch_growth_interval
@@ -2061,6 +2155,9 @@ def main(argv):
                     break
                 print(f"\nTrue model loss: {baseline_loss:.6f}")
 
+                if FLAGS.export_update_geometry and not geometry_exported:
+                    geometry_capture = capture_update_geometry(
+                        train_state.params, candidate_params, batch)
                 dir = jax.tree_util.tree_map(lambda x, y: x - y, candidate_params, train_state.params)
                 if FLAGS.log_update_balance and step % FLAGS.log_freq == 0:
                     defer_wandb(
@@ -2276,6 +2373,9 @@ def main(argv):
                     metrics.update(sharded_gn_quadratic_metrics(
                         train_state.params, inner_state.params, gn_quadratic_rng, batch))
 
+                if FLAGS.export_update_geometry and not geometry_exported:
+                    geometry_capture = capture_update_geometry(
+                        train_state.params, inner_state.params, batch)
                 if FLAGS.linesearch:
                     ls_batches, ls_rngs, sharded_rng, baseline_loss, exit_flag = pull_ls_batches_and_baseline(
                         sharded_rng, train_state.params, dataset
@@ -2368,6 +2468,25 @@ def main(argv):
        
             cg_checkpoint_safe = True
             progress.complete_update()
+            if geometry_capture is not None:
+                # The sidecar is the completion marker: write it only after
+                # acceptance, with the existing quadratic/fidelity scalars.
+                def scalar(value):
+                    value = float(jax.device_get(value))
+                    return value if np.isfinite(value) else None
+
+                geometry_capture.update(
+                    outer_step=int(step), accepted_scalar_step=scalar(effective_step_size),
+                    metrics={name: scalar(value) for name, value in metrics.items()
+                             if name.startswith('gn_quad/')})
+                for name in ('gn_quad/g_dot_d', 'gn_quad/d_G_d'):
+                    geometry_capture['metrics'].setdefault(name, None)
+                if checkpointer.enable:
+                    with mlxu.open_file(os.path.join(
+                            output_dir, 'update_geometry', update_geometry.METADATA_FILE), 'w') as stream:
+                        json.dump(geometry_capture, stream, indent=2, allow_nan=False)
+                multihost_utils.sync_global_devices('update_geometry_complete')
+                geometry_exported = True
             live_results = [train_state, inner_state, sharded_rng, metrics]
             if FLAGS.optimizer_type == 'cg':
                 live_results.extend((cg_first_moment, cg_second_moment,
@@ -2421,11 +2540,12 @@ def main(argv):
                 step % FLAGS.log_freq == 0
                 or FLAGS.train_batch_growth_interval > 0
                 or FLAGS.optimizer_type == 'cg'
-                or do_condition)
+                or do_condition
+                or FLAGS.stop_after_first_outer_step)
             if should_log:
                 log_metrics = {}
                 stop_after_log = False
-                if step % FLAGS.log_freq == 0:
+                if step % FLAGS.log_freq == 0 or FLAGS.stop_after_first_outer_step:
                     log_metrics.update(get_tpu_metrics())
                     log_metrics.update(metrics)
                     log_metrics["param_norm"] = global_norm(train_state.params)
@@ -2486,7 +2606,7 @@ def main(argv):
                 console_metrics = {k: v for k, v in log_metrics.items()
                     if not k.startswith('spectrum/')}
                 tqdm.write("\n" + pprint.pformat(console_metrics) + "\n")
-                if stop_after_log:
+                if stop_after_log or FLAGS.stop_after_first_outer_step:
                     break
             
             
