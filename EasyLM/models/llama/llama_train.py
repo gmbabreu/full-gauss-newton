@@ -28,6 +28,7 @@ from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.training_resume import (
     resume_companion_paths, validate_resume_metadata, validate_dataset_snapshot,
+    validate_replay_config,
 )
 from EasyLM.training_progress import (
     ProcessTiming, TrainingProgress, configure_wandb_run, resolve_progress,
@@ -133,6 +134,7 @@ def main(argv):
     output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
+    validate_replay_config(flags_config_dict)
 
     log_config = mlxu.flatten_config_dict(flags_config_dict)
 
@@ -145,6 +147,7 @@ def main(argv):
                       and FLAGS.checkpointer.save_optimizer_state
                       and FLAGS.checkpointer.float_dtype == 'fp32')
     resume_metadata = None
+    replay_transition = False
     reporting_metadata = None
     if raw_adam and FLAGS.load_checkpoint.startswith('trainstate::'):
         if not resumable_save:
@@ -163,7 +166,8 @@ def main(argv):
 
         complete = load_companion('complete')
         resume_metadata = load_companion('metadata')
-        validate_resume_metadata(resume_metadata, complete, flags_config_dict)
+        replay_transition = validate_resume_metadata(
+            resume_metadata, complete, flags_config_dict, load_companion('dataset'))
         name = os.path.basename(checkpoint_path)
         if name != 'streaming_train_state' and int(name.rsplit('_', 1)[1]) != resume_metadata['step']:
             raise ValueError('Milestone filename and metadata step differ')
@@ -198,14 +202,17 @@ def main(argv):
         FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
-    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    dataset = DatasetFactory.load_dataset(
+        FLAGS.train_dataset, tokenizer, first_order_adam_replay=raw_adam)
     if FLAGS.load_dataset_state:
         dataset_state = mlxu.load_pickle(FLAGS.load_dataset_state)
         if dataset_state is None:
             raise ValueError('Checkpoint has no dataset state')
         if resume_metadata is not None:
             validate_dataset_snapshot(dataset_state, resume_metadata)
-        dataset.load_state_dict(dataset_state)
+            dataset.load_state_dict(dataset_state, allow_replay_transition=replay_transition)
+        else:
+            dataset.load_state_dict(dataset_state)
         print('loaded dataset state', flush=True)
 
     if FLAGS.eval_steps > 0:

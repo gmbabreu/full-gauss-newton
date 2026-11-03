@@ -29,8 +29,12 @@ class DatasetFactory(object):
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
-    def load_dataset(cls, config, tokenizer, **kwargs):
+    def load_dataset(cls, config, tokenizer, *, first_order_adam_replay=False, **kwargs):
         config = cls.get_default_config(config)
+        if config.huggingface_dataset.repeat_first_n_batches and (
+                not first_order_adam_replay or config.type != 'huggingface'
+                or config.huggingface_dataset.pretokenized_dataset_dir):
+            raise ValueError('repeat_first_n_batches requires the first-order Adam raw Hugging Face training path')
         text_processor = TextProcessor(config.text_processor, tokenizer)
         if config.type == 'huggingface' and config.huggingface_dataset.pretokenized_dataset_dir != '':
             return OptHuggingfaceDataset(
@@ -171,6 +175,7 @@ class HuggingfaceDataset(object):
         config.always_start_with_bos = False
         config.batch_token_dtype = 'i4'
         config.tokens_count_at_start = 0        
+        config.repeat_first_n_batches = 0
         config.shuffle_data = True
         config.shuffle_seed = 42
         config.shuffle_buffer_size = 100_000
@@ -179,6 +184,13 @@ class HuggingfaceDataset(object):
 
     def __init__(self, config, tokenizer, text_processor):
         self.config = self.get_default_config(config)
+        repeat = self.config.repeat_first_n_batches
+        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0:
+            raise ValueError('repeat_first_n_batches must be a nonnegative integer')
+        if repeat and (self.config.tokens_count_at_start != 0
+                       or not isinstance(self.config.batch_size, int)
+                       or self.config.batch_size <= 0 or self.config.seq_length <= 0):
+            raise ValueError('Replay requires a fixed positive batch size/sequence length and tokens_count_at_start=0')
         print(config,self.config)
         name = self.config.name if self.config.name != '' else None
         split = self.config.split if self.config.split != '' else None
@@ -208,14 +220,30 @@ class HuggingfaceDataset(object):
         loss_mask_buffer = state['loss_mask_buffer']
         examples_consumed = state['examples_consumed']
         total_tokens = state['metadata']['dataset_total_tokens']
+        repeat = self.config.repeat_first_n_batches
+        chunk_size = int(self.config.batch_size) * self.config.seq_length
+        # A saved boundary still contains the previous epoch's packing remainder.
+        # Reset that remainder before touching the source, including on restoration.
+        epoch_batch = (total_tokens // chunk_size) % repeat if repeat else 0
+        if repeat and total_tokens > 0 and epoch_batch == 0:
+            epoch_batch = repeat
         dataset_iterator = islice(iter(self._dataset), examples_consumed, None)
         while True:
+            if repeat and epoch_batch == repeat:
+                # iter(self) would reuse the checkpoint's _start_state.
+                dataset_iterator = iter(self._dataset)
+                examples_consumed = 0
+                token_buffer = []
+                loss_mask_buffer = []
+                epoch_batch = 0
             batch_size = int(self.config.batch_size)
             chunk_size = batch_size * self.config.seq_length
             if len(token_buffer) <= chunk_size + 1:
                 try:
                     example = next(dataset_iterator)
                 except StopIteration:
+                    if repeat:
+                        raise ValueError(f'Replay source cannot supply {repeat} complete packed batches (got {epoch_batch})')
                     return
                 tokens, loss_masks = self.text_processor(example)
                 token_buffer.extend(tokens)
@@ -223,6 +251,7 @@ class HuggingfaceDataset(object):
                 examples_consumed += 1
                 continue
             total_tokens += chunk_size
+            epoch_batch += 1
             batch = {
                 'input_tokens': np.array(token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(batch_size, self.config.seq_length),
                 'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=self.config.batch_token_dtype).reshape(batch_size, self.config.seq_length),
@@ -233,6 +262,12 @@ class HuggingfaceDataset(object):
             token_buffer = token_buffer[chunk_size:]
             loss_mask_buffer = loss_mask_buffer[chunk_size:]
             self.metadata = dict(dataset_example_index=examples_consumed - 1, dataset_total_tokens=total_tokens)
+            if repeat:
+                completed_batches = total_tokens // chunk_size
+                self.metadata.update(
+                    replay_completed_epochs=completed_batches // repeat,
+                    replay_next_batch_index=completed_batches % repeat,
+                    unique_solve_tokens=min(total_tokens, repeat * chunk_size))
             self._live_state = dict(examples_consumed=examples_consumed,
                 token_buffer=list(token_buffer), loss_mask_buffer=list(loss_mask_buffer),
                 metadata=dict(self.metadata))
@@ -244,8 +279,12 @@ class HuggingfaceDataset(object):
             tokenizer_name=getattr(self.tokenizer, 'name_or_path', None),
             tokenizer_vocab_size=len(self.tokenizer), **deepcopy(self._live_state))
 
-    def load_state_dict(self, state_dict, *, allow_batch_size_change=False):
+    def load_state_dict(self, state_dict, *, allow_batch_size_change=False,
+                        allow_replay_transition=False):
         if state_dict.get('packed_state_version') != 1:
+            if (self.config.repeat_first_n_batches
+                    or state_dict.get('config', {}).get('repeat_first_n_batches', 0)):
+                raise ValueError('Replay resume requires a complete packed dataset snapshot')
             if 'config' in state_dict:
                 self.config.update(mlxu.ConfigDict(state_dict['config']))
             self.metadata = dict(state_dict.get('metadata', self.metadata))
@@ -259,6 +298,18 @@ class HuggingfaceDataset(object):
         if not allow_batch_size_change:
             matching_keys += ('batch_size',)
         saved_config = state_dict['config']
+        saved_repeat = saved_config.get('repeat_first_n_batches', 0)
+        repeat = self.config.repeat_first_n_batches
+        if saved_repeat != repeat and not (
+                allow_replay_transition and saved_repeat == 0 and repeat > 0):
+            raise ValueError('Dataset replay change requires validated initial transition')
+        if repeat:
+            total = state_dict['metadata']['dataset_total_tokens']
+            chunk = self.config.batch_size * self.config.seq_length
+            if (allow_batch_size_change or saved_config.get('tokens_count_at_start') != 0
+                    or total < 0 or total % chunk
+                    or (saved_repeat == 0 and total > repeat * chunk)):
+                raise ValueError('Replay resume requires fixed batches, zero-origin aligned tokens, and an eligible parent')
         for key in matching_keys:
             if saved_config.get(key) != self.config[key]:
                 raise ValueError(f'Dataset resume config mismatch for {key}: saved={saved_config.get(key)!r}, requested={self.config[key]!r}')
@@ -320,6 +371,7 @@ class OptHuggingfaceDataset(object):
     def get_default_config(updates=None):
         config = mlxu.config_dict()
         config.pretokenized_dataset_dir = ''  # Directory of pre-tokenized dataset
+        config.repeat_first_n_batches = 0
         config.seq_length = 1024
         config.batch_size = 8
         config.always_start_with_bos = False
@@ -373,6 +425,8 @@ class OptHuggingfaceDataset(object):
             config (dict): Configuration dictionary.
         """
         self.config = self.get_default_config(config)
+        if self.config.repeat_first_n_batches:
+            raise ValueError('repeat_first_n_batches requires a raw Hugging Face dataset')
         if not hasattr(self, 'config'):
             raise ValueError("Configuration is missing.")
         
