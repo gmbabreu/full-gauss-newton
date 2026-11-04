@@ -75,7 +75,7 @@ automatically. The initial transition only permits enabling replay, increasing
 directory and W&B run. A parent may have consumed at most K batches: a
 single-pass step1500 parent is rejected for K=1000. Old snapshots without the
 repeat field in either training or validation config are treated as repeat=0.
-Parameters-only continuation is unsupported for replay.
+Parameters-only continuation is unsupported for first-order Adam replay.
 
 The complete train state (step, moments and schedule counters) and RNG are
 restored. At the step1000 boundary, the next update consumes original batch0.
@@ -88,6 +88,62 @@ config matching; it does not permit another change to the training horizon.
 `unique_solve_tokens`, capped at K * batch_size * sequence_length. For K=1000,
 batch size 720 and sequence length 1024, this cap is 737,280,000 input positions.
 Step50000 represents 50 total passes, including the inherited first pass.
+
+## Adam-GN solve-stream replay
+
+`llama_train_gn.py` supports replay for non-adaptive Adam-GN with
+`single_batch_inner=True`, raw HF streaming, fixed matching batch sizes, and
+no batch growth. Use an explicit positive `ls_eval_batches` (1 for this
+experiment); replay rejects the legacy 0/inner_loop_iter fallback. Replay is
+disabled for validation. Other solver paths remain unsupported for replay.
+
+Retain the Adam experiment's exact tokenizer, source, text-processor/packing
+flags, and GN model/solver settings. Append/override these flags on its GN
+launch command (use a new output experiment and W&B run):
+
+```shell
+python -m EasyLM.models.llama.llama_train_gn \
+    --load_checkpoint='trainstate_params::gs://gfn-soo/checkpoints/warmup_150m/1_0/streaming_train_state' \
+    --load_dataset_state='' --cg_resume_state='' \
+    --log_step_offset=0 --log_token_offset=0 --start_tokens=0 \
+    --optimizer_type=adamw --gauss_newton=True \
+    --single_batch_inner=True --adaptive_inner_loop=False \
+    --train_dataset.type=huggingface \
+    --train_dataset.huggingface_dataset.pretokenized_dataset_dir='' \
+    --train_dataset.huggingface_dataset.streaming=True \
+    --train_dataset.huggingface_dataset.batch_size=720 \
+    --train_dataset_batch_size=720 --train_batch_growth_interval=0 \
+    --train_dataset.huggingface_dataset.seq_length=1024 \
+    --train_dataset.huggingface_dataset.shuffle_data=True \
+    --train_dataset.huggingface_dataset.shuffle_seed=42 \
+    --train_dataset.huggingface_dataset.shuffle_buffer_size=100000 \
+    --train_dataset.huggingface_dataset.repeat_first_n_batches=500 \
+    --train_dataset.huggingface_dataset.tokens_count_at_start=0 \
+    --eval_dataset.huggingface_dataset.repeat_first_n_batches=0 \
+    --linesearch=True --ls_eval_batches=1 \
+    --total_steps=10000 --target_loss=0.0 \
+    --save_model_freq=0 --save_milestone_freq=0
+```
+
+The checkpoint supplies parameters only; normal fresh GN solver initialization
+and the existing reset policy, schedule and RNG progression apply. One solve
+batch is fetched per outer update and reused throughout the inner solve. Only
+the data iterator resets at epoch boundaries. There is no GN replay resume
+system; dataset restoration, nonzero reporting offsets and saving are rejected
+in this initial mode.
+
+Line search uses a separate single-pass loader from a deep copy of the solve
+config, changing only repeat to 0 and shuffle seed to solve_seed+1 (43).
+Candidate step sizes reuse the fetched line-search batches and RNGs as before.
+Changing ls_eval_batches does not advance the solve stream. Validation retains
+its own loader. With replay disabled, solve and line search retain the original
+shared training iterator and accounting behavior.
+
+Outer-update records include solve-stream replay metadata. Line-search token
+visits remain in phase_linesearch_tokens and cannot overwrite the solve dataset
+cursor. After update501, the solve batch is original batch0, total_tokens is
+369,377,280, unique_solve_tokens is 368,640,000, replay_completed_epochs is 1,
+and replay_next_batch_index is 1. Step10000 completes 20 solve epochs.
 
 ## Saving Checkpoint
 EasyLM will only save the checkpoint in the streaming format. By default, only

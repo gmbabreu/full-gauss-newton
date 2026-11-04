@@ -37,13 +37,15 @@ class TrainingProgress:
     def cumulative_tokens(self):
         return self.token_offset + self.phase_solve_tokens
 
-    def charge(self, role, batch, dataset_metadata=None):
+    def charge(self, role, batch, dataset_metadata=None, *, update_dataset_cursor=True):
         tokens = int(batch["input_tokens"].size)
         field = {"solve": "phase_solve_tokens", "linesearch": "phase_linesearch_tokens",
                  "skipped": "phase_skipped_tokens"}.get(role)
         if field is None:
             raise ValueError(f"unknown training batch role: {role}")
         setattr(self, field, getattr(self, field) + tokens)
+        if not update_dataset_cursor:
+            return tokens
         if dataset_metadata and "dataset_total_tokens" in dataset_metadata:
             self.dataset_total_tokens = int(dataset_metadata["dataset_total_tokens"])
         else:

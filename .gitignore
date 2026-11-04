@@ -44,6 +44,7 @@ pip-delete-this-directory.txt
 !/tests/test_gn_jacobi_pcg.py
 !/tests/test_update_geometry.py
 !/tests/test_streaming_replay.py
+!/tests/test_gn_streaming_replay.py
 htmlcov/
 .tox/
 .nox/

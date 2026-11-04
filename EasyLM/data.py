@@ -29,12 +29,15 @@ class DatasetFactory(object):
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
-    def load_dataset(cls, config, tokenizer, *, first_order_adam_replay=False, **kwargs):
+    def load_dataset(cls, config, tokenizer, *, first_order_adam_replay=False,
+                     adam_gn_replay=False, **kwargs):
         config = cls.get_default_config(config)
         if config.huggingface_dataset.repeat_first_n_batches and (
-                not first_order_adam_replay or config.type != 'huggingface'
+                not (first_order_adam_replay or adam_gn_replay)
+                or config.type != 'huggingface'
+                or (adam_gn_replay and not config.huggingface_dataset.streaming)
                 or config.huggingface_dataset.pretokenized_dataset_dir):
-            raise ValueError('repeat_first_n_batches requires the first-order Adam raw Hugging Face training path')
+            raise ValueError('repeat_first_n_batches requires the first-order Adam or explicitly authorized Adam-GN raw Hugging Face training path (streaming for GN)')
         text_processor = TextProcessor(config.text_processor, tokenizer)
         if config.type == 'huggingface' and config.huggingface_dataset.pretokenized_dataset_dir != '':
             return OptHuggingfaceDataset(

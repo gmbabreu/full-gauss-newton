@@ -468,7 +468,48 @@ def get_tpu_metrics():
     return out
 
 
+def validate_gn_replay(flags):
+    """Authorize only fresh, fixed-batch Adam-GN solve-stream replay."""
+    hf = flags.train_dataset.huggingface_dataset
+    if flags.eval_dataset.huggingface_dataset.repeat_first_n_batches:
+        raise ValueError('Validation replay must remain disabled')
+    repeat = hf.repeat_first_n_batches
+    if not repeat:
+        return False
+    if (isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0
+            or flags.optimizer_type != 'adamw' or not flags.gauss_newton
+            or not flags.single_batch_inner or flags.adaptive_inner_loop
+            or flags.inner_loop_iter <= 0
+            or flags.train_dataset.type != 'huggingface'
+            or hf.pretokenized_dataset_dir or not hf.streaming
+            or flags.train_batch_growth_interval != 0
+            or hf.batch_size <= 0 or hf.batch_size != flags.train_dataset_batch_size
+            or hf.tokens_count_at_start != 0 or flags.start_tokens != 0):
+        raise ValueError('GN replay requires non-adaptive Adam-GN, single_batch_inner=True, '
+                         'raw HF streaming, fixed matching batch sizes/no growth and zero-origin tokens')
+    if flags.ls_eval_batches <= 0:
+        raise ValueError('GN replay requires explicit ls_eval_batches>0 (use 1); no inner_loop_iter fallback')
+    if (flags.load_dataset_state or flags.cg_resume_state
+            or flags.log_step_offset != 0 or flags.log_token_offset != 0
+            or (flags.load_checkpoint and not flags.load_checkpoint.startswith(
+                ('trainstate_params::', 'params::', 'flax_params::')))):
+        raise ValueError('GN replay requires fresh solver/data initialization, params-only loading, '
+                         'empty load_dataset_state and zero reporting offsets')
+    if flags.save_model_freq or flags.save_milestone_freq:
+        raise ValueError('GN replay currently requires save_model_freq=0 and save_milestone_freq=0')
+    return True
+
+
+def build_gn_replay_auxiliary_dataset(config, tokenizer):
+    """Independent, single-pass line-search stream; preserve solve packing."""
+    auxiliary_config = copy.deepcopy(config)
+    auxiliary_config.huggingface_dataset.repeat_first_n_batches = 0
+    auxiliary_config.huggingface_dataset.shuffle_seed += 1
+    return DatasetFactory.load_dataset(auxiliary_config, tokenizer)
+
+
 def main(argv):
+    replay_enabled = validate_gn_replay(FLAGS)
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.export_update_geometry:
@@ -642,7 +683,10 @@ def main(argv):
         )
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
-    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    dataset = DatasetFactory.load_dataset(
+        FLAGS.train_dataset, tokenizer, adam_gn_replay=replay_enabled)
+    linesearch_dataset = (build_gn_replay_auxiliary_dataset(FLAGS.train_dataset, tokenizer)
+                         if replay_enabled else None)
     if FLAGS.load_dataset_state or FLAGS.cg_resume_state:
         dataset_state = cg_dataset if cg_metadata is not None else mlxu.load_pickle(FLAGS.load_dataset_state)
         if dataset_state is None:
@@ -1827,6 +1871,7 @@ def main(argv):
         inner_state = create_trainstate_from_params(train_state.params)
         dataset_object = dataset
         dataset = iter(dataset_object)
+        linesearch_iterator = iter(linesearch_dataset) if replay_enabled else dataset
         actual_solve_batch_size = None
         solve_batch_size = FLAGS.train_dataset_batch_size
 
@@ -1840,10 +1885,11 @@ def main(argv):
                 finally:
                     dataset_object.config.batch_size = previous_batch_size
             else:
-                batch, metadata = next(dataset)
+                batch, metadata = next(linesearch_iterator if role == 'linesearch' else dataset)
             if role == 'solve':
                 actual_solve_batch_size = int(batch['input_tokens'].shape[0])
-            progress.charge(role, batch, metadata)
+            progress.charge(role, batch, metadata,
+                           update_dataset_cursor=not replay_enabled or role == 'solve')
             return batch, metadata
 
         diagnostics = ConditionDiagnostics(
@@ -2074,6 +2120,8 @@ def main(argv):
 
             def pull_ls_batches_and_baseline(sharded_rng, base_params, dataset):
                 exit_flag = False
+                # Replay validation requires an explicit positive count (normally 1).
+                # The historical fallback remains available only with replay disabled.
                 num_ls_batches = FLAGS.ls_eval_batches if FLAGS.ls_eval_batches > 0 else FLAGS.inner_loop_iter
                 ls_batches = []
                 for _ in range(num_ls_batches):
@@ -2514,6 +2562,8 @@ def main(argv):
                 finally:
                     condition_batch = None
             timing.stop_train_interval(completed_update=True)
+            if replay_enabled:
+                defer_wandb(single_dataset_metrics_, step=step)
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
                 n_actual, groups = microbatch_groups(
