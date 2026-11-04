@@ -1,0 +1,8 @@
+{
+  "program": "EasyLM.models.llama.llama_train_gn",
+  "route": "sweep",
+  "inner_adam": true,
+  "flags": {
+    "inner_b1": 0
+  }
+}

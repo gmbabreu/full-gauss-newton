@@ -1,0 +1,19 @@
+{
+  "program": "EasyLM.models.llama.llama_train_gn",
+  "route": "sweep",
+  "flags": {
+    "cg_preconditioner": "adam_diag",
+    "cg_interpolation_lambda": 0.1,
+    "cg_damping_mu": 0,
+    "cg_maxiter": 256,
+    "optimizer_type": "cg",
+    "cg_tol": 0.05,
+    "cg_atol": 0,
+    "cg_n_micro": 4,
+    "outer_momentum_beta": 0,
+    "cg_lambda_batch_denominator": 0,
+    "cg_lambda_final": -1,
+    "cg_lambda_ramp_steps": 0,
+    "condition_log": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "program": "EasyLM.models.llama.llama_train_gn",
+  "route": "sweep",
+  "inner_adam": true,
+  "flags": {
+    "optimizer_type": "muon",
+    "inner_loop_lr": 0.003
+  }
+}

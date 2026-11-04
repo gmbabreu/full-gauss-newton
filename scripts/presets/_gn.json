@@ -1,0 +1,16 @@
+{
+  "gauss_newton": true,
+  "reset_start": false,
+  "single_batch_inner": true,
+  "adaptive_inner_loop": false,
+  "linesearch": true,
+  "armijo_linesearch": true,
+  "armijo_beta": 0.5,
+  "armijo_init_step": 1,
+  "ls_eval_batches": 1,
+  "normalize_step": false,
+  "weight_average": false,
+  "global_warmup": 0,
+  "inner_loop_warmup": 0,
+  "condition_log": false
+}
