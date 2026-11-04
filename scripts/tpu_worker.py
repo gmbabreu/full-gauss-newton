@@ -14,6 +14,10 @@ import sys
 import time
 
 
+HELPER_PATHS = tuple('scripts/' + name for name in
+                     ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'))
+
+
 def command(argv, *, check=True):
     result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and result.returncode:
@@ -27,10 +31,10 @@ def atomic_json(path, value):
     temp.replace(path)
 
 
-def fingerprint(repo):
-    paths = [repo / 'scripts' / name for name in
-             ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py')]
-    paths += sorted((repo / 'scripts' / 'presets').glob('*.json'))
+def fingerprint(repo, *, include_presets=True):
+    paths = [repo / path for path in HELPER_PATHS]
+    if include_presets:
+        paths += sorted((repo / 'scripts' / 'presets').glob('*.json'))
     return {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
 
@@ -136,7 +140,7 @@ class Worker:
         if problems:
             raise RuntimeError('; '.join(problems))
 
-    def preflight(self):
+    def preflight(self, *, for_update=False):
         self.require_lock()
         if not Path(self.p['environment']).is_file():
             raise RuntimeError('Missing environment file: ' + self.p['environment'])
@@ -144,12 +148,22 @@ class Worker:
             raise RuntimeError('The sourced environment must provide tmux, python and python3')
         report = self.report()
         self.idle_clean(report)
-        if self.p.get('fingerprint') != fingerprint(self.repo):
+        actual = fingerprint(self.repo, include_presets=not for_update)
+        expected = self.p.get('fingerprint')
+        if for_update:
+            expected = {path: (expected or {}).get(path) for path in HELPER_PATHS}
+            if expected != actual:
+                raise RuntimeError('Controller/worker executable helpers differ; manually bootstrap '
+                                   'the same helper revision on every worker before updating')
+        elif expected != actual:
             raise RuntimeError('Controller/worker tooling or presets differ; sync and commit the tooling on every worker')
-        if self.p.get('expected_sha') and (report['sha'], report['branch']) != (
+        if not for_update and self.p.get('expected_sha') and (report['sha'], report['branch']) != (
                 self.p['expected_sha'], self.p['expected_branch']):
             raise RuntimeError('Controller/worker branch or SHA differs; explicitly sync the chosen branch on every worker')
         return report
+
+    def preflight_update(self):
+        return self.preflight(for_update=True)
 
     def status(self):
         report = self.report()
@@ -223,7 +237,9 @@ class Worker:
             env.pop(key, None)
         env.update(PYTHONUNBUFFERED='1', PYTHONPATH=str(self.repo) + os.pathsep + env.get('PYTHONPATH', ''),
                    GFN_MANAGED_RUN_TOKEN=manifest['token'])
-        if self.p['worker'] != 0:
+        if self.p['worker'] == 0:
+            env.pop('WANDB_MODE', None)
+        else:
             env['WANDB_MODE'] = 'disabled'
         if self.p['plan']['route'] == 'sweep':
             env.update(SLURM_ARRAY_TASK_ID='1', SLURM_ARRAY_JOB_ID=manifest['run_id'])
@@ -355,7 +371,7 @@ class Worker:
         os.execvp('tail', ['tail', '-n', '100', '-F', str(path)])
 
     def fetch(self):
-        self.preflight()
+        self.preflight(for_update=True)
         branch = self.p['branch']
         command(['git', 'check-ref-format', '--branch', branch])
         command(['git', 'fetch', 'origin', f'refs/heads/{branch}:refs/remotes/origin/{branch}'])
@@ -368,21 +384,20 @@ class Worker:
         return {'target_sha': target}
 
     def verify_target(self, target):
-        for path, digest in self.p['fingerprint'].items():
+        # The updater must retain compatible executable helpers across the
+        # switch. Presets are data delivered by the update, not a prerequisite.
+        for path in HELPER_PATHS:
+            digest = self.p['fingerprint'].get(path)
             try:
                 content = subprocess.check_output(['git', 'show', target + ':' + path], stderr=subprocess.PIPE)
             except subprocess.CalledProcessError as error:
                 raise RuntimeError('Target branch lacks ' + path + '; deliver the tooling commit there before switching') from error
             if hashlib.sha256(content).hexdigest() != digest:
-                raise RuntimeError('Target branch tooling differs or is missing; deliver the tooling commit there before switching')
-        target_presets = {p for p in command(['git', 'ls-tree', '-r', '--name-only', target, '--',
-                                             'scripts/presets']).splitlines() if p.endswith('.json')}
-        expected_presets = {p for p in self.p['fingerprint'] if p.startswith('scripts/presets/')}
-        if target_presets != expected_presets:
-            raise RuntimeError('Target branch has a different preset inventory; sync tooling before switching')
+                raise RuntimeError('Target branch executable helpers differ; manually bootstrap '
+                                   'the same helper revision before switching')
 
     def update(self):
-        self.preflight()
+        self.preflight(for_update=True)
         branch, sha = self.p['branch'], self.p['target_sha']
         fetched = command(['git', 'rev-parse', f'refs/remotes/origin/{branch}'])
         if fetched != sha:
@@ -407,7 +422,7 @@ def main():
     payload = json.loads(base64.urlsafe_b64decode(encoded))
     try:
         worker = Worker(payload)
-        if action not in {'acquire', 'release', 'preflight', 'status', 'launch', 'stop', 'logs',
+        if action not in {'acquire', 'release', 'preflight', 'preflight_update', 'status', 'launch', 'stop', 'logs',
                           'fetch', 'update', 'supervise'}:
             raise ValueError('Unknown worker action')
         result = getattr(worker, action)()

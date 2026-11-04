@@ -159,7 +159,7 @@ class Controller:
         print('Processes started on all workers. Use status/logs to check training initialization.', flush=True)
 
     def update(self, branch=None):
-        before = self.all_workers('preflight')
+        before = self.all_workers('preflight_update')
         identities = {(r['branch'], r['sha']) for r in before.values()}
         if len(identities) != 1:
             raise RuntimeError('Workers differ in branch/SHA; reconcile explicitly before updating')
