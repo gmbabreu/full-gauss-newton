@@ -79,12 +79,20 @@ For the epoch version use `git switch codex/tpu-workflow-epoch` on the controlle
 and synchronize that same branch/SHA on every worker first. After the PRs are
 merged separately, normal `main`/`epoch` checkouts can be used instead.
 
-`pull`/`switch` require matching tooling on the controller, current workers, and
-**target commit**. They refuse a branch that lacks or changes tooling/presets;
-bootstrap that tooling revision explicitly first. This avoids switching away the
-helper needed to finish verification and release reservations. Following a remote
-`switch epoch`, also switch/update the controller to the same resulting branch/SHA
-before `run`.
+`pull`/`switch` require identical executable helpers (`tpu.sh`, `tpu_control.py`,
+`tpu_worker.py`, and `run_experiment.py`) on the controller, current workers, and
+**target commit**. Preset contents and inventory may differ: updates can deliver
+committed preset-only changes while workers still have the previous presets.
+All workers must still start idle, clean, and at the same branch/SHA, and converge
+to one clean target commit. `run` continues to require the controller and every
+worker to match in branch/SHA, helpers, and the full preset inventory and contents.
+
+Helper-code changes require manual bootstrap of the same revision on the
+controller and every worker first, including upgrading from the original workflow
+to this corrected updater. Updates refuse missing or changed target helpers so
+the helper remains available to finish verification and release reservations.
+Following a remote `switch epoch` or preset update, also switch/update the
+controller to the same resulting branch/SHA before `run`.
 
 ## Command reference
 
@@ -197,7 +205,9 @@ The controller generates one timestamp/UUID run ID for all workers. GN sets
 `output_dir/experiment_id`, by default under `gs://gfn-soo/checkpoints/script_runs`.
 A normal invocation always creates a fresh identity; it does not reuse inherited
 W&B IDs, names, resume settings, SLURM IDs, or previous experiment directories.
-Worker 0 may report to W&B; all other workers get `WANDB_MODE=disabled`.
+Worker 0 has inherited `WANDB_MODE` removed so a controller/worker environment
+with `WANDB_MODE=disabled` cannot silently disable its reporting; all other
+workers get `WANDB_MODE=disabled`.
 `PYTHONUNBUFFERED=1` and the worker repository's `PYTHONPATH` are set for both routes.
 
 A controller file lock and token-owned reservations on every worker serialize

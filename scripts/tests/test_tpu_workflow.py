@@ -281,7 +281,7 @@ class MockedCloudTests(unittest.TestCase):
     def test_update_refusal_before_fetch(self):
         for action in ('pull', 'switch'):
             self.log.write_text('')
-            with patch.dict(os.environ, FAKE_FAIL='preflight:2'):
+            with patch.dict(os.environ, FAKE_FAIL='preflight_update:2'):
                 with self.assertRaises(RuntimeError):
                     control.Controller('1').operate(action, branch='epoch' if action == 'switch' else None)
             self.assertFalse(any(c['action'] in ('fetch', 'update') for c in self.calls()))
@@ -290,6 +290,8 @@ class MockedCloudTests(unittest.TestCase):
         with patch.dict(os.environ, FAKE_UPDATE='1'):
             control.Controller('1').operate('switch', branch='epoch')
         calls = self.calls()
+        self.assertEqual([c['worker'] for c in calls if c['action'] == 'preflight_update'], [0, 1, 2])
+        self.assertFalse(any(c['action'] == 'preflight' for c in calls))
         fetch = [i for i, c in enumerate(calls) if c['action'] == 'fetch']
         update = [(i, c) for i, c in enumerate(calls) if c['action'] == 'update']
         self.assertLess(max(fetch), min(i for i, c in update))
@@ -330,6 +332,17 @@ class WorkerTests(unittest.TestCase):
             self.w.p['fingerprint'] = {}
             with self.assertRaisesRegex(RuntimeError, 'tooling or presets differ'):
                 self.w.preflight()
+
+    def test_update_preflight_accepts_preset_differences_but_run_refuses(self):
+        self.w.p['fingerprint']['scripts/presets/adam.json'] = 'new-preset'
+        self.w.p['fingerprint']['scripts/presets/new.json'] = 'added-preset'
+        with patch.object(self.w, 'report', return_value=self.clean), patch('shutil.which', return_value='/bin/mock'):
+            self.assertEqual(self.w.preflight_update(), self.clean)
+            with self.assertRaisesRegex(RuntimeError, 'tooling or presets differ'):
+                self.w.preflight()
+            self.w.p['fingerprint']['scripts/tpu_worker.py'] = 'changed-helper'
+            with self.assertRaisesRegex(RuntimeError, 'executable helpers differ; manually bootstrap'):
+                self.w.preflight_update()
 
     def test_missing_environment_and_tool(self):
         with patch.object(self.w, 'report', return_value=self.clean):
@@ -424,7 +437,7 @@ class WorkerTests(unittest.TestCase):
             report = self.w.report()
         self.assertEqual(report['unmanaged'], unmanaged)
 
-    def test_supervisor_environment_identity_and_exit_record(self):
+    def test_supervisor_clears_inherited_disabled_wandb_mode_and_records_exit(self):
         for wid in (0, 2):
             with self.subTest(worker=wid):
                 p = {**self.payload, 'worker': wid, 'plan': experiment.make_plan('gn_adam', [], f'run-{wid}')}
@@ -437,7 +450,8 @@ class WorkerTests(unittest.TestCase):
                 table = [dict(pid=os.getpid(), start='birth', pgrp=1, argv=[])]
                 with patch.object(worker, 'process_table', return_value=table), \
                         patch.object(worker.subprocess, 'Popen', return_value=child) as popen, \
-                        patch.object(worker.signal, 'signal'), patch.dict(os.environ, WANDB_RUN_ID='old', WANDB_RESUME='must'):
+                        patch.object(worker.signal, 'signal'), \
+                        patch.dict(os.environ, WANDB_RUN_ID='old', WANDB_RESUME='must', WANDB_MODE='disabled'):
                     self.assertEqual(w.supervise()['exit_status'], 7)
                 env = popen.call_args.kwargs['env']
                 self.assertNotIn('WANDB_RUN_ID', env)
@@ -447,6 +461,8 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(env['SLURM_ARRAY_TASK_ID'], '1')
                 if wid:
                     self.assertEqual(env['WANDB_MODE'], 'disabled')
+                else:
+                    self.assertNotIn('WANDB_MODE', env)
                 self.assertTrue(popen.call_args.kwargs['start_new_session'])
                 self.assertEqual(json.loads((directory / 'manifest.json').read_text())['exit_status'], 7)
 
@@ -583,13 +599,78 @@ class LocalGitUpdateTests(unittest.TestCase):
             self.w.fetch()
         self.assertEqual(self.git(self.clone, 'branch', '--show-current'), 'tooling')
 
-    def test_changed_target_preset_refuses_before_switch(self):
-        (self.origin / 'scripts/presets/adam.json').write_text('{}')
+    def test_changed_target_preset_is_delivered_by_switch(self):
+        preset = self.origin / 'scripts/presets/adam.json'
+        value = json.loads(preset.read_text())
+        value['flags']['total_steps'] = 3100
+        preset.write_text(json.dumps(value, indent=2) + '\n')
         self.git(self.origin, 'add', '.')
         self.git(self.origin, 'commit', '-m', 'change preset fixture')
-        with self.assertRaisesRegex(RuntimeError, 'tooling differs'):
+        target = self.git(self.origin, 'rev-parse', 'HEAD')
+        self.assertEqual(self.w.fetch()['target_sha'], target)
+        self.w.p['target_sha'] = target
+        report = self.w.update()
+        self.assertEqual((report['branch'], report['sha'], report['dirty']), ('epoch', target, ''))
+        self.assertEqual((self.clone / 'scripts/presets/adam.json').read_text(), preset.read_text())
+
+    def test_changed_target_helper_requires_manual_bootstrap(self):
+        with (self.origin / 'scripts/tpu_worker.py').open('a') as helper:
+            helper.write('\n# changed helper revision\n')
+        self.git(self.origin, 'add', '.')
+        self.git(self.origin, 'commit', '-m', 'change helper fixture')
+        with self.assertRaisesRegex(RuntimeError, 'executable helpers differ; manually bootstrap'):
             self.w.fetch()
         self.assertEqual(self.git(self.clone, 'branch', '--show-current'), 'tooling')
+
+    def test_controller_delivers_preset_only_changes_to_all_workers(self):
+        # Exercise the controller's reservations/preflight/fetch/apply/convergence
+        # path against two real local Git checkouts; no SSH/cloud calls occur.
+        second_clone = self.path / 'clone-2'
+        subprocess.check_output(['git', 'clone', '-b', 'tooling', str(self.origin), str(second_clone)],
+                                stderr=subprocess.PIPE)
+        second = worker.Worker({**self.w.p, 'repo': str(second_clone), 'state': str(self.path / 'records-2')})
+        self.w.release()
+        workers = {0: self.w, 1: second}
+        for operation in ('pull', 'switch'):
+            with self.subTest(operation=operation):
+                # First fast-forward tooling, then switch to epoch. Both target
+                # revisions alter only presets, and controllers already see them.
+                branch = 'tooling' if operation == 'pull' else 'epoch'
+                self.git(self.origin, 'switch', branch)
+                preset = self.origin / 'scripts/presets/adam.json'
+                value = json.loads(preset.read_text())
+                value['flags']['total_steps'] = 3100 if operation == 'pull' else 3200
+                preset.write_text(json.dumps(value, indent=2) + '\n')
+                self.git(self.origin, 'add', '.')
+                self.git(self.origin, 'commit', '-m', 'preset-only ' + operation)
+                target = self.git(self.origin, 'rev-parse', 'HEAD')
+                controller = control.Controller('1')
+                controller.base['fingerprint'] = worker.fingerprint(self.origin)
+
+                def discover():
+                    controller.workers = list(workers)
+
+                def rpc(wid, action, extra=None):
+                    w = workers[wid]
+                    os.chdir(w.repo)  # Each real RPC starts in its worker's checkout.
+                    w.p.update(token=controller.token, fingerprint=controller.base['fingerprint'])
+                    w.p.update(extra or {})
+                    # Monitor usage is irrelevant to Git convergence; report Git
+                    # and mocked process/tmux state without querying libtpu.
+                    return w.report() if action == 'status' else getattr(w, action)()
+
+                with patch.object(control.Controller, 'discover', side_effect=discover), \
+                        patch.object(controller, 'rpc', side_effect=rpc), \
+                        patch.object(second, 'active_records', return_value=[]), \
+                        redirect_stdout(io.StringIO()):
+                    controller.operate(operation, branch='epoch' if operation == 'switch' else None)
+
+                for w in workers.values():
+                    self.assertEqual(self.git(w.repo, 'rev-parse', 'HEAD'), target)
+                    self.assertEqual(self.git(w.repo, 'branch', '--show-current'), branch)
+                    self.assertEqual(self.git(w.repo, 'status', '--porcelain'), '')
+                    self.assertEqual((w.repo / 'scripts/presets/adam.json').read_text(), preset.read_text())
+                    self.assertFalse(w.lock.exists())
 
     def test_diverged_local_branch_refuses_fast_forward(self):
         self.git(self.clone, 'config', 'user.email', 'test@example.invalid')
