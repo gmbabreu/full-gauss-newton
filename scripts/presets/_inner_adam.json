@@ -1,0 +1,11 @@
+{
+  "optimizer_type": "adamw",
+  "inner_loop_iter": 50,
+  "inner_loop_lr": 0.001,
+  "lr_sched": "global_cosine",
+  "inner_b1": 0.9,
+  "inner_b2": 0.999,
+  "inner_clip_gradient": 1,
+  "inner_loop_wd": 0.01,
+  "optimizer_wd": 0.001
+}
