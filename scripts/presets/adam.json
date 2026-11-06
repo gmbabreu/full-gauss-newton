@@ -1,0 +1,7 @@
+{
+  "program": "EasyLM.models.llama.llama_train",
+  "route": "direct",
+  "flags": {
+    "dtype": "fp32"
+  }
+}
