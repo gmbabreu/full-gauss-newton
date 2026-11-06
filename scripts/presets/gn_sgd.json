@@ -1,0 +1,15 @@
+{
+  "program": "EasyLM.models.llama.llama_train_gn",
+  "route": "sweep",
+  "inner_adam": false,
+  "flags": {
+    "optimizer_type": "sgd",
+    "inner_loop_iter": 200,
+    "inner_loop_lr": 0.1,
+    "lr_sched": "constant",
+    "inner_sgd_momentum": 0,
+    "inner_clip_gradient": 0,
+    "inner_loop_wd": 0,
+    "optimizer_wd": 0
+  }
+}
