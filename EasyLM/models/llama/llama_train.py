@@ -94,6 +94,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     notes='',
     
     target_loss=0.0,
+    batch_transfer_probe=False,
 )
 
 def get_gpu_memory():
@@ -135,6 +136,11 @@ def main(argv):
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
 
     log_config = mlxu.flatten_config_dict(flags_config_dict)
+
+    if FLAGS.batch_transfer_probe:
+        from EasyLM import batch_transfer
+        probe_model_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+        batch_transfer.validate_config(flags_config_dict, probe_model_config.to_dict())
 
     raw_adam = (FLAGS.optimizer.type == 'adamw'
                 and FLAGS.train_dataset.type == 'huggingface'
@@ -192,7 +198,8 @@ def main(argv):
         modify_state_json_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/state.json'), os.path.join(tmp_dir, 'train_dataset/train'), num_files_to_keep=num_to_download)
         load_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'dataset_dict.json'), os.path.join(tmp_dir, 'train_dataset/dataset_dict.json'))
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
-    if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
+    if (not FLAGS.batch_transfer_probe
+            and FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://')):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
     if FLAGS.load_dataset_state.startswith('gs://'):
         FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
@@ -208,14 +215,15 @@ def main(argv):
         dataset.load_state_dict(dataset_state)
         print('loaded dataset state', flush=True)
 
-    if FLAGS.eval_steps > 0:
+    if FLAGS.eval_steps > 0 and not FLAGS.batch_transfer_probe:
         eval_dataset = DatasetFactory.load_dataset(
             FLAGS.eval_dataset, dataset.tokenizer
         )
         eval_iterator = iter(eval_dataset)
 
     seq_length = dataset.seq_length
-    llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+    llama_config = (probe_model_config if FLAGS.batch_transfer_probe
+                    else LLaMAConfigurator.finalize_config(FLAGS.llama))
 
     model = FlaxLLaMAForCausalLMModule(
         llama_config,
@@ -442,24 +450,26 @@ def main(argv):
         else:
             wandb.init(entity=FLAGS.wandb_entity, project=FLAGS.wandb_project, config=log_config, dir=FLAGS.wandb_dir)  # Replace with your project name
 
-            is_gcs = output_dir.startswith("gs://")
+            if not FLAGS.batch_transfer_probe:
+                is_gcs = output_dir.startswith("gs://")
 
-            # If not GCS, create local directory
-            if not is_gcs and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+                # If not GCS, create local directory
+                if not is_gcs and not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
 
-            # Save wandb_id.txt locally first
-            local_path = os.path.join(output_dir if not is_gcs else FLAGS.tmp_dir, "wandb_id.txt")
+                # Save wandb_id.txt locally first
+                local_path = os.path.join(output_dir if not is_gcs else FLAGS.tmp_dir, "wandb_id.txt")
 
-            with open(local_path, 'w+') as f:
-                f.write(wandb.run.id)  # Hacky but easier than handling in train state loader
+                with open(local_path, 'w+') as f:
+                    f.write(wandb.run.id)  # Hacky but easier than handling in train state loader
 
-            # If output_dir is a GCS bucket, upload the file
-            if is_gcs:
-                gcs_path = os.path.join(output_dir, "wandb_id.txt")
-                upload_to_gcs(local_path, gcs_path)
+                # If output_dir is a GCS bucket, upload the file
+                if is_gcs:
+                    gcs_path = os.path.join(output_dir, "wandb_id.txt")
+                    upload_to_gcs(local_path, gcs_path)
 
-        configure_wandb_run(wandb.run)
+        if not FLAGS.batch_transfer_probe:
+            configure_wandb_run(wandb.run)
 
         start_step = int(jax.device_get(train_state.step))
         sharded_rng = (jax.device_put(resume_metadata['train_rng'])
@@ -489,6 +499,40 @@ def main(argv):
             'timing_includes_first_use_compilation': True,
         }, allow_val_change=True)
         timing = ProcessTiming()
+
+        if FLAGS.batch_transfer_probe:
+            from jax.experimental import multihost_utils
+
+            # This loader deliberately does not receive the saved data state.
+            update_batch, transfer_batch = batch_transfer.fresh_pair(
+                DatasetFactory, FLAGS.train_dataset, tokenizer)
+            assert FLAGS.train_dataset_batch_size % mesh.shape['dp'] == 0, \
+                "Batch size must be divisible by the number of devices in 'dp'."
+            update_batch, transfer_batch = jax.tree.map(
+                lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
+                (update_batch, transfer_batch))
+            _, param_gathers = make_shard_and_gather_fns(train_state_partition.params)
+            _, batch_gathers = make_shard_and_gather_fns(batch_partition)
+            train_state, sharded_rng, result = batch_transfer.measure(
+                train_state, sharded_rng, update_batch, transfer_batch,
+                train_step=sharded_train_step, eval_step=sharded_eval_step,
+                param_gathers=param_gathers, batch_gathers=batch_gathers, seed=FLAGS.seed)
+            result.update(
+                checkpoint_uri=init_checkpoint_path,
+                repository_commit=batch_transfer.repository_commit(),
+                optimizer_state_source=('restored' if init_checkpoint_path.startswith('trainstate::')
+                                        else 'fresh'),
+                model=llama_config.to_dict(), dtype=FLAGS.dtype, param_dtype=FLAGS.param_dtype,
+                tokenizer=FLAGS.tokenizer, dataset=FLAGS.train_dataset.to_dict(),
+                optimizer=FLAGS.optimizer.to_dict(), total_steps=FLAGS.total_steps, seed=FLAGS.seed,
+                train_dataset_batch_size=FLAGS.train_dataset_batch_size,
+                precision_comparison='Native Adam resume uses FP32 compute/state; historical GN '
+                    'probes used BF16 compute and FP32 parameters. Native-method comparison, '
+                    'not a matched-precision causal test.')
+            batch_transfer.complete(
+                result, output_dir, writer=jax.process_index() == 0,
+                open_file=mlxu.open_file, barrier=multihost_utils.sync_global_devices, wandb=wandb)
+            return
         
         def copy_array(x):
             return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array

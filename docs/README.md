@@ -90,6 +90,7 @@ Here are the documentations for the common modules and scripts in EasyLM:
 * [Serving](serving.md): serving the language model with an HTTP server
 * [Logger](logger.md): logging metrics for training
 * [Evaluation](evaluation.md): evaluation of language models on benchmarks
+* [Batch transfer](batch_transfer.md): one-step first-order Adam diagnostic and Panel C handoff
 
 
 
