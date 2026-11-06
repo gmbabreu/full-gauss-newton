@@ -146,6 +146,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     armijo_init_step=1.0,
 
     gauss_newton=False,
+    gn_damping_mu=0.0,  # Isotropic displacement damping for iterative GN solvers.
     redo_gn=0,
     reset_start=False,
 
@@ -469,6 +470,11 @@ def get_tpu_metrics():
 
 
 def main(argv):
+    if not math.isfinite(FLAGS.gn_damping_mu) or FLAGS.gn_damping_mu < 0:
+        raise ValueError('gn_damping_mu must be finite and nonnegative')
+    if FLAGS.gn_damping_mu and (not FLAGS.gauss_newton or
+            FLAGS.optimizer_type not in ('adamw', 'muon', 'sgd')):
+        raise ValueError('gn_damping_mu requires Adam/Muon/SGD GN; CG uses cg_damping_mu')
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.export_update_geometry:
@@ -1003,7 +1009,14 @@ def main(argv):
 
             # quadratic loss on linear model
             loss = scalar_loss_on_logits(logits0) + jnp.sum(g0 * v) + 0.5 * jnp.sum(v * Hv)
-
+            if FLAGS.gn_damping_mu:
+                # d = params - params0: solve (G + mu I)d = -g.
+                # Add after the logit pullback; parameter penalties inside
+                # scalar_loss_on_logits are constant with respect to logits.
+                grad_params = jax.tree_util.tree_map(
+                    lambda g, d: g + FLAGS.gn_damping_mu * d,
+                    grad_params, dparams)
+                loss += 0.5 * FLAGS.gn_damping_mu * tree_dot(dparams, dparams)
 
             return (loss, 0), (grad_params, b_norm)
 
@@ -1532,6 +1545,7 @@ def main(argv):
         solver_keys = (
             'optimizer_type', 'optimizer', 'inner_loop_iter', 'inner_loop_lr',
             'inner_loop_wd', 'inner_sgd_momentum', 'inner_b1', 'inner_b2',
+            'gn_damping_mu',
             'inner_clip_gradient', 'optimizer_wd', 'lr_sched', 'total_steps',
             'global_warmup', 'inner_loop_warmup', 'end_lr', 'reset_start',
             'cg_preconditioner', 'cg_damping_mu', 'cg_gn_jacobi_probes',
@@ -2664,3 +2678,4 @@ if __name__ == "__main__":
     print(jax.local_devices())
     print(jax.devices())
     mlxu.run(main)
+
