@@ -2,7 +2,10 @@
 import ast
 import copy
 import json
+import os
 import pickle
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -10,7 +13,7 @@ from unittest.mock import Mock
 import jax
 import jax.numpy as jnp
 from jax.experimental.pjit import pjit
-from jax.sharding import Mesh, PartitionSpec as PS
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
 import numpy as np
 import pytest
 from flax.training.train_state import TrainState
@@ -119,16 +122,20 @@ def warm_state(tx, count=7):
     return state
 
 
-def compiled_trainer(info):
+def trainer_namespace(info):
     class SoftmaxModel:
         def apply(self, params, inputs, **kwargs):
             return NS(logits=params['w'][inputs])
 
-    namespace = dict(jax=jax, jnp=jnp, PS=PS, JaxRNG=JaxRNG, model=SoftmaxModel(),
+    return dict(jax=jax, jnp=jnp, PS=PS, JaxRNG=JaxRNG, model=SoftmaxModel(),
         LLaMAConfigurator=NS(rng_keys=lambda: ('params', 'dropout', 'fcm')),
         with_sharding_constraint=with_sharding_constraint,
         cross_entropy_loss_and_accuracy=cross_entropy_loss_and_accuracy,
         global_norm=global_norm, optimizer_info=info, get_gpu_memory=lambda: [0])
+
+
+def compiled_trainer(info):
+    namespace = trainer_namespace(info)
     train = trainer_function('train_step', namespace)
     evaluate = trainer_function('eval_step', namespace)
     # Same donation contract as production, with replicated CPU state.
@@ -137,6 +144,75 @@ def compiled_trainer(info):
     evaluate = pjit(evaluate, in_shardings=(PS(), PS(), PS()),
                     out_shardings=(PS(), PS()), donate_argnums=(1,))
     return train, evaluate
+
+
+def test_four_cpu_devices_partitioned_probe_evaluation():
+    # A subprocess ensures device count is set before JAX initializes, even
+    # when the surrounding suite has already used a single CPU device.
+    env = dict(os.environ, JAX_PLATFORMS='cpu',
+               XLA_FLAGS='--xla_force_host_platform_device_count=4',
+               OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')
+    env['PYTHONPATH'] = str(ROOT)
+    result = subprocess.run([sys.executable, '-c',
+        "import runpy; runpy.run_path('tests/test_batch_transfer.py')['partitioned_eval_worker']()"],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'PARTITIONED_PROBE_EVAL_OK' in result.stdout
+
+
+def partitioned_eval_worker():
+    assert jax.device_count() >= 4
+    with Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('dp', 'fsdp')) as mesh:
+        tx, info = optimizer()
+        state = warm_state(tx)
+        state_partition = jax.tree.map(lambda _: PS(), state)
+        batch_partition = {name: PS(('dp', 'fsdp')) for name in batches()[0]}
+        namespace = trainer_namespace(info)
+        namespace.update(pjit=pjit, train_state_partition=state_partition,
+                         batch_partition=batch_partition, FLAGS=NS(batch_transfer_probe=True))
+        trainer_function('train_step', namespace)
+        trainer_function('eval_step', namespace)
+        # Compile the trainer's actual pjit declarations, including its input
+        # contracts. Copying the contracts here would conceal the regression.
+        declarations = {}
+        for name in ('sharded_train_step', 'sharded_eval_step'):
+            assignment = next(node for node in ast.walk(TREE) if isinstance(node, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == name
+                                      for target in node.targets))
+            declarations[name] = assignment
+            execute([assignment], namespace)
+        sharding = NamedSharding(mesh, PS(('dp', 'fsdp')))
+        pair = tuple(jax.tree.map(lambda x: jax.device_put(np.tile(x, (4, 1)), sharding), batch)
+                     for batch in batches())
+        for batch in pair:
+            for leaf in batch.values():
+                assert not leaf.is_fully_replicated
+                assert len(leaf.addressable_shards) == 4
+                assert {shard.data.shape for shard in leaf.addressable_shards} == {(2, 3)}
+                assert len({str(shard.index) for shard in leaf.addressable_shards}) == 4
+        before = np.asarray(state.params['w']).copy()
+        _, param_gathers = make_shard_and_gather_fns(state_partition.params)
+        _, batch_gathers = make_shard_and_gather_fns(batch_partition)
+        updated, _, result = probe.measure(state, jax.random.PRNGKey(31), *pair,
+            train_step=namespace['sharded_train_step'], eval_step=namespace['sharded_eval_step'],
+            param_gathers=param_gathers, batch_gathers=batch_gathers, seed=42)
+        after = np.asarray(updated.params['w'])
+        for role, batch in zip(('update', 'transfer'), pair):
+            host_batch = jax.device_get(batch)
+            for when, weights in (('before', before), ('after', after)):
+                assert result['metrics'][f'batch_transfer/loss_{role}_{when}'] == pytest.approx(
+                    numpy_loss_grad(weights, host_batch)[0], abs=2e-7)
+        assert result['optimizer_step_after'] == result['optimizer_step_before'] + 1
+        # Ordinary evaluation still receives replicated inputs with its PS()
+        # contract, on the same four-device mesh.
+        namespace['FLAGS'].batch_transfer_probe = False
+        execute([declarations['sharded_eval_step']], namespace)
+        replicated = jax.tree.map(lambda x: jax.device_put(x, NamedSharding(mesh, PS())),
+                                  jax.device_get(pair[0]))
+        _, metrics = namespace['sharded_eval_step'](updated.params, jax.random.PRNGKey(9), replicated)
+        assert float(metrics['eval_loss']) == pytest.approx(
+            numpy_loss_grad(after, jax.device_get(replicated))[0], abs=2e-7)
+    print('PARTITIONED_PROBE_EVAL_OK')
 
 
 def measure(state, rng, train, evaluate):

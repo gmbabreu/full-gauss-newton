@@ -340,7 +340,11 @@ def main(argv):
 
     sharded_eval_step = pjit(
         eval_step,
-        in_shardings=(train_state_partition.params, PS(), PS()),
+        in_shardings=(
+            train_state_partition.params,
+            PS(),
+            batch_partition if FLAGS.batch_transfer_probe else PS(),
+        ),
         out_shardings=(PS(), PS()),
         donate_argnums=(1,),
     )
