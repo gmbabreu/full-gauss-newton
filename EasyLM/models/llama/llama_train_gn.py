@@ -163,7 +163,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_lambda_batch_denominator=0.0,  # Positive: global solve sequences / denominator.
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
-    cg_n_micro=1,   # microbatches for CG G; 1 = no microbatching (default, backward-compatible)
+    cg_n_micro=1,   # microbatches for CG and iterative GN; 1 preserves the original path
 
     # Observational spectral diagnostics.  They run only at the requested
     # cadence and never alter the solve operator or effective lambda.
@@ -389,6 +389,27 @@ def weighted_microbatch_sum(batch, groups, contribution_fn, zero):
                 lambda acc, x: acc + (mb_size / batch_size) * x, carry, value)
         total = jax.lax.fori_loop(0, count, body, total)
     return total
+
+
+def iterative_gn_microbatch(batch, groups, params0, params, logits_fn,
+                            loss_fn, need_base):
+    """Accumulate a frozen GN quadratic before any optimizer transformation."""
+    direction = jax.tree.map(lambda p, p0: p - p0, params, params0)
+    zero = jax.tree.map(jnp.zeros_like, params0)
+
+    def contribution(mb):
+        logits, push = linearize(lambda p: logits_fn(p, mb), params0)
+        v = push(direction)
+        loss = lambda z: loss_fn(z, mb)
+        g, hv = jax.jvp(jax.grad(loss), (logits,), (v,))
+        pull = linear_transpose(push, params0)
+        residual = pull(g + hv)[0]
+        base = jax.lax.cond(need_base, lambda: pull(g)[0], lambda: zero)
+        value = loss(logits) + jnp.sum(g * v) + 0.5 * jnp.sum(v * hv)
+        return value, residual, base
+
+    return weighted_microbatch_sum(
+        batch, groups, contribution, (jnp.float32(0), zero, zero))
 
 
 def validate_cg_preconditioner(flags):
@@ -672,13 +693,15 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    if FLAGS.log_gn_quadratic or FLAGS.export_update_geometry:
+    if (FLAGS.log_gn_quadratic or FLAGS.export_update_geometry
+            or (FLAGS.gauss_newton and FLAGS.optimizer_type != "cg"
+                and FLAGS.cg_n_micro > 1)):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
         if any(float(getattr(llama_config, name, 0.0)) != 0.0
                for name in stochastic):
-            raise ValueError('GN quadratic logging/update geometry requires zero dropout and FCM')
+            raise ValueError('GN quadratic logging/update geometry/microbatching requires zero dropout and FCM')
     if (FLAGS.condition_log
             and FLAGS.optimizer_type in ('adamw', 'muon', 'sgd')):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
@@ -1007,7 +1030,23 @@ def main(argv):
 
             return (loss, 0), (grad_params, b_norm)
 
-        (loss, accuracy), (grads, b_norm) = value_and_gradient(params0, train_state.params, is_last_step)
+        if FLAGS.cg_n_micro == 1:
+            (loss, accuracy), (grads, b_norm) = value_and_gradient(params0, train_state.params, is_last_step)
+        else:
+            model_rngs = rng_generator(LLaMAConfigurator.rng_keys())
+            _, groups = microbatch_groups(
+                batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+            loss, grads, base = iterative_gn_microbatch(
+                batch, groups, params0, train_state.params,
+                lambda p, mb: model.apply(
+                    p, mb['input_tokens'], deterministic=False,
+                    rngs=model_rngs).logits,
+                lambda z, mb: cross_entropy_loss_and_accuracy_with_weight_decay(
+                    z, mb['target_tokens'], train_state.params, params0,
+                    mb['loss_masks'], weight_decay=wd)[0],
+                is_last_step)
+            accuracy = 0
+            b_norm = global_norm(base)
 
         try:
             perplexity = jnp.exp(loss)
@@ -1045,6 +1084,21 @@ def main(argv):
             return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks'])[0]
 
+        if FLAGS.cg_n_micro > 1:
+            model_rngs = rng_generator(LLaMAConfigurator.rng_keys())
+            _, groups = microbatch_groups(
+                batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+            _, residual, base = iterative_gn_microbatch(
+                batch, groups, params0, final_params,
+                lambda p, mb: model.apply(
+                    p, mb['input_tokens'], deterministic=False,
+                    rngs=model_rngs).logits,
+                lambda z, mb: cross_entropy_loss_and_accuracy(
+                    z, mb['target_tokens'], mb['loss_masks'])[0],
+                jnp.bool_(True))
+            direction = jax.tree.map(lambda p, p0: p - p0, final_params, params0)
+            gd = jax.tree.map(lambda r, g: r - g, residual, base)
+            return gn_quadratic_summary(direction, base, gd)
         return measure_gn_quadratic(logits_fn, logits_loss, params0, final_params)
 
     def loss_fn(params, batch, rng):
