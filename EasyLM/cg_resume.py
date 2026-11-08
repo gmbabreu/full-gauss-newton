@@ -141,6 +141,9 @@ def validate_flags(saved, current):
                     cg_gn_jacobi_probes=4)
     saved = {**defaults, **saved}
     current = {**defaults, **current}
+    # Normalize the shared flag to the legacy field for old checkpoint bundles.
+    for config in (saved, current):
+        config['cg_n_micro'] = config.pop('n_micro', 0) or config.get('cg_n_micro', 1)
     # Everything is trajectory-affecting unless explicitly operational/reporting.
     ignored = {'cg_resume_state', 'load_dataset_state', 'wandb_run_id', 'wandb_dir',
         'wandb_project', 'wandb_entity', 'output_dir', 'tmp_dir', 'experiment_id',

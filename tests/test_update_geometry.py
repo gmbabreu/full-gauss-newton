@@ -253,7 +253,7 @@ def test_actual_trainer_capture_one_raw_product_and_original_base(tmp_path):
             flags_dict[keyword.arg] = ast.literal_eval(keyword.value)
         except ValueError:
             flags_dict[keyword.arg] = {}
-    flags_dict.update(optimizer_type='adamw', cg_n_micro=1)
+    flags_dict.update(optimizer_type='adamw', n_micro=1)
     gathers = jax.tree.map(lambda _: lambda value: np.asarray(value), base)
     ns = dict(jax=jax, jnp=jnp, np=np, os=os, sp=subprocess, __file__=str(TRAINER),
               update_geometry=geometry, flatten_dict=flatten_dict,

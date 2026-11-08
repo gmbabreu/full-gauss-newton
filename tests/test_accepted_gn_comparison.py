@@ -57,7 +57,7 @@ class AcceptedGNComparisonTest(unittest.TestCase):
             normalize_step=False, outer_momentum_beta=0., outer_weight_decay=0.,
             single_batch_inner=True, inner_loop_iter=1, inner_loop_wd=0.,
             log_inner_steps=False, log_update_balance=False, weight_average=False,
-            linesearch=linesearch, gauss_newton=True, cg_n_micro=3,
+            linesearch=linesearch, gauss_newton=True, n_micro=3,
             cg_interpolation_lambda=1., cg_lambda_batch_denominator=0,
             cg_lambda_final=-1., fixed_step_size=fixed, armijo_linesearch=armijo,
             armijo_init_step=1., armijo_beta=.5, patience=1, ls_range=7,

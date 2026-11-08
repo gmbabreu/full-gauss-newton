@@ -163,7 +163,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     cg_lambda_batch_denominator=0.0,  # Positive: global solve sequences / denominator.
     cg_lambda_final=-1.0,
     cg_lambda_ramp_steps=0,
-    cg_n_micro=1,   # microbatches for CG and iterative GN; 1 preserves the original path
+    n_micro=0,  # Shared microbatch count; 0 inherits the legacy setting (default 1).
+    cg_n_micro=1,  # Deprecated compatibility setting; explicit n_micro takes precedence.
 
     # Observational spectral diagnostics.  They run only at the requested
     # cadence and never alter the solve operator or effective lambda.
@@ -490,6 +491,11 @@ def get_tpu_metrics():
 
 
 def main(argv):
+    if FLAGS.n_micro < 0 or FLAGS.cg_n_micro <= 0:
+        raise ValueError('n_micro must be nonnegative; cg_n_micro must be positive')
+    FLAGS.n_micro = FLAGS.n_micro or FLAGS.cg_n_micro
+    # Retain the effective legacy field for existing resume/export schemas.
+    FLAGS.cg_n_micro = FLAGS.n_micro
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.export_update_geometry:
@@ -695,7 +701,7 @@ def main(argv):
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
     if (FLAGS.log_gn_quadratic or FLAGS.export_update_geometry
             or (FLAGS.gauss_newton and FLAGS.optimizer_type != "cg"
-                and FLAGS.cg_n_micro > 1)):
+                and FLAGS.n_micro > 1)):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
                       'attention_dropout', 'residue_dropout', 'fcm_min_ratio',
                       'fcm_max_ratio')
@@ -1030,12 +1036,12 @@ def main(argv):
 
             return (loss, 0), (grad_params, b_norm)
 
-        if FLAGS.cg_n_micro == 1:
+        if FLAGS.n_micro == 1:
             (loss, accuracy), (grads, b_norm) = value_and_gradient(params0, train_state.params, is_last_step)
         else:
             model_rngs = rng_generator(LLaMAConfigurator.rng_keys())
             _, groups = microbatch_groups(
-                batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+                batch['input_tokens'].shape[0], FLAGS.n_micro, data_shards)
             loss, grads, base = iterative_gn_microbatch(
                 batch, groups, params0, train_state.params,
                 lambda p, mb: model.apply(
@@ -1084,10 +1090,10 @@ def main(argv):
             return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks'])[0]
 
-        if FLAGS.cg_n_micro > 1:
+        if FLAGS.n_micro > 1:
             model_rngs = rng_generator(LLaMAConfigurator.rng_keys())
             _, groups = microbatch_groups(
-                batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+                batch['input_tokens'].shape[0], FLAGS.n_micro, data_shards)
             _, residual, base = iterative_gn_microbatch(
                 batch, groups, params0, final_params,
                 lambda p, mb: model.apply(
@@ -1153,7 +1159,7 @@ def main(argv):
         # Partition by per-device rows. Unequal groups have distinct static slice
         # sizes, while every global slice remains evenly data-sharded.
         batch_size = batch_['input_tokens'].shape[0]
-        _, groups = microbatch_groups(batch_size, FLAGS.cg_n_micro, data_shards)
+        _, groups = microbatch_groups(batch_size, FLAGS.n_micro, data_shards)
 
         def gradient_contribution(mb):
             def f_mb(p):
@@ -1426,7 +1432,7 @@ def main(argv):
         """
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         _, groups = microbatch_groups(
-            batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+            batch['input_tokens'].shape[0], FLAGS.n_micro, data_shards)
 
         def contribution(mb):
             def logits_fn(params):
@@ -1576,7 +1582,7 @@ def main(argv):
                 tree, os.path.join(bundle_dir, filename), geometry_param_gathers,
                 writer=checkpointer.enable)
         _, groups = microbatch_groups(
-            solve_batch['input_tokens'].shape[0], FLAGS.cg_n_micro, data_shards)
+            solve_batch['input_tokens'].shape[0], FLAGS.n_micro, data_shards)
         try:
             commit = sp.check_output(
                 ['git', 'rev-parse', 'HEAD'], cwd=os.path.dirname(__file__),
@@ -1605,7 +1611,7 @@ def main(argv):
                 preconditioning=False, deterministic=True,
                 loss='cross_entropy_loss_and_accuracy_with_weight_decay; wd=0',
                 model_config=llama_config.to_dict(), compute_dtype=FLAGS.dtype,
-                parameter_dtype=FLAGS.param_dtype, cg_n_micro=FLAGS.cg_n_micro,
+                parameter_dtype=FLAGS.param_dtype, cg_n_micro=FLAGS.n_micro,
                 data_shards=data_shards, microbatch_groups=[list(group) for group in groups]),
             solver={key: solver_config[key] for key in solver_keys},
             iteration_budget=(FLAGS.cg_maxiter if FLAGS.optimizer_type == 'cg'
@@ -2093,7 +2099,7 @@ def main(argv):
                         updated_params = apply_outer_decay(base_params, updated_params)
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
+                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.n_micro)
                             accumulated_loss += loss
                         average_loss = float(jax.device_get(accumulated_loss / len(ls_batches)))
                         print(f"step={step_size:.6f}  loss={average_loss:.6f}")
@@ -2118,7 +2124,7 @@ def main(argv):
                         updated_params = apply_outer_decay(base_params, updated_params)
                         accumulated_loss = 0.0
                         for batch, subrng in zip(ls_batches, ls_rngs):
-                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.cg_n_micro)
+                            loss, _ = microbatched_loss_fn(updated_params, batch, subrng, FLAGS.n_micro)
                             accumulated_loss += loss
                         average_loss = accumulated_loss / len(ls_batches)
                         losses.append((step_size, average_loss))
@@ -2146,7 +2152,7 @@ def main(argv):
                     ls_rngs.append(subrng)
                 baseline_loss = 0.0
                 for batch, subrng in zip(ls_batches, ls_rngs):
-                    bl, _ = microbatched_loss_fn(base_params, batch, subrng, FLAGS.cg_n_micro)
+                    bl, _ = microbatched_loss_fn(base_params, batch, subrng, FLAGS.n_micro)
                     baseline_loss += bl
                 baseline_loss = float(jax.device_get(baseline_loss / len(ls_batches)))
                 return ls_batches, ls_rngs, sharded_rng, baseline_loss, False
@@ -2257,7 +2263,7 @@ def main(argv):
                     metrics.update(accepted_gn_comparison(
                         metrics, train_state.params, updated_params, batch,
                         gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
-                        FLAGS.cg_n_micro, losses=losses, baseline_loss=baseline_loss,
+                        FLAGS.n_micro, losses=losses, baseline_loss=baseline_loss,
                         ls_batches=ls_batches, ls_rngs=ls_rngs))
                 train_state = train_state.replace(step=train_state.step + 1, params=updated_params)
 
@@ -2478,7 +2484,7 @@ def main(argv):
                         metrics.update(accepted_gn_comparison(
                             metrics, train_state.params, updated_params, batch,
                             gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
-                            FLAGS.cg_n_micro, losses=losses, baseline_loss=baseline_loss,
+                            FLAGS.n_micro, losses=losses, baseline_loss=baseline_loss,
                             ls_batches=ls_batches, ls_rngs=ls_rngs))
                     train_state = train_state.replace(
                         step=train_state.step+1,
@@ -2509,7 +2515,7 @@ def main(argv):
                         metrics.update(accepted_gn_comparison(
                             metrics, train_state.params, updated_params, batch,
                             gn_quadratic_rng, effective_step_size, microbatched_loss_fn,
-                            FLAGS.cg_n_micro))
+                            FLAGS.n_micro))
                     train_state = train_state.replace(
                         step=train_state.step+1,
                         opt_state=inner_state.opt_state,
@@ -2571,14 +2577,14 @@ def main(argv):
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
                 n_actual, groups = microbatch_groups(
-                    actual_solve_batch_size, FLAGS.cg_n_micro, data_shards)
+                    actual_solve_batch_size, FLAGS.n_micro, data_shards)
                 local_sizes = [mb_size // data_shards
                                for _, count, mb_size in groups for _ in range(count)]
                 defer_wandb({
                     'cg_damping_mu': cg_metrics['cg_damping_mu'],
                     'cg_gn_jacobi_probes': cg_metrics['cg_gn_jacobi_probes'],
                     'cg_gn_jacobi_gvp_count': cg_metrics['cg_gn_jacobi_gvp_count'],
-                    'cg_n_micro_requested': FLAGS.cg_n_micro,
+                    'cg_n_micro_requested': FLAGS.n_micro,
                     'cg_n_micro': n_actual,
                     'cg_microbatch_per_device_min': min(local_sizes),
                     'cg_microbatch_per_device_max': max(local_sizes),

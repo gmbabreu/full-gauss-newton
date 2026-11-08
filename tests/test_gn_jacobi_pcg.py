@@ -31,7 +31,7 @@ def flags(**changes):
                 cg_gn_jacobi_probes=4, optimizer_type='cg',
                 cg_interpolation_lambda=1., cg_lambda_batch_denominator=0.,
                 cg_lambda_final=-1., cg_lambda_ramp_steps=0, condition_log=False,
-                cg_n_micro=3, cg_tol=1e-6, cg_atol=0., cg_maxiter=30,
+                n_micro=3, cg_tol=1e-6, cg_atol=0., cg_maxiter=30,
                 log_gn_quadratic=True, log_freq=1,
                 optimizer=NS(adamw_optimizer=NS(b1=0., b2=.9, weight_decay=.2)))
     result.__dict__.update(changes)
@@ -109,7 +109,7 @@ class TrainerSolveTest(unittest.TestCase):
     def test_dense_system_microbatch_damping_and_raw_metrics(self):
         for micro in (1, 2, 3, 5, 9):
             with self.subTest(micro=micro):
-                result, captured = self.solve(flags(cg_n_micro=micro), inspect=True)
+                result, captured = self.solve(flags(n_micro=micro), inspect=True)
                 self.assertEqual(captured['estimates'], 1)
                 expected_A = self.G + .35 * np.eye(2)
                 np.testing.assert_allclose(captured['A'], expected_A, atol=2e-7)

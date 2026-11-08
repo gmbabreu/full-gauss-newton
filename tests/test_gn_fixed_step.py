@@ -38,7 +38,7 @@ class GNFixedStepTest(unittest.TestCase):
         namespace = dict(
             jax=jax, train_state=before, inner_state=solved, step=7,
             FLAGS=SimpleNamespace(fixed_step_size=fixed, outer_weight_decay=decay,
-                                  log_update_balance=False, cg_n_micro=1),
+                                  log_update_balance=False, n_micro=1),
             do_accepted_gn=True, metrics={}, accepted_gn_comparison=comparison,
             batch=object(), gn_quadratic_rng=object(), microbatched_loss_fn=object())
         mask = next(n for n in ast.walk(TREE) if isinstance(n, ast.Assign)
