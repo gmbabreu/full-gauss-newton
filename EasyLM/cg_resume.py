@@ -138,7 +138,7 @@ def newest(directory):
 def validate_flags(saved, current):
     # Missing fields in old bundles denote the legacy solver, on either side.
     defaults = dict(cg_preconditioner='adam_diag', cg_damping_mu=0.0,
-                    cg_gn_jacobi_probes=4)
+                    cg_gn_jacobi_probes=4, lr_schedule_steps=0)
     saved = {**defaults, **saved}
     current = {**defaults, **current}
     # Normalize the shared flag to the legacy field for old checkpoint bundles.

@@ -62,6 +62,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     dtype='fp32',
     param_dtype='fp32',
     total_steps=10000,
+    lr_schedule_steps=0,  # Outer-step horizon; 0 inherits total_steps.
     load_llama_config='',
     update_llama_config='',
     load_checkpoint='',
@@ -496,6 +497,8 @@ def main(argv):
     FLAGS.n_micro = FLAGS.n_micro or FLAGS.cg_n_micro
     # Retain the effective legacy field for existing resume/export schemas.
     FLAGS.cg_n_micro = FLAGS.n_micro
+    if FLAGS.lr_schedule_steps < 0:
+        raise ValueError("lr_schedule_steps must be nonnegative")
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
 
     if FLAGS.export_update_geometry:
@@ -928,7 +931,7 @@ def main(argv):
     _, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
     # Use the exact same learning-rate schedule as the regular AdamW path.
     adamw_lr_schedule = optimizer_info['learning_rate_schedule']
-    lr_sched = get_global_lr_sched(FLAGS.lr_sched, FLAGS.inner_loop_lr, FLAGS.total_steps, FLAGS.inner_loop_iter, FLAGS.global_warmup, FLAGS.inner_loop_warmup, FLAGS.end_lr)
+    lr_sched = get_global_lr_sched(FLAGS.lr_sched, FLAGS.inner_loop_lr, FLAGS.lr_schedule_steps or FLAGS.total_steps, FLAGS.inner_loop_iter, FLAGS.global_warmup, FLAGS.inner_loop_warmup, FLAGS.end_lr)
     tayl_solver = build_optimizer(lr_sched, FLAGS.inner_b1, FLAGS.inner_b2, FLAGS.inner_clip_gradient, FLAGS.optimizer_wd, FLAGS.optimizer_type)
 
     # optimizer, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
