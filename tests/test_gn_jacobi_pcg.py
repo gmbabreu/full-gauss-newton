@@ -13,6 +13,7 @@ import numpy as np
 
 from EasyLM import cg_resume
 from EasyLM.pcg import estimate_gn_diagonal, gn_jacobi_preconditioner
+from EasyLM.minres_qlp import minres_qlp
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / 'EasyLM/models/llama/llama_train_gn.py'
@@ -59,6 +60,8 @@ class TrainerSolveTest(unittest.TestCase):
     def solve(self, config=None, *, lr=.03, moments=1., warm=None, inspect=False, compiled=False):
         config = config or flags()
         ns = dict(jax=jax, jnp=jnp, FLAGS=config, data_shards=1,
+                  minres_qlp=minres_qlp,
+                  tree_dot=lambda a, b: sum(jnp.vdot(x, y) for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b))),
                   with_sharding_constraint=lambda x, spec: x, PS=lambda *args: None,
                   linearize=jax.linearize, linear_transpose=jax.linear_transpose,
                   adamw_lr_schedule=lambda step: jnp.float32(lr), global_norm=norm,

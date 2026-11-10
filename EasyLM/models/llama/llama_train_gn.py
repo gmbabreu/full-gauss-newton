@@ -35,6 +35,7 @@ from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM.pcg import estimate_gn_diagonal, gn_jacobi_preconditioner
 from EasyLM import cg_resume
+from EasyLM.minres_qlp import minres_qlp, STOP_REASONS as QLP_STOP_REASONS
 from EasyLM import update_geometry
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
@@ -154,6 +155,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
     patience=1,
 
+    cg_solver='cg',  # Legacy CG or undamped minres_qlp.
+    cg_plain_gn=False,
+    cg_qlp_rank_rtol=0.0,  # 0 selects 32 * working dtype epsilon.
     cg_preconditioner='adam_diag',
     cg_damping_mu=0.0,
     cg_gn_jacobi_probes=4,
@@ -414,8 +418,59 @@ def iterative_gn_microbatch(batch, groups, params0, params, logits_fn,
         batch, groups, contribution, (jnp.float32(0), zero, zero))
 
 
+def validate_cg_solver(flags):
+    """Validate the opt-in undamped route before distributed initialization."""
+    if flags.cg_solver not in ('cg', 'minres_qlp'):
+        raise ValueError('cg_solver must be cg or minres_qlp')
+    rank = flags.cg_qlp_rank_rtol
+    if not math.isfinite(rank) or not 0 <= rank < 1:
+        raise ValueError('cg_qlp_rank_rtol must be 0 (automatic) or in (0, 1)')
+    if flags.optimizer_type == 'cg' and (
+            not isinstance(flags.cg_maxiter, numbers.Integral) or flags.cg_maxiter < 0
+            or not math.isfinite(flags.cg_tol) or flags.cg_tol < 0
+            or not math.isfinite(flags.cg_atol) or flags.cg_atol < 0):
+        raise ValueError('CG tolerances and iteration limit must be finite and nonnegative')
+    if flags.cg_solver == 'cg':
+        if flags.cg_plain_gn:
+            raise ValueError('cg_plain_gn requires cg_solver=minres_qlp')
+        return
+    if flags.optimizer_type != 'cg' or not flags.cg_plain_gn:
+        raise ValueError('MINRES-QLP requires optimizer_type=cg and cg_plain_gn=True')
+    if flags.cg_preconditioner != 'none' or flags.cg_damping_mu != 0:
+        raise ValueError('MINRES-QLP requires no preconditioner and zero damping')
+    if (flags.cg_interpolation_lambda != 1 or flags.cg_lambda_batch_denominator != 0
+            or flags.cg_lambda_final != -1 or flags.cg_lambda_ramp_steps != 0):
+        raise ValueError('MINRES-QLP requires fixed lambda=1 and disabled schedules')
+    if flags.normalize_step or flags.outer_momentum_beta != 0:
+        raise ValueError('MINRES-QLP forbids direction normalization and outer momentum')
+
+
+def plain_gn_linesearch_scale(base_params, direction, proposed_scale, losses,
+                              baseline_loss, direction_valid, evaluate_loss):
+    """Reuse the earlier MINRES guard, including actual fixed-step validation."""
+    scale = float(jax.device_get(proposed_scale))
+    if (not bool(jax.device_get(direction_valid)) or not np.isfinite(scale)
+            or scale <= 0 or not np.isfinite(baseline_loss)):
+        return 0.0
+    candidate = jax.tree.map(lambda p, d: p + scale * d, base_params, direction)
+    finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
+                               for x in jax.tree.leaves((direction, candidate))]))
+    if not bool(jax.device_get(finite)):
+        return 0.0
+    candidate_loss = next((loss for step, loss in losses
+                           if float(jax.device_get(step)) == scale), None)
+    if candidate_loss is None:
+        candidate_loss = evaluate_loss(candidate)
+    candidate_loss = float(jax.device_get(candidate_loss))
+    return scale if np.isfinite(candidate_loss) and candidate_loss < baseline_loss else 0.0
+
+
 def validate_cg_preconditioner(flags):
     """Reject combinations outside the fixed damped GN Jacobi system."""
+    if getattr(flags, 'cg_solver', 'cg') == 'minres_qlp':
+        if flags.cg_preconditioner != 'none':
+            raise ValueError('MINRES-QLP requires cg_preconditioner=none')
+        return
     if flags.cg_preconditioner not in ('adam_diag', 'gn_jacobi'):
         raise ValueError('cg_preconditioner must be adam_diag or gn_jacobi')
     if not math.isfinite(flags.cg_damping_mu) or flags.cg_damping_mu < 0:
@@ -497,6 +552,7 @@ def main(argv):
     FLAGS.n_micro = FLAGS.n_micro or FLAGS.cg_n_micro
     # Retain the effective legacy field for existing resume/export schemas.
     FLAGS.cg_n_micro = FLAGS.n_micro
+    validate_cg_solver(FLAGS)
     if FLAGS.schedule_steps < 0:
         raise ValueError("schedule_steps must be nonnegative")
     schedule_steps = FLAGS.schedule_steps or FLAGS.total_steps
@@ -1182,6 +1238,71 @@ def main(argv):
             batch_, groups, gradient_contribution,
             jax.tree.map(jnp.zeros_like, params0))
 
+        def apply_G(v):
+            """Apply the weighted full-batch Gauss--Newton operator."""
+            def curvature_contribution(mb):
+                def f_mb(p):
+                    return model.apply(p, mb['input_tokens'], deterministic=True).logits
+
+                def scalar_loss_mb(logits):
+                    return cross_entropy_loss_and_accuracy_with_weight_decay(
+                        logits, mb['target_tokens'], params0, params0,
+                        mb['loss_masks'], weight_decay=wd)[0]
+
+                logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
+                grad_loss = jax.grad(scalar_loss_mb)
+                jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
+                logits_v_mb = jvp_fn_mb(v)
+                _, hv_mb = jax.jvp(grad_loss, (logits0_mb,), (logits_v_mb,))
+                return jt_fn_mb(hv_mb)[0]
+
+            return weighted_microbatch_sum(
+                batch_, groups, curvature_contribution,
+                jax.tree.map(jnp.zeros_like, params0))
+
+        if getattr(FLAGS, 'cg_plain_gn', False):
+            rhs = jax.tree.map(lambda g: -g, b_param)
+            direction, info = minres_qlp(
+                apply_G, rhs, tol=FLAGS.cg_tol, atol=FLAGS.cg_atol,
+                maxiter=FLAGS.cg_maxiter,
+                rank_rtol=FLAGS.cg_qlp_rank_rtol or None)
+            gradient_dot_direction = tree_dot(b_param, direction)
+            nonzero = jnp.any(jnp.stack([jnp.any(d != 0)
+                                        for d in jax.tree.leaves(direction)]))
+            candidate = jax.tree.map(lambda p, d: p + d, params0, direction)
+            finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
+                                       for x in jax.tree.leaves((direction, candidate))]))
+            direction_valid = (finite & (info['status'] != 4)
+                               & jnp.isfinite(gradient_dot_direction)
+                               & (~nonzero | (gradient_dot_direction < 0)))
+            new_params = jax.tree.map(lambda p, q: jnp.where(direction_valid, q, p),
+                                      params0, candidate)
+            metrics = dict(
+                cg_direction_valid=direction_valid,
+                cg_gradient_dot_direction=gradient_dot_direction,
+                param_norm=global_norm(new_params), b_norm=global_norm(rhs),
+                relative_residual=info['relative_residual'],
+                cg_true_residual=info['true_residual_norm'],
+                cg_direction_norm=info['direction_norm'],
+                cg_damping_mu=jnp.float32(0), cg_gn_jacobi_probes=jnp.int32(0),
+                cg_gn_jacobi_gvp_count=jnp.int32(0),
+                **{f'qlp/{key}': value for key, value in info.items()})
+            diagnostic_count = jnp.int32(0)
+            if FLAGS.log_gn_quadratic:
+                def measure_candidate():
+                    d = jax.tree.map(lambda p, p0: p - p0, new_params, params0)
+                    return gn_quadratic_summary(d, b_param, apply_G(d))
+                diagnostic_count = jnp.asarray(outer_step % FLAGS.log_freq == 0, jnp.int32)
+                metrics.update(jax.lax.cond(
+                    outer_step % FLAGS.log_freq == 0, measure_candidate,
+                    lambda: {f'gn_quad/{name}': jnp.float32(jnp.nan) for name in (
+                        'g_dot_d', 'd_G_d', 'loss_improvement',
+                        'optimal_scaled_loss_improvement', 'final_relative_residual')}))
+            metrics['qlp/total_matvec_count'] = info['matvec_count'] + diagnostic_count
+            # Legacy checkpoint slots remain inert, and the outer counter advances.
+            return (new_params, first_moment, second_moment, cg_x0,
+                    adam_step + 1, rng_generator(), metrics)
+
         # ── Adam EMA updates ──────────────────────────────────────────
         #
         # Both moments are updated once per outer step  using the full-batch gradient b_param
@@ -1259,28 +1380,6 @@ def main(argv):
                 tree,
                 new_second_moment,
             )
-
-        def apply_G(v):
-            """Apply the weighted full-batch Gauss--Newton operator."""
-            def curvature_contribution(mb):
-                def f_mb(p):
-                    return model.apply(p, mb['input_tokens'], deterministic=True).logits
-
-                def scalar_loss_mb(logits):
-                    return cross_entropy_loss_and_accuracy_with_weight_decay(
-                        logits, mb['target_tokens'], params0, params0,
-                        mb['loss_masks'], weight_decay=wd)[0]
-
-                logits0_mb, jvp_fn_mb = linearize(f_mb, params0)
-                grad_loss = jax.grad(scalar_loss_mb)
-                jt_fn_mb = linear_transpose(jvp_fn_mb, params0)
-                logits_v_mb = jvp_fn_mb(v)
-                _, hv_mb = jax.jvp(grad_loss, (logits0_mb,), (logits_v_mb,))
-                return jt_fn_mb(hv_mb)[0]
-
-            return weighted_microbatch_sum(
-                batch_, groups, curvature_contribution,
-                jax.tree.map(jnp.zeros_like, params0))
 
         # ── CG operator Av ────────────────────────────────
         # Av(v) computes A_t(v) = λ G v + (1-λ)/η D_t v.
@@ -1598,6 +1697,7 @@ def main(argv):
             'inner_loop_wd', 'inner_sgd_momentum', 'inner_b1', 'inner_b2',
             'inner_clip_gradient', 'optimizer_wd', 'lr_sched', 'total_steps',
             'global_warmup', 'inner_loop_warmup', 'end_lr', 'reset_start',
+            'cg_solver', 'cg_plain_gn', 'cg_qlp_rank_rtol',
             'cg_preconditioner', 'cg_damping_mu', 'cg_gn_jacobi_probes',
             'cg_tol', 'cg_atol', 'cg_maxiter', 'cg_interpolation_lambda',
             'cg_lambda_batch_denominator', 'cg_lambda_final', 'cg_lambda_ramp_steps',
@@ -2243,6 +2343,23 @@ def main(argv):
 
                 step_size, losses = run_linesearch(train_state.params, dir, ls_batches, ls_rngs)
                 effective_step_size = FLAGS.fixed_step_size if FLAGS.fixed_step_size > 0.0 else step_size
+                if getattr(FLAGS, 'cg_plain_gn', False):
+                    def evaluate_plain_candidate(candidate):
+                        total = 0.0
+                        for ls_batch, ls_rng in zip(ls_batches, ls_rngs):
+                            loss, _ = microbatched_loss_fn(
+                                candidate, ls_batch, ls_rng, FLAGS.n_micro)
+                            total += loss
+                        return total / len(ls_batches)
+
+                    effective_step_size = plain_gn_linesearch_scale(
+                        train_state.params, dir, effective_step_size, losses,
+                        baseline_loss, cg_metrics['cg_direction_valid'],
+                        evaluate_plain_candidate)
+                    cg_metrics['cg_step_rejected'] = effective_step_size == 0.0
+                    cg_metrics['cg_accepted_scale'] = effective_step_size
+                    if effective_step_size == 0.0:
+                        dir = jax.tree.map(jnp.zeros_like, dir)
                 print("Step size:", effective_step_size)
 
                 if FLAGS.outer_momentum_beta > 0.0:
@@ -2559,7 +2676,7 @@ def main(argv):
             del live_results
             if do_condition:
                 condition_kwargs = {}
-                if FLAGS.optimizer_type == 'cg':
+                if FLAGS.optimizer_type == 'cg' and not FLAGS.cg_plain_gn:
                     beta2_correction = 1.0 - FLAGS.optimizer.adamw_optimizer.b2 ** int(
                         jax.device_get(cg_adam_step))
                     condition_kwargs = dict(
@@ -2592,9 +2709,15 @@ def main(argv):
                     'cg_n_micro': n_actual,
                     'cg_microbatch_per_device_min': min(local_sizes),
                     'cg_microbatch_per_device_max': max(local_sizes),
-                    'cg_lambda_scheduled': cg_metrics['cg_lambda_scheduled'],
-                    'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
-                    'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
+                    **({
+                        **{key: value for key, value in cg_metrics.items()
+                           if key.startswith(('qlp/', 'cg_'))},
+                        'qlp/status_name': QLP_STOP_REASONS[int(jax.device_get(cg_metrics['qlp/status']))],
+                    } if FLAGS.cg_plain_gn else {
+                        'cg_lambda_scheduled': cg_metrics['cg_lambda_scheduled'],
+                        'cg_lambda_effective': cg_metrics['cg_lambda_effective'],
+                        'adamw_learning_rate': cg_metrics['adamw_learning_rate'],
+                    }),
                     **({'cg_relative_damping': (
                         None if scheduled_lambda == 0.0
                         else cg_metrics['cg_relative_damping'])}
