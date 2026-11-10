@@ -14,16 +14,14 @@ from tpu_control import Controller
 
 # id, batch, peak inner LR, microbatch count
 TRIALS = [(i, b, lr, micro) for i, (b, lr, micro) in enumerate([
-    (720, .001, 1), (720, .003, 1),
-    (256, .001, 1), (256, .003, 1),
-    (1024, .001, 2), (1024, .003, 2),
-    (2048, .001, 4), (2048, .003, 4),
-    (64, .001, 1), (64, .003, 1),
-])]
+    (720,.0005,1), (720,.002,1), (256,.0005,1), (256,.001,1),
+    (2048,.004,4), (720,.004,1), (1024,.002,2), (1024,.001,2),
+    (2048,.001,4), (2048,.002,4), (128,.0005,1), (128,.001,1),
+], start=1)]
 
 
 def build_plan(trial, tokens, schedule_tokens):
-    _, batch, lr, micro = TRIALS[trial]
+    _, batch, lr, micro = TRIALS[trial - 1]
     unit = batch * 1024
     steps = tokens // unit
     horizon = (schedule_tokens + unit - 1) // unit
@@ -45,7 +43,7 @@ def build_plan(trial, tokens, schedule_tokens):
         log_inner_steps=False, condition_log=False, log_gn_quadratic=False,
         log_update_balance=False, save_model_freq=0, save_milestone_freq=0,
         train_batch_growth_interval=0, fixed_step_size=0,
-        notes=f'GN_Adam_trial{trial}_B{batch}_lr{lr:g}_K50_wd0.001_T{steps*unit}_H{schedule_tokens}')
+        notes=f'GN_Adam_trial{trial}_B{batch}_lr{lr:g}_K50_wd0.001')
     flags['checkpointer.save_optimizer_state'] = False
     return make_plan('gn_adam', [f'--{k}={v}' for k, v in flags.items()])
 
@@ -81,15 +79,15 @@ def main():
     p.add_argument('action', choices=['preview', 'run'])
     p.add_argument('--target', choices=['1', '2'], default='1')
     p.add_argument('--trials', default=','.join(str(t[0]) for t in TRIALS))
-    p.add_argument('--tokens', type=int, default=299000000, help='Solve-token cap per trial')
+    p.add_argument('--tokens', type=int, default=150000000, help='Solve-token cap per trial')
     p.add_argument('--schedule-tokens', type=int, default=1000000000, help='Solve-token cosine horizon')
     p.add_argument('--poll', type=int, default=60)
     p.add_argument('--max-hours', type=float, default=72, help='Timeout per trial; stops queue, leaves training for inspection')
     p.add_argument('--json', action='store_true', help='Print complete resolved plans in preview')
     a = p.parse_args()
     ids = [int(x) for x in a.trials.split(',')]
-    if not ids or len(set(ids)) != len(ids) or any(i not in range(len(TRIALS)) for i in ids):
-        p.error('Choose unique trial IDs 0 through 9')
+    if not ids or len(set(ids)) != len(ids) or any(i not in range(1, len(TRIALS)+1) for i in ids):
+        p.error('Choose unique trial IDs 1 through 12')
     if a.poll < 5 or a.max_hours <= 0:
         p.error('Invalid polling interval or timeout')
     plans = [(i, build_plan(i, a.tokens, a.schedule_tokens)) for i in ids]

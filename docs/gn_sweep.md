@@ -7,7 +7,9 @@ TPU1 is the default; do not stop or update TPU2's independent Adam queue.
     python3 scripts/gn_sweep_queue.py preview --target 1 --json
     python3 -u scripts/gn_sweep_queue.py run --target 1 --tokens 299000000 --schedule-tokens 1000000000
 
-Ten trials: B720/256/1024/2048/64, each with peak inner LR .001/.003.
+Twelve trials, numbered1–12: B128/256/720/1024/2048; inner LR .0005/.001/.002/.004.
+TPU1: --trials1,3,7,9,5,11; TPU2: --trials2,4,8,10,6,12 (use spaces after --trials).
+Default solve-token cap150M; schedule horizon1B. Run names omit token budgets.
 FP32 computation/parameters, K50, b1 .9, b2 .999, optimizer_wd .001,
 inner_loop_wd .01, global cosine to zero, no warmup, n_micro1/1/2/4/1.
 Uses the shared warmup parameter checkpoint and preset C4 data settings.
