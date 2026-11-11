@@ -131,10 +131,10 @@ class QueueTests(unittest.TestCase):
         spec = json.loads(path.read_text())
         plan = queue.make_queue_plan(spec, queue_id='adam-controlled')
         expected = [(128,.01,.95,0), (128,.015,.95,0),
-                    (64,.015,.95,0), (192,.01,.95,0),
-                    (256,.015,.95,0), (128,.01,.99,0),
-                    (128,.01,.95,.001), (128,.01,.95,.01),
-                    (128,.02,.95,0), (128,.01,.98,0)]
+                    (128,.02,.95,0), (64,.015,.95,0),
+                    (192,.01,.95,0), (256,.015,.95,0),
+                    (128,.01,.98,0), (128,.01,.99,0),
+                    (128,.01,.95,.001), (128,.01,.95,.01)]
         self.assertEqual(len(plan['trials']), len(expected))
         run_ids = set()
         for item, (b, lr, b2, wd) in zip(plan['trials'], expected):
