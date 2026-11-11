@@ -22,6 +22,11 @@ TRIALS = [(i, b, lr, micro) for i, (b, lr, micro) in enumerate([
 
 def build_plan(trial, tokens, schedule_tokens):
     _, batch, lr, micro = TRIALS[trial - 1]
+    return build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens)
+
+
+def build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens):
+    """Build a scientific-equivalent plan for any ordered queue entry."""
     unit = batch * 1024
     steps = tokens // unit
     horizon = (schedule_tokens + unit - 1) // unit
