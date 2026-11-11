@@ -83,7 +83,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss):
     horizon = (schedule_tokens + unit - 1) // unit
     warmup = max(1, math.ceil(.01 * horizon))
     # Target checks happen on validation; use the same cadence on every run.
-    cadence = max(1, math.ceil(20_000_000 / unit))
+    cadence = max(1, min(steps, math.ceil(20_000_000 / unit)))
     flags = {
         'mesh_dim': '16,1,1', 'dtype': 'fp32', 'param_dtype': 'fp32',
         'seed': 42, 'train_dataset_batch_size': batch,
