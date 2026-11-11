@@ -364,6 +364,25 @@ The ordered default screening configuration is
 follow-up**, including K25/K100 and per-trial 75M/150M/200M solve-token
 budgets, is `scripts/sweeps/gn_batch_k_followup.json`.
 
+Before the expensive six-trial follow-up, run the minimal **two-trial
+integration smoke test** in `scripts/sweeps/gn_resident_smoke.json`:
+each B256 trial performs one outer update, first K1 then K2. This verifies
+real TPU worker initialization, GCS ready/result synchronization, W&B,
+and automatic progression after a completed trial. It **does not**
+benchmark the scientific value of these K settings.
+
+```bash
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json
+bash scripts/tpu.sh 1 logs 0
+bash scripts/tpu.sh 1 status
+```
+
+Do not start the full queue until all workers have returned successful
+exit statuses and the worker0 log says `ALL TRIALS COMPLETE`.
+On failure, inspect `logs` and the managed worker manifests;
+**do not assume CPU-only CI proves GCS permissions or live JAX initialization**.
+
 For the follow-up run, use:
 
 ```bash
