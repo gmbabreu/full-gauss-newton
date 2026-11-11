@@ -163,7 +163,7 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
             self.assertEqual(int(f['n_micro']), micro)
             self.assertEqual(float(f['inner_loop_lr']), lr)
-            self.assertEqual(f['inner_loop_iter'], 50)
+            self.assertEqual(int(f['inner_loop_iter']), 50)
 
 
 if __name__ == '__main__':
