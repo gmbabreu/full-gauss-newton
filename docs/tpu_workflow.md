@@ -471,3 +471,75 @@ preemption, missing TPU-local GCS credentials, lost HF/W&B connectivity, or a
 GN training crash. Workers time out rather than hanging forever. No intermediate
 GN optimizer/data checkpoints are introduced; interrupted individual trials
 are not automatically resumable.
+
+## TPU2 AdamW target-loss queue (separate feature branch)
+
+Branch `codex/tpu-resident-adamw-sweep` adds the `adam` route to the same
+TPU-local synchronized queue runner, without changing the GN route. The ordered
+`scripts/sweeps/adamw_followup.json` contains ten B64/B128/B192/B256 runs
+testing peak LR, second-moment beta2, and weight decay. All runs use the
+150M warmup checkpoint, FP32, seed 42, a **1.2B-token cap**, a **2B-token
+cosine schedule horizon**, 1% schedule warmup, and target validation loss
+`3.25`. Each run starts from the common checkpoint with fresh Adam moments,
+not the preceding run. Short W&B notes look like
+`Adam_B128_lr0.01_b20.95_wd0`; token budgets and seeds remain in structured
+run configuration, not notes.
+
+The trainer already supports `--target_loss` and evaluates it *after* validation
+batches, not continuously. A run reaching the target exits normally; a run
+that does not reach it completes its token cap. Plan for up to 10 full
+runs; **the intended ~20-hour window is not a runtime guarantee** and
+does not automatically stop the overall queue at 20 hours. The per-trial
+resident timeout remains in place.
+
+### Keep TPU1 unchanged
+
+Do not switch the existing `~/Desktop/full-gauss-newton` checkout if it is
+being used to monitor TPU1 GN. On box248, create a **separate** Git worktree for
+the TPU2 controller, using the feature branch at one exact commit:
+
+```bash
+cd ~/Desktop/full-gauss-newton
+git fetch origin
+git worktree add --track -b codex/tpu-resident-adamw-sweep \
+  ~/Desktop/full-gauss-newton-adamw origin/codex/tpu-resident-adamw-sweep
+cd ~/Desktop/full-gauss-newton-adamw
+git rev-parse HEAD
+git status --short
+```
+
+If that branch/worktree already exists, inspect it and fast-forward it rather
+than deleting or resetting. **Check `bash scripts/tpu.sh 2 status` first**.
+Do not touch an active TPU2 MINRES-QLP run. Only after TPU2 is confirmed fully
+idle/clean, operator manually fetches and switches **all** TPU2 workers
+`gn-v4-32-2` (0,1,2,3), with project `fast-second-order`, zone
+`us-central2-b`, and worker repo `/full-gauss-newton`. The old helper
+fingerprint switch restriction applies, so use explicit read-only checks,
+then `git fetch` and `git switch --track`, `git merge --ff-only`.
+Verify every worker is on the *same named branch and commit* as the box248
+TPU2 controller and all are idle. **Never** reset/stash/force a worker or
+change TPU1.
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json
+bash scripts/tpu.sh 2 status
+bash scripts/tpu.sh 2 logs 0
+```
+
+The queue is TPU-resident after initial launch; existing stop is immediate
+and cancels the current trial:
+
+```bash
+bash scripts/tpu.sh 2 stop
+```
+
+Before running the full Adam queue, if TPU2 has not run resident-queue
+coordination before, use the already committed short
+`scripts/sweeps/gn_resident_smoke.json` to validate GCS synchronization on
+TPU2 (not a GN scientific experiment). Verify successful exit status 0 on all
+workers and no managed training processes before starting the Adam queue.
+
+Do not merge this branch or start TPU experiments as part of implementation
+or CI. The operator controls TPU2 deployment and run start.
