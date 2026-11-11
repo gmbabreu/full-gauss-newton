@@ -106,6 +106,79 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(f['load_checkpoint'], 'trainstate_params::gs://gfn-soo/checkpoints/warmup_150m/1_0/streaming_train_state')
         self.assertEqual(len({t['plan']['run_id'] for t in plan['trials']}), len(expectation))
 
+    def test_adam_spec_strict_validation(self):
+        p = {'preset': 'adam', 'default_solve_tokens': 1200000000,
+             'schedule_tokens': 2000000000, 'target_loss': 3.25,
+             'trials': [{'name': 'Adam_B128', 'batch': 128, 'lr': .01,
+                         'b2': .95, 'weight_decay': 0}]}
+        queue.parse_spec(p)
+        invalid = [
+            {'batch': 0}, {'batch': 127}, {'lr': float('nan')},
+            {'lr': 0}, {'b2': 1}, {'b2': 0}, {'weight_decay': -1},
+            {'name': '../escape'}, {'solve_tokens': 100}
+        ]
+        for patch in invalid:
+            bad = dict(p, trials=[dict(p['trials'][0], **patch)])
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                queue.parse_spec(bad)
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            queue.parse_spec(dict(p, trials=p['trials'] * 2))
+        with self.assertRaisesRegex(ValueError, 'target_loss'):
+            queue.parse_spec(dict(p, target_loss=float('nan')))
+
+    def test_adam_followup_real_config_and_short_notes(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup.json'
+        spec = json.loads(path.read_text())
+        plan = queue.make_queue_plan(spec, queue_id='adam-controlled')
+        expected = [(128,.01,.95,0), (128,.015,.95,0),
+                    (64,.015,.95,0), (192,.01,.95,0),
+                    (256,.015,.95,0), (128,.01,.99,0),
+                    (128,.01,.95,.001), (128,.01,.95,.01)]
+        self.assertEqual(len(plan['trials']), len(expected))
+        run_ids = set()
+        for item, (b, lr, b2, wd) in zip(plan['trials'], expected):
+            p = item['plan']
+            f = p['flags']
+            self.assertEqual(p['preset'], 'adam')
+            self.assertEqual(p['route'], 'direct')
+            self.assertEqual(p['program'], 'EasyLM.models.llama.llama_train')
+            self.assertEqual(int(f['train_dataset_batch_size']), b)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
+            self.assertEqual(int(f['total_steps']), 1200000000 // (b*1024))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             -(-2000000000 // (b*1024)))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             max(1, __import__('math').ceil(.01 * (-(-2000000000 // (b*1024))))))
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.b2']), b2)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.1)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+            self.assertEqual(f['optimizer.adamw_optimizer.lr_sched'], 'cosine')
+            self.assertEqual(float(f['target_loss']), 3.25)
+            self.assertEqual(int(f['eval_steps']), 50)
+            self.assertEqual(int(f['optimizer.accumulate_gradient_steps']), 1)
+            self.assertIn('150m', f['load_checkpoint'])
+            self.assertEqual(f['notes'], f'Adam_B{b}_lr{lr:g}_b2{b2:g}_wd{wd:g}')
+            self.assertNotIn('_T', f['notes'])
+            self.assertNotIn('seed42', f['notes'])
+            self.assertNotIn('_0', p['experiment_id'])
+            self.assertEqual(item['actual_solve_tokens'], b * 1024 * int(f['total_steps']))
+            run_ids.add(p['run_id'])
+        self.assertEqual(len(run_ids), len(expected))
+        self.assertEqual(plan['preset'], 'adam')
+
+    def test_gn_queue_still_uses_existing_builder(self):
+        p = queue.make_queue_plan({
+            'preset': 'gn_adam', 'default_solve_tokens': 150000000,
+            'schedule_tokens': 1000000000,
+            'trials': [{'name': 'GN_B4096', 'batch': 4096,
+                        'inner_lr': .002, 'n_micro': 8}]},
+            queue_id='gn-controlled')
+        self.assertEqual(p['preset'], 'gn_adam')
+        self.assertEqual(p['trials'][0]['plan']['route'], 'sweep')
+        self.assertEqual(int(p['trials'][0]['plan']['flags']['inner_loop_iter']), 50)
+
     def test_plan_hash_and_worker_count(self):
         p = fixture((2, 3), count=1)
         queue.verify_plan(p, 2)
