@@ -1,0 +1,31 @@
+{
+  "preset": "gn_adam",
+  "default_solve_tokens": 150000000,
+  "schedule_tokens": 1000000000,
+  "trials": [
+    {
+      "name": "B8192_lr0.001",
+      "batch": 8192,
+      "inner_lr": 0.001,
+      "n_micro": 16
+    },
+    {
+      "name": "B8192_lr0.002",
+      "batch": 8192,
+      "inner_lr": 0.002,
+      "n_micro": 16
+    },
+    {
+      "name": "B4096_lr0.004",
+      "batch": 4096,
+      "inner_lr": 0.004,
+      "n_micro": 8
+    },
+    {
+      "name": "B8192_lr0.004",
+      "batch": 8192,
+      "inner_lr": 0.004,
+      "n_micro": 16
+    }
+  ]
+}
