@@ -558,7 +558,7 @@ class LocalGitUpdateTests(unittest.TestCase):
         git(self.origin, 'init', '-b', 'tooling')
         git(self.origin, 'config', 'user.email', 'test@example.invalid')
         git(self.origin, 'config', 'user.name', 'Local test')
-        for name in ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'):
+        for name in (Path(path).name for path in worker.HELPER_PATHS):
             (self.origin / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(SCRIPTS / name, self.origin / 'scripts' / name)
         shutil.copytree(SCRIPTS / 'presets', self.origin / 'scripts' / 'presets')
