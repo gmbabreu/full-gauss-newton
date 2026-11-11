@@ -169,6 +169,19 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(run_ids), len(expected))
         self.assertEqual(plan['preset'], 'adam')
 
+    def test_adam_smoke_evaluates_each_single_update(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_smoke.json'
+        plan = queue.make_queue_plan(json.loads(path.read_text()), queue_id='smoke-controlled')
+        self.assertEqual(len(plan['trials']), 2)
+        for item in plan['trials']:
+            f = item['plan']['flags']
+            self.assertEqual(int(f['total_steps']), 1)
+            self.assertEqual(int(f['eval_freq']), 1)
+            self.assertEqual(int(f['log_freq']), 1)
+            self.assertEqual(int(f['eval_steps']), 50)
+            self.assertEqual(float(f['target_loss']), 3.25)
+            self.assertEqual(item['requested_solve_tokens'], 131072)
+
     def test_gn_queue_still_uses_existing_builder(self):
         p = queue.make_queue_plan({
             'preset': 'gn_adam', 'default_solve_tokens': 150000000,
