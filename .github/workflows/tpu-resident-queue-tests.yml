@@ -2,7 +2,7 @@ name: TPU resident queue CPU tests
 
 on:
   pull_request:
-    branches: [gn-adam-sweep]
+    branches: [gn-adam-sweep, codex/tpu-resident-queue-implementation]
     paths:
       - 'scripts/**'
       - '.github/workflows/tpu-resident-queue-tests.yml'
@@ -37,5 +37,11 @@ jobs:
           bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json --dry-run > /tmp/queue-smoke.log
           grep 'smoke_B256_K1' /tmp/queue-smoke.log
           grep 'smoke_B256_K2' /tmp/queue-smoke.log
+      - name: AdamW ten-trial queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json --dry-run > /tmp/adamw-preview.log
+          grep 'Adam_B128_lr0.02_b20.95_wd0' /tmp/adamw-preview.log
+          grep 'Adam_B128_lr0.01_b20.98_wd0' /tmp/adamw-preview.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-preview.log
       - name: Repository TPU workflow and resident queue tests
         run: python -m unittest discover -s scripts/tests -v
