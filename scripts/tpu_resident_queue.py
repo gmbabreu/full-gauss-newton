@@ -210,6 +210,8 @@ class ResidentRunner:
             env.pop('WANDB_MODE', None)
         else:
             env['WANDB_MODE'] = 'disabled'
+        if self.cancelled:
+            raise InterruptedError('Queue cancelled before trial launch')
         print(f'START trial={idx} {item["name"]} run={item["plan"]["run_id"]}', flush=True)
         self.child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('run_experiment.py')),
                                        '--execute', str(path)], env=env)
@@ -229,6 +231,15 @@ class ResidentRunner:
             rc = self.child.wait()
             if rc:
                 raise RuntimeError(f'Trial {idx} exited with status {rc}')
+        except BaseException:
+            if self.child is not None and self.child.poll() is None:
+                self.child.terminate()
+                try:
+                    self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.child.kill()
+                    self.child.wait()
+            raise
         finally:
             self.child = None
 
@@ -250,6 +261,8 @@ class ResidentRunner:
                     clock=self.clock, sleep=self.sleep, cancelled=lambda: self.cancelled)
             for item in self.plan['trials']:
                 idx, run_id = item['index'], item['plan']['run_id']
+                if self.cancelled:
+                    raise InterruptedError('Queue cancelled before trial')
                 self.train(item, directory, hours=trial_hours)
                 self.store.create(f'result/{idx}/{self.worker}.json',
                                   record(self.plan, self.worker, idx, run_id, 0))
