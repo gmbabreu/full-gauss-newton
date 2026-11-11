@@ -1,0 +1,53 @@
+{
+  "preset": "gn_adam",
+  "default_solve_tokens": 150000000,
+  "schedule_tokens": 1000000000,
+  "trials": [
+    {
+      "name": "B8192_lr0.002_K50",
+      "batch": 8192,
+      "inner_lr": 0.002,
+      "n_micro": 16,
+      "inner_loop_iter": 50
+    },
+    {
+      "name": "B4096_lr0.002_K25",
+      "batch": 4096,
+      "inner_lr": 0.002,
+      "n_micro": 8,
+      "inner_loop_iter": 25
+    },
+    {
+      "name": "B4096_lr0.002_K100",
+      "batch": 4096,
+      "inner_lr": 0.002,
+      "n_micro": 8,
+      "inner_loop_iter": 100,
+      "solve_tokens": 75000000
+    },
+    {
+      "name": "B4096_lr0.004_K50",
+      "batch": 4096,
+      "inner_lr": 0.004,
+      "n_micro": 8,
+      "inner_loop_iter": 50,
+      "solve_tokens": 200000000
+    },
+    {
+      "name": "B2048_lr0.002_K50",
+      "batch": 2048,
+      "inner_lr": 0.002,
+      "n_micro": 4,
+      "inner_loop_iter": 50,
+      "solve_tokens": 200000000
+    },
+    {
+      "name": "B3072_lr0.002_K50",
+      "batch": 3072,
+      "inner_lr": 0.002,
+      "n_micro": 6,
+      "inner_loop_iter": 50,
+      "solve_tokens": 200000000
+    }
+  ]
+}
