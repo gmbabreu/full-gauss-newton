@@ -25,5 +25,12 @@ jobs:
           bash scripts/tpu.sh 1 queue scripts/sweeps/gn_large_batch_remaining.json --dry-run > /tmp/queue-preview.log
           grep 'DRY RUN: no GCP calls' /tmp/queue-preview.log
           grep 'B8192_lr0.001' /tmp/queue-preview.log
+      - name: Follow-up K25 K100 batch queue dry-run
+        run: |
+          bash scripts/tpu.sh 1 queue scripts/sweeps/gn_batch_k_followup.json --dry-run > /tmp/queue-followup.log
+          grep 'B4096_lr0.002_K25' /tmp/queue-followup.log
+          grep 'B4096_lr0.002_K100' /tmp/queue-followup.log
+          grep 'B8192_lr0.002_K50' /tmp/queue-followup.log
+          grep 'DRY RUN: no GCP calls' /tmp/queue-followup.log
       - name: Repository TPU workflow and resident queue tests
         run: python -m unittest discover -s scripts/tests -v
