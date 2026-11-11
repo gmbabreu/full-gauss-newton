@@ -25,8 +25,10 @@ def build_plan(trial, tokens, schedule_tokens):
     return build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens)
 
 
-def build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens):
-    """Build a scientific-equivalent plan for any ordered queue entry."""
+def build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens, *, inner_loop_iter=50):
+    """Build an equivalent GN-Adam plan; default preserves the legacy K50 sweep."""
+    if type(inner_loop_iter) is not int or inner_loop_iter <= 0:
+        raise ValueError('inner_loop_iter must be a positive integer')
     unit = batch * 1024
     steps = tokens // unit
     horizon = (schedule_tokens + unit - 1) // unit
@@ -36,7 +38,7 @@ def build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens):
     flags = dict(train_dataset_batch_size=batch, n_micro=micro,
         total_steps=steps, schedule_steps=horizon,
         dtype='fp32', param_dtype='fp32', mesh_dim='16,1,1', seed=42,
-        inner_loop_iter=50, inner_loop_lr=lr, lr_sched='global_cosine',
+        inner_loop_iter=inner_loop_iter, inner_loop_lr=lr, lr_sched='global_cosine',
         global_warmup=0, inner_loop_warmup=0, end_lr=0,
         inner_b1=.9, inner_b2=.999, inner_clip_gradient=1,
         inner_loop_wd=.01, optimizer_wd=.001,
@@ -48,7 +50,7 @@ def build_plan_for_config(trial, batch, lr, micro, tokens, schedule_tokens):
         log_inner_steps=False, condition_log=False, log_gn_quadratic=False,
         log_update_balance=False, save_model_freq=0, save_milestone_freq=0,
         train_batch_growth_interval=0, fixed_step_size=0,
-        notes=f'GN_Adam_trial{trial}_B{batch}_lr{lr:g}_K50_wd0.001')
+        notes=f'GN_Adam_trial{trial}_B{batch}_lr{lr:g}_K{inner_loop_iter}_wd0.001')
     flags['checkpointer.save_optimizer_state'] = False
     return make_plan('gn_adam', [f'--{k}={v}' for k, v in flags.items()])
 
