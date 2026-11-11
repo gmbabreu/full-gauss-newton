@@ -201,7 +201,18 @@ class Worker:
                         exit_status=None, state='prepared', token=self.p['token'],
                         session='gfn-' + self.p['plan']['run_id'])
         atomic_json(directory / 'manifest.json', manifest)
-        runner = [sys.executable, str(self.repo / 'scripts' / 'tpu_worker.py'), 'supervise', encode(self.p)]
+        if self.p['plan']['route'] == 'queue':
+            # The queue plan can contain many full per-trial command lines.
+            # Embedding it in tmux's one-command argument exceeds tmux's
+            # command length limit; persist it and pass only a short pointer.
+            atomic_json(directory / 'supervisor_payload.json', self.p)
+            pointer = {key: self.p[key] for key in ('repo', 'state', 'token')}
+            pointer['run_id'] = self.p['plan']['run_id']
+            runner = [sys.executable, str(self.repo / 'scripts' / 'tpu_worker.py'),
+                      'supervise-file', encode(pointer)]
+        else:
+            runner = [sys.executable, str(self.repo / 'scripts' / 'tpu_worker.py'),
+                      'supervise', encode(self.p)]
         # tmux accepts a single shell command; quote every argv element, never eval.
         shell = self.supervisor_command(runner)
         manifest['pane_command'] = shell
@@ -424,10 +435,43 @@ def encode(value):
     return base64.urlsafe_b64encode(json.dumps(value).encode()).decode()
 
 
+def load_supervisor_payload(pointer):
+    """Resolve a queue supervisor's short tmux pointer to its saved full RPC.
+
+    The original controller-signed token and run identity are checked against
+    the manifest, and only a previously persisted launch payload is accepted.
+    This keeps the tmux command bounded regardless of sweep size.
+    """
+    if not isinstance(pointer, dict) or set(pointer) != {'repo', 'state', 'run_id', 'token'}:
+        raise ValueError('Invalid supervisor pointer')
+    run_id = pointer['run_id']
+    token = pointer['token']
+    if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', run_id):
+        raise ValueError('Invalid supervisor run identity')
+    if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', token):
+        raise ValueError('Invalid supervisor launch token')
+    directory = Path(pointer['state']).expanduser().resolve() / run_id
+    payload = json.loads((directory / 'supervisor_payload.json').read_text())
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    for key in ('repo', 'state', 'token'):
+        if payload.get(key) != pointer[key]:
+            raise RuntimeError('Supervisor payload identity mismatch: ' + key)
+    if payload.get('plan', {}).get('run_id') != run_id or manifest.get('run_id') != run_id:
+        raise RuntimeError('Supervisor run identity mismatch')
+    if manifest.get('token') != token or manifest.get('worker') != payload.get('worker'):
+        raise RuntimeError('Supervisor ownership token/worker mismatch')
+    if payload.get('plan', {}).get('route') != 'queue':
+        raise RuntimeError('File-backed supervisor only supports the queue route')
+    return payload
+
+
 def main():
     action, encoded = sys.argv[1:]
     payload = json.loads(base64.urlsafe_b64decode(encoded))
     try:
+        if action == 'supervise-file':
+            payload = load_supervisor_payload(payload)
+            action = 'supervise'
         worker = Worker(payload)
         if action not in {'acquire', 'release', 'preflight', 'preflight_update', 'status', 'launch', 'stop', 'logs',
                           'fetch', 'update', 'supervise'}:
