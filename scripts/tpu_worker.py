@@ -15,7 +15,8 @@ import time
 
 
 HELPER_PATHS = tuple('scripts/' + name for name in
-                     ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'))
+                     ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py',
+                      'tpu_resident_queue.py', 'gn_sweep_queue.py'))
 
 
 def command(argv, *, check=True):
@@ -259,9 +260,15 @@ class Worker:
             with (directory / 'worker.log').open('a', buffering=1) as log:
                 if interrupted or (directory / 'cancelled').exists():
                     raise RuntimeError('Launch cancelled before process start')
-                child = subprocess.Popen([sys.executable, str(self.repo / 'scripts' / 'run_experiment.py'),
-                                          '--execute', str(directory / 'plan.json')],
-                                         stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                if self.p['plan']['route'] == 'queue':
+                    runner = [sys.executable, str(self.repo / 'scripts' / 'tpu_resident_queue.py'),
+                              '--execute', str(directory / 'plan.json'),
+                              '--worker', str(self.p['worker'])]
+                else:
+                    runner = [sys.executable, str(self.repo / 'scripts' / 'run_experiment.py'),
+                              '--execute', str(directory / 'plan.json')]
+                child = subprocess.Popen(runner, stdout=log, stderr=subprocess.STDOUT,
+                                         env=env, start_new_session=True)
                 identity = next((p for p in process_table() if p['pid'] == child.pid), None)
                 manifest.update(pgid=child.pid, process_start=identity['start'] if identity else None,
                                 state='started')
