@@ -535,11 +535,21 @@ and cancels the current trial:
 bash scripts/tpu.sh 2 stop
 ```
 
-Before running the full Adam queue, if TPU2 has not run resident-queue
-coordination before, use the already committed short
-`scripts/sweeps/gn_resident_smoke.json` to validate GCS synchronization on
-TPU2 (not a GN scientific experiment). Verify successful exit status 0 on all
-workers and no managed training processes before starting the Adam queue.
+Before running the full Adam queue, use
+`scripts/sweeps/adamw_smoke.json` to test both the **direct AdamW trainer
+route** and TPU2 GCS synchronization. Its two B128 configurations each do
+one update and one 50-batch validation, and should automatically advance
+between trials. This is an infrastructure test, **not** a scientific optimizer
+comparison. Run:
+
+```bash
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_smoke.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_smoke.json
+bash scripts/tpu.sh 2 logs 0
+```
+
+Verify both trials finished, all workers report successful exit status 0
+and no managed training processes before starting the expensive Adam queue.
 
 Do not merge this branch or start TPU experiments as part of implementation
 or CI. The operator controls TPU2 deployment and run start.
