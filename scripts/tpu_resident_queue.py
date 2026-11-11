@@ -28,7 +28,93 @@ def positive_int(x, label):
         raise ValueError(label + ' must be a positive integer')
 
 
+def parse_adam_spec(spec):
+    """Strict AdamW queue schema; GN queue schema remains unchanged."""
+    required = {'preset', 'default_solve_tokens', 'schedule_tokens',
+                'target_loss', 'trials'}
+    if set(spec) != required:
+        raise ValueError('Invalid Adam queue configuration fields')
+    positive_int(spec['default_solve_tokens'], 'default_solve_tokens')
+    positive_int(spec['schedule_tokens'], 'schedule_tokens')
+    target = spec['target_loss']
+    if type(target) not in (int, float) or not math.isfinite(target) or target <= 0:
+        raise ValueError('target_loss must be finite and positive')
+    if not isinstance(spec['trials'], list) or not spec['trials']:
+        raise ValueError('Missing ordered Adam trials')
+    names, configurations = set(), set()
+    for item in spec['trials']:
+        required_trial = {'name', 'batch', 'lr', 'b2', 'weight_decay'}
+        if not isinstance(item, dict) or set(item) not in (
+                required_trial, required_trial | {'solve_tokens'}):
+            raise ValueError('Invalid Adam trial fields')
+        name = item['name']
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', name):
+            raise ValueError('Unsafe trial name')
+        batch = item['batch']
+        positive_int(batch, 'batch')
+        if batch % 16:
+            raise ValueError('Batch must be divisible by 16-way data parallel mesh')
+        lr, b2, wd = item['lr'], item['b2'], item['weight_decay']
+        if type(lr) not in (int, float) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('lr must be finite and positive')
+        if type(b2) not in (int, float) or not math.isfinite(b2) or not 0 < b2 < 1:
+            raise ValueError('b2 must be finite and in (0, 1)')
+        if type(wd) not in (int, float) or not math.isfinite(wd) or wd < 0:
+            raise ValueError('weight_decay must be finite and nonnegative')
+        budget = item.get('solve_tokens', spec['default_solve_tokens'])
+        positive_int(budget, 'solve_tokens')
+        if budget < batch * 1024 or budget > spec['schedule_tokens']:
+            raise ValueError('Invalid Adam token budget')
+        signature = (batch, float(lr), float(b2), float(wd), budget)
+        if name in names or signature in configurations:
+            raise ValueError('Duplicate Adam trial or name')
+        names.add(name)
+        configurations.add(signature)
+    return spec
+
+
+def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss):
+    """One direct-route AdamW run, using the existing preset/trainer and flags."""
+    from run_experiment import make_plan
+    batch = item['batch']
+    lr, b2, wd = item['lr'], item['b2'], item['weight_decay']
+    unit = batch * 1024
+    steps = tokens // unit
+    horizon = (schedule_tokens + unit - 1) // unit
+    warmup = max(1, math.ceil(.01 * horizon))
+    # Target checks happen on validation; use the same cadence on every run.
+    cadence = max(1, math.ceil(20_000_000 / unit))
+    flags = {
+        'mesh_dim': '16,1,1', 'dtype': 'fp32', 'param_dtype': 'fp32',
+        'seed': 42, 'train_dataset_batch_size': batch,
+        'total_steps': steps, 'target_loss': target_loss,
+        'log_freq': cadence, 'eval_freq': cadence, 'eval_steps': 50,
+        'log_initial_eval': True,
+        'optimizer.type': 'adamw',
+        'optimizer.accumulate_gradient_steps': 1,
+        'optimizer.adamw_optimizer.lr': lr,
+        'optimizer.adamw_optimizer.b1': .9,
+        'optimizer.adamw_optimizer.b2': b2,
+        'optimizer.adamw_optimizer.lr_sched': 'cosine',
+        'optimizer.adamw_optimizer.init_lr': lr * .1,
+        'optimizer.adamw_optimizer.end_lr': lr * .1,
+        'optimizer.adamw_optimizer.lr_warmup_steps': warmup,
+        'optimizer.adamw_optimizer.lr_decay_steps': horizon,
+        'optimizer.adamw_optimizer.weight_decay': wd,
+        'optimizer.adamw_optimizer.clip_gradient': 1,
+        'optimizer.adamw_optimizer.bf16_momentum': False,
+        'optimizer.adamw_optimizer.multiply_by_parameter_scale': False,
+        'weight_average': False,
+        'save_model_freq': 0, 'save_milestone_freq': 0,
+        'checkpointer.save_optimizer_state': False,
+        'notes': f'Adam_B{batch}_lr{lr:g}_b2{b2:g}_wd{wd:g}',
+    }
+    return make_plan('adam', [f'--{key}={value}' for key, value in flags.items()])
+
+
 def parse_spec(spec):
+    if isinstance(spec, dict) and spec.get('preset') == 'adam':
+        return parse_adam_spec(spec)
     if not isinstance(spec, dict) or set(spec) != {
             'preset', 'default_solve_tokens', 'schedule_tokens', 'trials'}:
         raise ValueError('Invalid queue configuration fields')
@@ -72,7 +158,6 @@ def parse_spec(spec):
 
 def make_queue_plan(spec, *, queue_id=None):
     """Controller-side only; resolve each trial before starting any TPU workers."""
-    from gn_sweep_queue import build_plan_for_config
     parse_spec(spec)
     queue_id = queue_id or (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                             + '-' + uuid4().hex)
@@ -81,13 +166,18 @@ def make_queue_plan(spec, *, queue_id=None):
     trials = []
     for i, item in enumerate(spec['trials'], 1):
         budget = item.get('solve_tokens', spec['default_solve_tokens'])
-        p = build_plan_for_config(i, item['batch'], item['inner_lr'],
-                                  item['n_micro'], budget, spec['schedule_tokens'],
-                                  inner_loop_iter=item.get('inner_loop_iter', 50))
+        if spec['preset'] == 'gn_adam':
+            from gn_sweep_queue import build_plan_for_config
+            p = build_plan_for_config(i, item['batch'], item['inner_lr'],
+                                      item['n_micro'], budget, spec['schedule_tokens'],
+                                      inner_loop_iter=item.get('inner_loop_iter', 50))
+        else:
+            p = build_adam_plan(i, item, budget, spec['schedule_tokens'],
+                                spec['target_loss'])
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
-    return dict(route='queue', preset='gn_adam', run_id=queue_id, flags={},
+    return dict(route='queue', preset=spec['preset'], run_id=queue_id, flags={},
                 explicit_overrides=[], workers=[], plan_sha256='', trials=trials,
                 queue_root='gs://gfn-soo/checkpoints/queue_runs/' + queue_id)
 
