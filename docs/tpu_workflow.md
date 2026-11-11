@@ -359,8 +359,26 @@ reserves, preflights and starts the same immutable queue on every discovered
 worker; the controller returns. Worker-local processes exchange small conditional
 GCS markers, so **box248 authentication and SSH are not required between trials**.
 
-The ordered configuration file is
-`scripts/sweeps/gn_large_batch_remaining.json`. Do not launch if the original
+The ordered default screening configuration is
+`scripts/sweeps/gn_large_batch_remaining.json`. The **new six-trial
+follow-up**, including K25/K100 and per-trial 75M/150M/200M solve-token
+budgets, is `scripts/sweeps/gn_batch_k_followup.json`.
+
+For the follow-up run, use:
+
+```bash
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_batch_k_followup.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_batch_k_followup.json
+```
+
+Its ordered trials are B8192/LR0.002/K50 (150M), B4096/LR0.002/K25
+(150M), B4096/LR0.002/K100 (75M), B4096/LR0.004/K50 (200M),
+B2048/LR0.002/K50 (200M), B3072/LR0.002/K50 (200M). The B3072
+trial uses `n_micro=6`; each B3072, B2048, B4096, and B8192 configuration
+uses 32 samples per data-shard microbatch with mesh `16,1,1`.
+All runs preserve the **1B solve-token cosine horizon** and start from the
+same warmup checkpoint, not from a preceding trial. K25/K100 entries
+set `inner_loop_iter` individually, leaving legacy defaults at K50. Do not launch if the original
 box248 queue controller is active or TPU workers show active processes.
 
 ```bash
