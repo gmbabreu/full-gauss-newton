@@ -162,7 +162,7 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(int(f['schedule_steps']), -(-1000000000 // (b * 1024)))
             self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
             self.assertEqual(int(f['n_micro']), micro)
-            self.assertEqual(f['inner_loop_lr'], lr)
+            self.assertEqual(float(f['inner_loop_lr']), lr)
             self.assertEqual(f['inner_loop_iter'], 50)
 
 
