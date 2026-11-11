@@ -1,0 +1,22 @@
+{
+  "preset": "adam",
+  "default_solve_tokens": 131072,
+  "schedule_tokens": 2000000000,
+  "target_loss": 3.25,
+  "trials": [
+    {
+      "name": "smoke_Adam_B128_lr0.01",
+      "batch": 128,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "smoke_Adam_B128_lr0.015",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0
+    }
+  ]
+}
