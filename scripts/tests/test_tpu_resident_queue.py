@@ -70,6 +70,41 @@ class QueueTests(unittest.TestCase):
                 queue.parse_spec(bad)
         with self.assertRaisesRegex(ValueError, 'Duplicate'):
             queue.parse_spec(dict(good, trials=good['trials'] * 2))
+        with self.assertRaisesRegex(ValueError, 'inner_loop_iter'):
+            queue.parse_spec(dict(good, trials=[
+                dict(good['trials'][0], inner_loop_iter=0)]))
+        queue.parse_spec(dict(good, trials=[
+            dict(good['trials'][0], inner_loop_iter=25)]))
+
+    def test_queue_spec_real_followup_order_and_exact_parameters(self):
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'gn_batch_k_followup.json'
+        spec = json.loads(path.read_text())
+        plan = queue.make_queue_plan(spec, queue_id='controlled')
+        expectation = [
+            (8192, .002, 50, 150_000_000, 16),
+            (4096, .002, 25, 150_000_000, 8),
+            (4096, .002, 100, 75_000_000, 8),
+            (4096, .004, 50, 200_000_000, 8),
+            (2048, .002, 50, 200_000_000, 4),
+            (3072, .002, 50, 200_000_000, 6),
+        ]
+        self.assertEqual(len(plan['trials']), len(expectation))
+        for t, (b, lr, k, requested, micro) in zip(plan['trials'], expectation):
+            f = t['plan']['flags']
+            self.assertEqual(int(f['train_dataset_batch_size']), b)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
+            self.assertEqual(float(f['inner_loop_lr']), lr)
+            self.assertEqual(int(f['inner_loop_iter']), k)
+            self.assertEqual(int(f['n_micro']), micro)
+            self.assertEqual(t['requested_solve_tokens'], requested)
+            self.assertEqual(int(f['total_steps']), requested // (b * 1024))
+            self.assertEqual(int(f['schedule_steps']), -(-1_000_000_000 // (b * 1024)))
+            self.assertEqual(t['actual_solve_tokens'], requested // (b * 1024) * b * 1024)
+            self.assertIn(f'_K{k}_', f['notes'])
+            self.assertEqual(f['load_checkpoint'], 'trainstate_params::gs://gfn-soo/checkpoints/warmup_150m/1_0/streaming_train_state')
+        self.assertEqual(len({t['plan']['run_id'] for t in plan['trials']}), len(expectation))
 
     def test_plan_hash_and_worker_count(self):
         p = fixture((2, 3), count=1)
