@@ -42,7 +42,9 @@ def parse_spec(spec):
     for item in spec['trials']:
         if not isinstance(item, dict) or set(item) not in (
                 {'name', 'batch', 'inner_lr', 'n_micro'},
-                {'name', 'batch', 'inner_lr', 'n_micro', 'solve_tokens'}):
+                {'name', 'batch', 'inner_lr', 'n_micro', 'solve_tokens'},
+                {'name', 'batch', 'inner_lr', 'n_micro', 'inner_loop_iter'},
+                {'name', 'batch', 'inner_lr', 'n_micro', 'solve_tokens', 'inner_loop_iter'}):
             raise ValueError('Invalid trial fields')
         name = item['name']
         if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', name):
@@ -50,6 +52,7 @@ def parse_spec(spec):
         batch, micro = item['batch'], item['n_micro']
         positive_int(batch, 'batch')
         positive_int(micro, 'n_micro')
+        positive_int(item.get('inner_loop_iter', 50), 'inner_loop_iter')
         lr = item['inner_lr']
         if type(lr) not in (int, float) or not math.isfinite(lr) or lr <= 0:
             raise ValueError('inner_lr must be finite and positive')
@@ -59,7 +62,7 @@ def parse_spec(spec):
             raise ValueError('Invalid solve/schedule token budget')
         if batch % 16 or micro > batch // 16:
             raise ValueError('Batch and microbatch must fit the 16-device data-parallel mesh')
-        signature = (batch, float(lr), micro, budget)
+        signature = (batch, float(lr), micro, budget, item.get('inner_loop_iter', 50))
         if name in names or signature in configurations:
             raise ValueError('Duplicate trial or trial name')
         names.add(name)
@@ -79,7 +82,8 @@ def make_queue_plan(spec, *, queue_id=None):
     for i, item in enumerate(spec['trials'], 1):
         budget = item.get('solve_tokens', spec['default_solve_tokens'])
         p = build_plan_for_config(i, item['batch'], item['inner_lr'],
-                                  item['n_micro'], budget, spec['schedule_tokens'])
+                                  item['n_micro'], budget, spec['schedule_tokens'],
+                                  inner_loop_iter=item.get('inner_loop_iter', 50))
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
