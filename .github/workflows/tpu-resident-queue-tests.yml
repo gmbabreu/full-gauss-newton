@@ -1,0 +1,24 @@
+name: TPU resident queue CPU tests
+
+on:
+  pull_request:
+    branches: [gn-adam-sweep]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/tpu-resident-queue-tests.yml'
+  workflow_dispatch:
+
+jobs:
+  cpu-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax and compilation
+        run: |
+          bash -n scripts/tpu.sh
+          python -m compileall -q scripts
+      - name: Repository TPU workflow and resident queue tests
+        run: python -m unittest discover -s scripts/tests -v
