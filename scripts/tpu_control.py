@@ -26,6 +26,7 @@ DEFAULTS = dict(
 )
 HELP = '''Usage (from root: bash scripts/tpu.sh; from scripts/: bash tpu.sh):
   tpu.sh TARGET run PRESET [--dry-run] [--flag=value ...]
+  tpu.sh TARGET queue SPEC.json [--dry-run]
   tpu.sh TARGET status
   tpu.sh TARGET logs [WORKER]       Follow latest log; default worker 0
   tpu.sh TARGET stop                Stop managed runs only
@@ -132,6 +133,9 @@ class Controller:
             raise RuntimeError('Reservation cleanup incomplete; inspect workers:\n' + '\n'.join(errors))
 
     def run(self, plan):
+        if plan['route'] == 'queue':
+            from tpu_resident_queue import finish_plan
+            finish_plan(plan, self.workers)
         dirty = local_git('status', '--porcelain', '--untracked-files=all')
         if dirty:
             raise RuntimeError('Controller working tree is dirty; commit tooling and presets before launching')
@@ -223,10 +227,34 @@ def main(argv=None):
     if len(args) < 2 or args[0] not in DEFAULTS['targets']:
         raise ValueError(HELP)
     target, action, *rest = args
-    if action not in {'run', 'status', 'logs', 'stop', 'pull', 'switch', 'ssh'}:
+    if action not in {'run', 'queue', 'status', 'logs', 'stop', 'pull', 'switch', 'ssh'}:
         raise ValueError(HELP)
     controller = Controller(target)
-    if action == 'run':
+    if action == 'queue':
+        if len(rest) not in (1, 2) or (len(rest) == 2 and rest[1] != '--dry-run'):
+            raise ValueError('queue requires a JSON spec and optional --dry-run')
+        from tpu_resident_queue import make_queue_plan
+        path = (ROOT / rest[0]).resolve()
+        if ROOT not in path.parents or path.suffix != '.json':
+            raise ValueError('Queue specification must be a JSON file inside the repository')
+        if local_git('ls-files', '--error-unmatch', '--', str(path.relative_to(ROOT))) != str(path.relative_to(ROOT)):
+            raise ValueError('Queue file must be tracked by Git')
+        if local_git('status', '--porcelain', '--untracked-files=all'):
+            raise ValueError('Controller working tree must be clean')
+        plan = make_queue_plan(json.loads(path.read_text()))
+        print('Queue run ID:', plan['run_id'], 'GCS:', plan['queue_root'], flush=True)
+        for item in plan['trials']:
+            flags = item['plan']['flags']
+            print('trial', item['index'], item['name'], 'batch', flags['train_dataset_batch_size'],
+                  'LR', flags['inner_loop_lr'], 'micro', flags['n_micro'],
+                  'updates', flags['total_steps'], 'actual solve tokens', item['actual_solve_tokens'],
+                  'run ID', item['plan']['run_id'], flush=True)
+        if len(rest) == 2:
+            print(json.dumps(plan, indent=2))
+            print('DRY RUN: no GCP calls, TPU launches, or trainer imports.')
+            return 0
+        controller.operate('run', plan)
+    elif action == 'run':
         if not rest or rest[0].startswith('--'):
             raise ValueError('run requires a preset. Choose: ' + ', '.join(choices()))
         preset, *overrides = rest
