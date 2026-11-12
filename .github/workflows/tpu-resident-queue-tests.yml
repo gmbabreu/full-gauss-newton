@@ -52,7 +52,7 @@ jobs:
       - name: Legacy-comparable AdamW queue dry-run
         run: |
           bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json --dry-run > /tmp/adamw-comparable-preview.log
-          grep 'Adam_B128_lr0.01_b20.95_wd0' /tmp/adamw-comparable-preview.log
+          grep 'Adam_B128_lr0.015_b20.95_wd0' /tmp/adamw-comparable-preview.log
           grep 'DRY RUN: no GCP calls' /tmp/adamw-comparable-preview.log
       - name: Repository TPU workflow and resident queue tests
         run: python -m unittest discover -s scripts/tests -v
