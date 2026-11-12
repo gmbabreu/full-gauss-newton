@@ -218,7 +218,10 @@ class QueueTests(unittest.TestCase):
             'checkpointer.save_optimizer_state': 'True',
             'log_initial_eval': 'False',
         }.items():
-            self.assertEqual(float(historical[key]), float(expected) if isinstance(expected, (int, float)) else expected) if isinstance(expected, (int, float)) else self.assertEqual(historical[key], expected)
+            if isinstance(expected, (int, float)):
+                self.assertEqual(float(historical[key]), float(expected))
+            else:
+                self.assertEqual(historical[key], expected)
         # B128 keeps the historical ~20M-token cadence: 153 steps.
         self.assertEqual(int(plan['trials'][0]['plan']['flags']['eval_freq']), 153)
         old = queue.make_queue_plan(json.loads(
