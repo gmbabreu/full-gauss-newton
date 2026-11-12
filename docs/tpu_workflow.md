@@ -564,8 +564,10 @@ seven ordered runs, keeping B128/LR0.015 while omitting the redundant
 B128/LR0.01, B64/LR0.015, and B128/LR0.02 comparisons. It uses `protocol:
 "adam_followup_600m"` to match the original follow-up evaluation and
 optimization schedule: 8 validation batches, no initial evaluation, roughly
-150M-token validation intervals, and a 600M-token cosine horizon with 1%
-warmup. Unlike the original historical runs, these experiments may continue
+20M-token validation intervals (611 updates for B32, 153 for B128),
+a 600M-token cosine horizon, 10 warmup updates beginning at initial LR 0,
+end LR equal to 10% of the peak, and optimizer-state saving enabled as
+in the original CLI (while save frequencies remain 0). Unlike the original historical runs, these experiments may continue
 up to 1.2B tokens unless their validation loss reaches 3.25. This **extends
 the old schedule beyond its decay horizon**, rather than stretching decay
 to 1.2B tokens, and is a deliberate experimental choice. The 1.2B token
