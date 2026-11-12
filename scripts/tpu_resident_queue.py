@@ -32,8 +32,12 @@ def parse_adam_spec(spec):
     """Strict AdamW queue schema; GN queue schema remains unchanged."""
     required = {'preset', 'default_solve_tokens', 'schedule_tokens',
                 'target_loss', 'trials'}
-    if set(spec) != required:
+    optional = {'protocol'}
+    if not required.issubset(spec) or set(spec) - required - optional:
         raise ValueError('Invalid Adam queue configuration fields')
+    protocol = spec.get('protocol')
+    if protocol not in (None, 'adam_followup_600m'):
+        raise ValueError('Unsupported Adam evaluation/schedule protocol')
     positive_int(spec['default_solve_tokens'], 'default_solve_tokens')
     positive_int(spec['schedule_tokens'], 'schedule_tokens')
     target = spec['target_loss']
@@ -63,8 +67,10 @@ def parse_adam_spec(spec):
             raise ValueError('weight_decay must be finite and nonnegative')
         budget = item.get('solve_tokens', spec['default_solve_tokens'])
         positive_int(budget, 'solve_tokens')
-        if budget < batch * 1024 or budget > spec['schedule_tokens']:
+        if budget < batch * 1024:
             raise ValueError('Invalid Adam token budget')
+        if budget > spec['schedule_tokens'] and protocol != 'adam_followup_600m':
+            raise ValueError('Adam solve budget exceeds schedule horizon without explicit legacy protocol')
         signature = (batch, float(lr), float(b2), float(wd), budget)
         if name in names or signature in configurations:
             raise ValueError('Duplicate Adam trial or name')
@@ -73,23 +79,37 @@ def parse_adam_spec(spec):
     return spec
 
 
-def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss):
-    """One direct-route AdamW run, using the existing preset/trainer and flags."""
+def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, protocol=None):
+    """One AdamW run. The named legacy protocol preserves old follow-up settings."""
     from run_experiment import make_plan
     batch = item['batch']
     lr, b2, wd = item['lr'], item['b2'], item['weight_decay']
     unit = batch * 1024
     steps = tokens // unit
-    horizon = (schedule_tokens + unit - 1) // unit
-    warmup = max(1, math.ceil(.01 * horizon))
-    # Target checks happen on validation; use the same cadence on every run.
-    cadence = max(1, min(steps, math.ceil(20_000_000 / unit)))
+    if protocol == 'adam_followup_600m':
+        # Original adam_followup trial (B128): 4577 decay steps, 46 warmup
+        # steps, 8 validation batches, every 1144 steps, no initial eval.
+        # A longer token cap is allowed; Optax holds end_lr after decay.
+        horizon = schedule_tokens // unit
+        warmup = max(1, round(.01 * horizon))
+        cadence = max(1, min(steps, horizon // 4))
+        eval_steps = 8
+        log_initial_eval = False
+    elif protocol is None:
+        # Preserve the existing, non-comparable 2B-horizon queue semantics.
+        horizon = (schedule_tokens + unit - 1) // unit
+        warmup = max(1, math.ceil(.01 * horizon))
+        cadence = max(1, min(steps, math.ceil(20_000_000 / unit)))
+        eval_steps = 50
+        log_initial_eval = True
+    else:
+        raise ValueError('Unsupported Adam evaluation/schedule protocol')
     flags = {
         'mesh_dim': '16,1,1', 'dtype': 'fp32', 'param_dtype': 'fp32',
         'seed': 42, 'train_dataset_batch_size': batch,
         'total_steps': steps, 'target_loss': target_loss,
-        'log_freq': cadence, 'eval_freq': cadence, 'eval_steps': 50,
-        'log_initial_eval': True,
+        'log_freq': cadence, 'eval_freq': cadence, 'eval_steps': eval_steps,
+        'log_initial_eval': log_initial_eval,
         'optimizer.type': 'adamw',
         'optimizer.accumulate_gradient_steps': 1,
         'optimizer.adamw_optimizer.lr': lr,
@@ -173,7 +193,7 @@ def make_queue_plan(spec, *, queue_id=None):
                                       inner_loop_iter=item.get('inner_loop_iter', 50))
         else:
             p = build_adam_plan(i, item, budget, spec['schedule_tokens'],
-                                spec['target_loss'])
+                                spec['target_loss'], protocol=spec.get('protocol'))
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
