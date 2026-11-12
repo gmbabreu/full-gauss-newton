@@ -188,21 +188,39 @@ class QueueTests(unittest.TestCase):
             batch = int(f['train_dataset_batch_size'])
             unit = batch * 1024
             old_horizon = 599982080 // unit
-            old_eval = old_horizon // 4
+            old_eval = -(-old_horizon // 30)
             self.assertEqual(int(f['eval_steps']), 8)
             self.assertEqual(f['log_initial_eval'], 'False')
             self.assertEqual(int(f['log_freq']), old_eval)
             self.assertEqual(int(f['eval_freq']), old_eval)
             self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
                              old_horizon)
-            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
-                             max(1, round(old_horizon * .01)))
-            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']),
-                             float(f['optimizer.adamw_optimizer.lr']) * .1)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']), 10)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']), 0)
             self.assertEqual(float(f['optimizer.adamw_optimizer.end_lr']),
                              float(f['optimizer.adamw_optimizer.lr']) * .1)
+            self.assertEqual(f['checkpointer.save_optimizer_state'], 'True')
             self.assertEqual(int(f['total_steps']), 1200000000 // unit)
             self.assertEqual(float(f['target_loss']), 3.25)
+        # Original pasted B32 command (600M solve tokens).
+        historical = queue.build_adam_plan(
+            1, {'batch': 32, 'lr': .005, 'b2': .95, 'weight_decay': 0},
+            599982080, 599982080, 3.25, protocol='adam_followup_600m')['flags']
+        for key, expected in {
+            'total_steps': 18310,
+            'log_freq': 611,
+            'eval_freq': 611,
+            'eval_steps': 8,
+            'optimizer.adamw_optimizer.lr_warmup_steps': 10,
+            'optimizer.adamw_optimizer.lr_decay_steps': 18310,
+            'optimizer.adamw_optimizer.init_lr': 0.0,
+            'optimizer.adamw_optimizer.end_lr': .0005,
+            'checkpointer.save_optimizer_state': 'True',
+            'log_initial_eval': 'False',
+        }.items():
+            self.assertEqual(float(historical[key]), float(expected) if isinstance(expected, (int, float)) else expected) if isinstance(expected, (int, float)) else self.assertEqual(historical[key], expected)
+        # B128 keeps the historical ~20M-token cadence: 153 steps.
+        self.assertEqual(int(plan['trials'][0]['plan']['flags']['eval_freq']), 153)
         old = queue.make_queue_plan(json.loads(
             (Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup.json').read_text()),
             queue_id='original-new')
