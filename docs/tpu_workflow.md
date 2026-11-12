@@ -560,8 +560,8 @@ or CI. The operator controls TPU2 deployment and run start.
 The **original** `scripts/sweeps/adamw_followup.json` is retained unchanged
 for provenance (50 validation batches, 2B-token LR schedule). The separate
 `scripts/sweeps/adamw_followup_comparable.json` is the proposed next queue:
-nine ordered runs, deliberately omitting B128/LR0.02 because its recent
-trajectory closely tracked B128/LR0.015. It uses `protocol:
+seven ordered runs, keeping B128/LR0.015 while omitting the redundant
+B128/LR0.01, B64/LR0.015, and B128/LR0.02 comparisons. It uses `protocol:
 "adam_followup_600m"` to match the original follow-up evaluation and
 optimization schedule: 8 validation batches, no initial evaluation, roughly
 150M-token validation intervals, and a 600M-token cosine horizon with 1%
