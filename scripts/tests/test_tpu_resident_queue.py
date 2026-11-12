@@ -169,6 +169,41 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(run_ids), len(expected))
         self.assertEqual(plan['preset'], 'adam')
 
+    def test_adam_legacy_eight_batch_comparability(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup_comparable.json'
+        spec = json.loads(path.read_text())
+        self.assertEqual(spec['protocol'], 'adam_followup_600m')
+        self.assertEqual(spec['schedule_tokens'], 599982080)
+        plan = queue.make_queue_plan(spec, queue_id='legacy-comparable')
+        self.assertEqual(len(plan['trials']), 10)
+        for t in plan['trials']:
+            f = t['plan']['flags']
+            batch = int(f['train_dataset_batch_size'])
+            unit = batch * 1024
+            old_horizon = 599982080 // unit
+            old_eval = old_horizon // 4
+            self.assertEqual(int(f['eval_steps']), 8)
+            self.assertEqual(f['log_initial_eval'], 'False')
+            self.assertEqual(int(f['log_freq']), old_eval)
+            self.assertEqual(int(f['eval_freq']), old_eval)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             old_horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             max(1, round(old_horizon * .01)))
+            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']),
+                             float(f['optimizer.adamw_optimizer.lr']) * .1)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.end_lr']),
+                             float(f['optimizer.adamw_optimizer.lr']) * .1)
+            self.assertEqual(int(f['total_steps']), 1200000000 // unit)
+            self.assertEqual(float(f['target_loss']), 3.25)
+        old = queue.make_queue_plan(json.loads(
+            (Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup.json').read_text()),
+            queue_id='original-new')
+        self.assertEqual(int(old['trials'][0]['plan']['flags']['eval_steps']), 50)
+        self.assertEqual(old['trials'][0]['plan']['flags']['log_initial_eval'], 'True')
+        self.assertNotEqual(old['trials'][0]['plan']['flags']['eval_freq'],
+                            plan['trials'][0]['plan']['flags']['eval_freq'])
+
     def test_adam_smoke_evaluates_each_single_update(self):
         path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_smoke.json'
         plan = queue.make_queue_plan(json.loads(path.read_text()), queue_id='smoke-controlled')
