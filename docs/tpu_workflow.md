@@ -553,3 +553,40 @@ and no managed training processes before starting the expensive Adam queue.
 
 Do not merge this branch or start TPU experiments as part of implementation
 or CI. The operator controls TPU2 deployment and run start.
+
+
+### Historical-comparability rerun (new, opt-in)
+
+The **original** `scripts/sweeps/adamw_followup.json` is retained unchanged
+for provenance (50 validation batches, 2B-token LR schedule). The separate
+`scripts/sweeps/adamw_followup_comparable.json` is the proposed next queue:
+nine ordered runs, deliberately omitting B128/LR0.02 because its recent
+trajectory closely tracked B128/LR0.015. It uses `protocol:
+"adam_followup_600m"` to match the original follow-up evaluation and
+optimization schedule: 8 validation batches, no initial evaluation, roughly
+150M-token validation intervals, and a 600M-token cosine horizon with 1%
+warmup. Unlike the original historical runs, these experiments may continue
+up to 1.2B tokens unless their validation loss reaches 3.25. This **extends
+the old schedule beyond its decay horizon**, rather than stretching decay
+to 1.2B tokens, and is a deliberate experimental choice. The 1.2B token
+ceiling and loss target are retained in resolved flags, not verbose W&B
+notes.
+
+Do not rerun already completed 50-batch experiments expecting their
+historical charts to become directly comparable. Always compare the
+new 8-batch series with the historical 8-batch runs, under the same
+evaluation stream/configuration. If the original run configuration
+differs in other flags, investigate that discrepancy before claiming
+strict equivalence.
+
+After confirming all TPU2 workers idle and clean, and manually
+fast-forwarding the TPU2 feature branch across the controller worktree
+and **all** TPU2 workers to the same commit, preview and launch:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json
+```
+
+Never change or restart active TPU2 training in order to deploy this.
