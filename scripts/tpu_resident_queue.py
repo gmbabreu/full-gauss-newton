@@ -87,12 +87,14 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, 
     unit = batch * 1024
     steps = tokens // unit
     if protocol == 'adam_followup_600m':
-        # Original adam_followup trial (B128): 4577 decay steps, 46 warmup
-        # steps, 8 validation batches, every 1144 steps, no initial eval.
-        # A longer token cap is allowed; Optax holds end_lr after decay.
+        # Match historical Adam follow-up: B32 at ~600M tokens had 18310
+        # decay steps, 10 warmup steps, log/eval every 611 steps (30 intervals),
+        # eight validation batches, and no initial eval.
+        # Larger batches scale the cadence by tokens, not by raw updates.
+        # If the token cap exceeds the decay horizon, Optax holds end_lr.
         horizon = schedule_tokens // unit
-        warmup = max(1, round(.01 * horizon))
-        cadence = max(1, min(steps, horizon // 4))
+        warmup = 10
+        cadence = max(1, min(steps, math.ceil(horizon / 30)))
         eval_steps = 8
         log_initial_eval = False
     elif protocol is None:
@@ -116,7 +118,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, 
         'optimizer.adamw_optimizer.b1': .9,
         'optimizer.adamw_optimizer.b2': b2,
         'optimizer.adamw_optimizer.lr_sched': 'cosine',
-        'optimizer.adamw_optimizer.init_lr': lr * .1,
+        'optimizer.adamw_optimizer.init_lr': 0.0 if protocol == 'adam_followup_600m' else lr * .1,
         'optimizer.adamw_optimizer.end_lr': lr * .1,
         'optimizer.adamw_optimizer.lr_warmup_steps': warmup,
         'optimizer.adamw_optimizer.lr_decay_steps': horizon,
@@ -126,7 +128,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, 
         'optimizer.adamw_optimizer.multiply_by_parameter_scale': False,
         'weight_average': False,
         'save_model_freq': 0, 'save_milestone_freq': 0,
-        'checkpointer.save_optimizer_state': False,
+        'checkpointer.save_optimizer_state': protocol == 'adam_followup_600m',
         'notes': f'Adam_B{batch}_lr{lr:g}_b2{b2:g}_wd{wd:g}',
     }
     return make_plan('adam', [f'--{key}={value}' for key, value in flags.items()])
