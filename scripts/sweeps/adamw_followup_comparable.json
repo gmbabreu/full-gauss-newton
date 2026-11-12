@@ -5,22 +5,8 @@
   "target_loss": 3.25,
   "trials": [
     {
-      "name": "Adam_B128_lr0.01_b20.95_wd0",
-      "batch": 128,
-      "lr": 0.01,
-      "b2": 0.95,
-      "weight_decay": 0
-    },
-    {
       "name": "Adam_B128_lr0.015_b20.95_wd0",
       "batch": 128,
-      "lr": 0.015,
-      "b2": 0.95,
-      "weight_decay": 0
-    },
-    {
-      "name": "Adam_B64_lr0.015_b20.95_wd0",
-      "batch": 64,
       "lr": 0.015,
       "b2": 0.95,
       "weight_decay": 0
