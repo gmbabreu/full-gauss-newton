@@ -229,8 +229,10 @@ class QueueTests(unittest.TestCase):
             queue_id='original-new')
         self.assertEqual(int(old['trials'][0]['plan']['flags']['eval_steps']), 50)
         self.assertEqual(old['trials'][0]['plan']['flags']['log_initial_eval'], 'True')
-        self.assertNotEqual(old['trials'][0]['plan']['flags']['eval_freq'],
-                            plan['trials'][0]['plan']['flags']['eval_freq'])
+        # Both versions intentionally evaluate around every 20M tokens,
+        # but differ in validation batch count and warmup.
+        self.assertEqual(old['trials'][0]['plan']['flags']['eval_freq'],
+                         plan['trials'][0]['plan']['flags']['eval_freq'])
 
     def test_adam_smoke_evaluates_each_single_update(self):
         path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_smoke.json'
