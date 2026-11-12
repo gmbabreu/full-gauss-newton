@@ -175,7 +175,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(spec['protocol'], 'adam_followup_600m')
         self.assertEqual(spec['schedule_tokens'], 599982080)
         plan = queue.make_queue_plan(spec, queue_id='legacy-comparable')
-        self.assertEqual(len(plan['trials']), 10)
+        self.assertEqual(len(plan['trials']), 9)
+        self.assertFalse(any(t['plan']['flags']['notes'] == 'Adam_B128_lr0.02_b20.95_wd0' for t in plan['trials']))
         for t in plan['trials']:
             f = t['plan']['flags']
             batch = int(f['train_dataset_batch_size'])
