@@ -295,6 +295,54 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(float(b720['optimizer.adamw_optimizer.init_lr']), .0001)
         self.assertEqual(float(b720['optimizer.adamw_optimizer.end_lr']), .001)
 
+    def test_eight_trial_overnight_queue(self):
+        from math import ceil
+        root = Path(__file__).resolve().parents[1] / 'sweeps'
+        spec = json.loads((root / 'adamw_long_horizon_eight.json').read_text())
+        plan = queue.make_queue_plan(spec, queue_id='overnight-controlled')
+        expected = [
+            (128, .01, 0),
+            (720, .01, .01),
+            (256, .01, 0),
+            (128, .015, 0),
+            (384, .01, 0),
+            (128, .01, .01),
+            (512, .01, 0),
+            (192, .0125, 0),
+        ]
+        self.assertEqual(len(plan['trials']), 8)
+        self.assertEqual(spec['target_loss'], 0)
+        self.assertEqual(spec['schedule_tokens'], 2_211_840_000)
+        self.assertEqual(spec['default_solve_tokens'], 2_211_840_000)
+        self.assertEqual(spec['warmup_tokens'], 7_372_800)
+        self.assertEqual(spec['init_lr_fraction'], .01)
+        self.assertEqual(spec['protocol'], 'adam_followup_600m')
+        names = []
+        for trial, (batch, lr, wd) in zip(plan['trials'], expected):
+            f = trial['plan']['flags']
+            names.append(trial['name'])
+            unit = batch * 1024
+            horizon = 2_211_840_000 // unit
+            self.assertEqual(int(f['train_dataset_batch_size']), batch)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), batch)
+            self.assertEqual(int(f['total_steps']), horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']), horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             ceil(7_372_800 / unit))
+            self.assertEqual(int(f['eval_steps']), 8)
+            self.assertEqual(int(f['eval_freq']), ceil(horizon / 30))
+            self.assertEqual(int(f['log_freq']), ceil(horizon / 30))
+            self.assertEqual(f['log_initial_eval'], 'False')
+            self.assertEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.b2']), .95)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertEqual(float(f['target_loss']), 0)
+            self.assertEqual(int(trial['actual_solve_tokens']), horizon * unit)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertNotIn('Adam_B720_lr0.01_long', names)
+
     def test_adam_long_horizon_rejects_invalid_overrides(self):
         spec = {'preset': 'adam', 'default_solve_tokens': 2_211_840_000,
                 'schedule_tokens': 2_211_840_000, 'target_loss': 0,
