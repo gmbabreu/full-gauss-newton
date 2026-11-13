@@ -32,7 +32,7 @@ def parse_adam_spec(spec):
     """Strict AdamW queue schema; GN queue schema remains unchanged."""
     required = {'preset', 'default_solve_tokens', 'schedule_tokens',
                 'target_loss', 'trials'}
-    optional = {'protocol', 'init_lr_fraction', 'warmup_tokens'}
+    optional = {'protocol', 'init_lr_fraction', 'warmup_tokens', 'eval_interval_tokens'}
     if not required.issubset(spec) or set(spec) - required - optional:
         raise ValueError('Invalid Adam queue configuration fields')
     protocol = spec.get('protocol')
@@ -44,8 +44,11 @@ def parse_adam_spec(spec):
             raise ValueError('init_lr_fraction must be finite in [0, 1]')
     if 'warmup_tokens' in spec:
         positive_int(spec['warmup_tokens'], 'warmup_tokens')
-    if ('init_lr_fraction' in spec or 'warmup_tokens' in spec) and protocol != 'adam_followup_600m':
-        raise ValueError('Explicit Adam LR warmup overrides require adam_followup_600m protocol')
+    if 'eval_interval_tokens' in spec:
+        positive_int(spec['eval_interval_tokens'], 'eval_interval_tokens')
+    if any(key in spec for key in ('init_lr_fraction', 'warmup_tokens',
+                                   'eval_interval_tokens')) and protocol != 'adam_followup_600m':
+        raise ValueError('Explicit Adam schedule/evaluation overrides require adam_followup_600m protocol')
     positive_int(spec['default_solve_tokens'], 'default_solve_tokens')
     positive_int(spec['schedule_tokens'], 'schedule_tokens')
     target = spec['target_loss']
@@ -88,7 +91,8 @@ def parse_adam_spec(spec):
 
 
 def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
-                    protocol=None, init_lr_fraction=None, warmup_tokens=None):
+                    protocol=None, init_lr_fraction=None, warmup_tokens=None,
+                    eval_interval_tokens=None):
     """One AdamW run. The named legacy protocol preserves old follow-up settings."""
     from run_experiment import make_plan
     batch = item['batch']
@@ -103,7 +107,11 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
         # If the token cap exceeds the decay horizon, Optax holds end_lr.
         horizon = schedule_tokens // unit
         warmup = 10 if warmup_tokens is None else max(1, math.ceil(warmup_tokens / unit))
-        cadence = max(1, min(steps, math.ceil(horizon / 30)))
+        # An explicit token-based cadence is independent of LR decay length.
+        # A 20M interval reproduces B32=611 and B128=153 update intervals.
+        cadence = max(1, min(steps, math.ceil(
+            (eval_interval_tokens / unit) if eval_interval_tokens is not None
+            else (horizon / 30))))
         eval_steps = 8
         log_initial_eval = False
     elif protocol is None:
@@ -208,7 +216,8 @@ def make_queue_plan(spec, *, queue_id=None):
             p = build_adam_plan(i, item, budget, spec['schedule_tokens'],
                                 spec['target_loss'], protocol=spec.get('protocol'),
                                 init_lr_fraction=spec.get('init_lr_fraction'),
-                                warmup_tokens=spec.get('warmup_tokens'))
+                                warmup_tokens=spec.get('warmup_tokens'),
+                                eval_interval_tokens=spec.get('eval_interval_tokens'))
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
