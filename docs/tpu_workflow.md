@@ -699,8 +699,14 @@ index, and every run starts independently from the warmup checkpoint.
 
 The `notes_from_trial_name: true` flag is opt-in and affects only the
 new queue; older queues retain existing W&B notes. The 20M-token
-evaluation cadence, eight validation batches, 2.21B-token common
-schedule, token-matched warmup, and `target_loss=0` are unchanged.
+evaluation cadence, eight validation batches, **2.21B-token common cosine
+schedule**, token-matched warmup, and `target_loss=0` are unchanged.
+The new queue intentionally assigns **2.21184B training tokens to trials
+2 (B720/WD.01) and 4 (B128/LR.015)**, but only **1.45B training tokens
+to trials 3, 5, 6, 7, and 8**. The shorter runs stop before completing
+the common LR decay, so their endpoint validation losses are screening
+measurements, not fully decayed final-loss comparisons. These per-trial
+budgets do not alter the learning-rate schedule.
 No checkpoint/resume behavior was added.
 
 **Do not deploy while the old eight-run queue is still active.** A
