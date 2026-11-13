@@ -640,3 +640,40 @@ The two new fields in long-horizon specifications
 `adam_followup_600m` planning mode, not the historical JSON,
 previous runs, GN, or trainer math. Only make branch changes while TPU2
 is confirmed fully idle; never switch running workers.
+
+
+### Eight-trial overnight AdamW queue
+
+`scripts/sweeps/adamw_long_horizon_eight.json` combines the five
+primary and three optional long-horizon trials into a **single** ordered
+eight-run queue. This is a separate new queue spec; the original primary
+and optional files remain intact. Its order is B128/.01/WD0,
+B720/.01/WD.01, B256/.01/WD0, B128/.015/WD0, B384/.01/WD0,
+B128/.01/WD.01, B512/.01/WD0, B192/.0125/WD0; all use β₂=.95.
+It does **not** repeat historical B720/.01/WD0.
+
+This queue preserves 2,211,840,000-token training and cosine horizon,
+7,372,800 warmup tokens, initial LR 1% peak, final LR 10% peak,
+8 validation batches at roughly 74M training-token intervals,
+a common checkpoint, and `target_loss=0` (full-budget final-loss comparison).
+**Eight full runs may last far beyond one night.** There is no total
+wall-clock deadline: a healthy queue keeps executing after the operator
+disconnects. It does not recover automatically from preemption or
+Hugging Face outages; the failed trial is not checkpoint-resumable
+with `save_model_freq=0` and `save_milestone_freq=0`. No additional
+training or checkpointing changes were introduced here.
+
+After verifying TPU2 **all four workers idle and clean**, operator manually
+syncs box248's AdamW worktree and all TPU2 worker checkouts to the exact
+same new feature-branch SHA. Only then:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_eight.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_eight.json
+bash scripts/tpu.sh 2 logs 0
+```
+
+Do not launch this queue if the five-run primary queue has already begun;
+the new queue would duplicate its first runs and preflight would reject
+active workers. Preserve active training instead.
