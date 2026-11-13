@@ -1,0 +1,68 @@
+{
+  "preset": "adam",
+  "default_solve_tokens": 2211840000,
+  "schedule_tokens": 2211840000,
+  "target_loss": 0,
+  "protocol": "adam_followup_600m",
+  "init_lr_fraction": 0.01,
+  "warmup_tokens": 7372800,
+  "trials": [
+    {
+      "name": "Adam_B128_lr0.01_long",
+      "batch": 128,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "Adam_B720_lr0.01_wd0.01_long",
+      "batch": 720,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0.01
+    },
+    {
+      "name": "Adam_B256_lr0.01_long",
+      "batch": 256,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "Adam_B128_lr0.015_long",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "Adam_B384_lr0.01_long",
+      "batch": 384,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "Adam_B128_lr0.01_wd0.01_long",
+      "batch": 128,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0.01
+    },
+    {
+      "name": "Adam_B512_lr0.01_long",
+      "batch": 512,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0
+    },
+    {
+      "name": "Adam_B192_lr0.0125_long",
+      "batch": 192,
+      "lr": 0.0125,
+      "b2": 0.95,
+      "weight_decay": 0
+    }
+  ],
+  "eval_interval_tokens": 20000000
+}

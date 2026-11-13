@@ -471,3 +471,254 @@ preemption, missing TPU-local GCS credentials, lost HF/W&B connectivity, or a
 GN training crash. Workers time out rather than hanging forever. No intermediate
 GN optimizer/data checkpoints are introduced; interrupted individual trials
 are not automatically resumable.
+
+## TPU2 AdamW target-loss queue (separate feature branch)
+
+Branch `codex/tpu-resident-adamw-sweep` adds the `adam` route to the same
+TPU-local synchronized queue runner, without changing the GN route. The ordered
+`scripts/sweeps/adamw_followup.json` contains ten B64/B128/B192/B256 runs
+testing peak LR, second-moment beta2, and weight decay. All runs use the
+150M warmup checkpoint, FP32, seed 42, a **1.2B-token cap**, a **2B-token
+cosine schedule horizon**, 1% schedule warmup, and target validation loss
+`3.25`. Each run starts from the common checkpoint with fresh Adam moments,
+not the preceding run. Short W&B notes look like
+`Adam_B128_lr0.01_b20.95_wd0`; token budgets and seeds remain in structured
+run configuration, not notes.
+
+The trainer already supports `--target_loss` and evaluates it *after* validation
+batches, not continuously. A run reaching the target exits normally; a run
+that does not reach it completes its token cap. Plan for up to 10 full
+runs; **the intended ~20-hour window is not a runtime guarantee** and
+does not automatically stop the overall queue at 20 hours. The per-trial
+resident timeout remains in place.
+
+### Keep TPU1 unchanged
+
+Do not switch the existing `~/Desktop/full-gauss-newton` checkout if it is
+being used to monitor TPU1 GN. On box248, create a **separate** Git worktree for
+the TPU2 controller, using the feature branch at one exact commit:
+
+```bash
+cd ~/Desktop/full-gauss-newton
+git fetch origin
+git worktree add --track -b codex/tpu-resident-adamw-sweep \
+  ~/Desktop/full-gauss-newton-adamw origin/codex/tpu-resident-adamw-sweep
+cd ~/Desktop/full-gauss-newton-adamw
+git rev-parse HEAD
+git status --short
+```
+
+If that branch/worktree already exists, inspect it and fast-forward it rather
+than deleting or resetting. **Check `bash scripts/tpu.sh 2 status` first**.
+Do not touch an active TPU2 MINRES-QLP run. Only after TPU2 is confirmed fully
+idle/clean, operator manually fetches and switches **all** TPU2 workers
+`gn-v4-32-2` (0,1,2,3), with project `fast-second-order`, zone
+`us-central2-b`, and worker repo `/full-gauss-newton`. The old helper
+fingerprint switch restriction applies, so use explicit read-only checks,
+then `git fetch` and `git switch --track`, `git merge --ff-only`.
+Verify every worker is on the *same named branch and commit* as the box248
+TPU2 controller and all are idle. **Never** reset/stash/force a worker or
+change TPU1.
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json
+bash scripts/tpu.sh 2 status
+bash scripts/tpu.sh 2 logs 0
+```
+
+The queue is TPU-resident after initial launch; existing stop is immediate
+and cancels the current trial:
+
+```bash
+bash scripts/tpu.sh 2 stop
+```
+
+Before running the full Adam queue, use
+`scripts/sweeps/adamw_smoke.json` to test both the **direct AdamW trainer
+route** and TPU2 GCS synchronization. Its two B128 configurations each do
+one update and one 50-batch validation, and should automatically advance
+between trials. This is an infrastructure test, **not** a scientific optimizer
+comparison. Run:
+
+```bash
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_smoke.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_smoke.json
+bash scripts/tpu.sh 2 logs 0
+```
+
+Verify both trials finished, all workers report successful exit status 0
+and no managed training processes before starting the expensive Adam queue.
+
+Do not merge this branch or start TPU experiments as part of implementation
+or CI. The operator controls TPU2 deployment and run start.
+
+
+### Historical-comparability rerun (new, opt-in)
+
+The **original** `scripts/sweeps/adamw_followup.json` is retained unchanged
+for provenance (50 validation batches, 2B-token LR schedule). The separate
+`scripts/sweeps/adamw_followup_comparable.json` is the proposed next queue:
+seven ordered runs, keeping B128/LR0.015 while omitting the redundant
+B128/LR0.01, B64/LR0.015, and B128/LR0.02 comparisons. It uses `protocol:
+"adam_followup_600m"` to match the original follow-up evaluation and
+optimization schedule: 8 validation batches, no initial evaluation, roughly
+20M-token validation intervals (611 updates for B32, 153 for B128),
+a 600M-token cosine horizon, 10 warmup updates beginning at initial LR 0,
+end LR equal to 10% of the peak, and optimizer-state saving enabled as
+in the original CLI (while save frequencies remain 0). Unlike the original historical runs, these experiments may continue
+up to 1.2B tokens unless their validation loss reaches 3.25. This **extends
+the old schedule beyond its decay horizon**, rather than stretching decay
+to 1.2B tokens, and is a deliberate experimental choice. The 1.2B token
+ceiling and loss target are retained in resolved flags, not verbose W&B
+notes.
+
+Do not rerun already completed 50-batch experiments expecting their
+historical charts to become directly comparable. Always compare the
+new 8-batch series with the historical 8-batch runs, under the same
+evaluation stream/configuration. If the original run configuration
+differs in other flags, investigate that discrepancy before claiming
+strict equivalence.
+
+After confirming all TPU2 workers idle and clean, and manually
+fast-forwarding the TPU2 feature branch across the controller worktree
+and **all** TPU2 workers to the same commit, preview and launch:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json
+```
+
+Never change or restart active TPU2 training in order to deploy this.
+
+
+### Long-horizon AdamW final-loss comparison
+
+`scripts/sweeps/adamw_long_horizon_primary.json` (five experiments)
+and `scripts/sweeps/adamw_long_horizon_optional.json` (three independent
+follow-ups) are opt-in, full-budget queues. **Neither reruns the historical
+B720 / LR .01 / WD0 / 3000-update result**. The primary set compares
+B128/.01, B256/.01, B384/.01, B720/.01/WD.01, B128/.015
+(β₂=.95, WD0 otherwise). Optional runs are B128/.01/WD.01,
+B512/.01/WD0, and B192/.0125/WD0.
+
+Every run uses **2,211,840,000** solve tokens (rounded down to full updates),
+matching the historical B720/3000-step token budget and cosine horizon.
+The common schedule has 1% peak initial LR (B720 historical run: .0001
+at peak .01), 10% peak final LR, and 7,372,800 warmup tokens
+(10 B720 updates, scaled to the other batch sizes). Each run uses
+8 validation batches per ~74M solve-token interval, the same 150M warmup
+checkpoint, and full FP32. `target_loss=0` disables target-based stopping
+to compare **terminal validation loss** at a common budget. The previous
+B720 reference evaluated 50 batches every update; its validation results
+are not directly interchangeable without a common evaluation protocol.
+
+These are **new independent training runs**, not resumes, and are not limited
+to 20 hours total. Running all five full 2.2B-token primary experiments
+may exceed available TPU time. Do not automatically launch optional runs.
+
+Before launching, check TPU2 idle and clean and synchronize all four
+TPU2 worker checkouts to the exact controller branch and commit.
+Keep TPU1 untouched. Preview, then operator-only launch:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_primary.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_primary.json
+```
+
+Only after results are reviewed, if worthwhile:
+
+```bash
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_optional.json --dry-run
+```
+
+The two new fields in long-horizon specifications
+(`init_lr_fraction`, `warmup_tokens`) affect only the explicit
+`adam_followup_600m` planning mode, not the historical JSON,
+previous runs, GN, or trainer math. Only make branch changes while TPU2
+is confirmed fully idle; never switch running workers.
+
+
+### Eight-trial overnight AdamW queue
+
+`scripts/sweeps/adamw_long_horizon_eight.json` combines the five
+primary and three optional long-horizon trials into a **single** ordered
+eight-run queue. This is a separate new queue spec; the original primary
+and optional files remain intact. Its order is B128/.01/WD0,
+B720/.01/WD.01, B256/.01/WD0, B128/.015/WD0, B384/.01/WD0,
+B128/.01/WD.01, B512/.01/WD0, B192/.0125/WD0; all use β₂=.95.
+It does **not** repeat historical B720/.01/WD0.
+
+This queue preserves 2,211,840,000-token training and cosine horizon,
+7,372,800 warmup tokens, initial LR 1% peak, final LR 10% peak,
+8 validation batches at **approximately 20M training-token intervals**
+(controlled independently by `eval_interval_tokens: 20000000`),
+a common checkpoint, and `target_loss=0` (full-budget final-loss comparison).
+The earlier version of this queue evaluated approximately every 74M
+tokens; the revised source changes only future launches. It cannot
+retroactively add evaluations to a queue already running, whose trial
+plans were resolved at launch. Do not replace running workers or restart
+the existing queue solely for plotting cadence.
+**Eight full runs may last far beyond one night.** There is no total
+wall-clock deadline: a healthy queue keeps executing after the operator
+disconnects. It does not recover automatically from preemption or
+Hugging Face outages; the failed trial is not checkpoint-resumable
+with `save_model_freq=0` and `save_milestone_freq=0`. No additional
+training or checkpointing changes were introduced here.
+
+After verifying TPU2 **all four workers idle and clean**, operator manually
+syncs box248's AdamW worktree and all TPU2 worker checkouts to the exact
+same new feature-branch SHA. Only then:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_eight.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_eight.json
+bash scripts/tpu.sh 2 logs 0
+```
+
+Do not launch this queue if the five-run primary queue has already begun;
+the new queue would duplicate its first runs and preflight would reject
+active workers. Preserve active training instead.
+
+
+### Remaining AdamW runs with numbered W&B names
+
+`scripts/sweeps/adamw_long_horizon_remaining.json` is a separate,
+future-only, seven-run configuration that excludes the first B128/.01/WD0
+experiment, which the operator has already mostly completed. It retains
+the other distinct B128 experiments and all B720/B256/B384/B512/B192
+candidates. Names and W&B `notes` explicitly preserve original ordinal
+labels `adam_trial2_...` through `adam_trial8_...`.
+Inside this new queue their synchronization/index sequence is 1 through 7;
+the preserved numbering is only a readable W&B name, **not** a resume
+index, and every run starts independently from the warmup checkpoint.
+
+The `notes_from_trial_name: true` flag is opt-in and affects only the
+new queue; older queues retain existing W&B notes. The 20M-token
+evaluation cadence, eight validation batches, **2.21B-token common cosine
+schedule**, token-matched warmup, and `target_loss=0` are unchanged.
+The new queue intentionally assigns **2.21184B training tokens to trials
+2 (B720/WD.01) and 4 (B128/LR.015)**, but only **1.45B training tokens
+to trials 3, 5, 6, 7, and 8**. The shorter runs stop before completing
+the common LR decay, so their endpoint validation losses are screening
+measurements, not fully decayed final-loss comparisons. These per-trial
+budgets do not alter the learning-rate schedule.
+No checkpoint/resume behavior was added.
+
+**Do not deploy while the old eight-run queue is still active.** A
+currently running resident queue has fixed plans, so changing the
+file or updating its repository cannot remove the queued trial safely.
+If it is already running, preserve it and use the revised queue only
+after the original queue exits and the operator confirms which
+experiments remain necessary. Do not launch duplicate trials.
+
+```bash
+# After all four TPU2 workers are idle, clean, and on the same new commit:
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json
+```

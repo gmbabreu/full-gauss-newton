@@ -245,10 +245,19 @@ def main(argv=None):
         print('Queue run ID:', plan['run_id'], 'GCS:', plan['queue_root'], flush=True)
         for item in plan['trials']:
             flags = item['plan']['flags']
-            print('trial', item['index'], item['name'], 'batch', flags['train_dataset_batch_size'],
-                  'LR', flags['inner_loop_lr'], 'micro', flags['n_micro'],
-                  'updates', flags['total_steps'], 'actual solve tokens', item['actual_solve_tokens'],
-                  'run ID', item['plan']['run_id'], flush=True)
+            if plan['preset'] == 'adam':
+                print('trial', item['index'], item['name'], 'batch', flags['train_dataset_batch_size'],
+                      'LR', flags['optimizer.adamw_optimizer.lr'],
+                      'b2', flags['optimizer.adamw_optimizer.b2'],
+                      'WD', flags['optimizer.adamw_optimizer.weight_decay'],
+                      'updates', flags['total_steps'], 'actual solve tokens', item['actual_solve_tokens'],
+                      'target loss', flags['target_loss'],
+                      'run ID', item['plan']['run_id'], flush=True)
+            else:
+                print('trial', item['index'], item['name'], 'batch', flags['train_dataset_batch_size'],
+                      'LR', flags['inner_loop_lr'], 'micro', flags['n_micro'],
+                      'updates', flags['total_steps'], 'actual solve tokens', item['actual_solve_tokens'],
+                      'run ID', item['plan']['run_id'], flush=True)
         if len(rest) == 2:
             print(json.dumps(plan, indent=2))
             print('DRY RUN: no GCP calls, TPU launches, or trainer imports.')

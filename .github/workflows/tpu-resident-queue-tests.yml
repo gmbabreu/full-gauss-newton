@@ -2,7 +2,7 @@ name: TPU resident queue CPU tests
 
 on:
   pull_request:
-    branches: [gn-adam-sweep]
+    branches: [gn-adam-sweep, codex/tpu-resident-queue-implementation]
     paths:
       - 'scripts/**'
       - '.github/workflows/tpu-resident-queue-tests.yml'
@@ -37,5 +37,42 @@ jobs:
           bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json --dry-run > /tmp/queue-smoke.log
           grep 'smoke_B256_K1' /tmp/queue-smoke.log
           grep 'smoke_B256_K2' /tmp/queue-smoke.log
+      - name: AdamW ten-trial queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup.json --dry-run > /tmp/adamw-preview.log
+          grep 'Adam_B128_lr0.02_b20.95_wd0' /tmp/adamw-preview.log
+          grep 'Adam_B128_lr0.01_b20.98_wd0' /tmp/adamw-preview.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-preview.log
+      - name: AdamW direct-route two-trial smoke dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_smoke.json --dry-run > /tmp/adamw-smoke-preview.log
+          grep 'smoke_Adam_B128_lr0.01' /tmp/adamw-smoke-preview.log
+          grep 'smoke_Adam_B128_lr0.015' /tmp/adamw-smoke-preview.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-smoke-preview.log
+      - name: Legacy-comparable AdamW queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json --dry-run > /tmp/adamw-comparable-preview.log
+          grep 'Adam_B128_lr0.015_b20.95_wd0' /tmp/adamw-comparable-preview.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-comparable-preview.log
+      - name: Long-horizon AdamW queues dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_primary.json --dry-run > /tmp/adamw-long-primary.log
+          grep 'Adam_B720_lr0.01_wd0.01_long' /tmp/adamw-long-primary.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-long-primary.log
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_optional.json --dry-run > /tmp/adamw-long-optional.log
+          grep 'Adam_B192_lr0.0125_long' /tmp/adamw-long-optional.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-long-optional.log
+      - name: Eight-trial overnight AdamW queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_eight.json --dry-run > /tmp/adamw-long-eight.log
+          grep 'Adam_B720_lr0.01_wd0.01_long' /tmp/adamw-long-eight.log
+          grep 'Adam_B192_lr0.0125_long' /tmp/adamw-long-eight.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-long-eight.log
+      - name: Numbered remaining AdamW queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json --dry-run > /tmp/adamw-long-remaining.log
+          grep 'adam_trial2_B720_lr0.01_wd0.01' /tmp/adamw-long-remaining.log
+          grep 'adam_trial8_B192_lr0.0125_wd0' /tmp/adamw-long-remaining.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-long-remaining.log
       - name: Repository TPU workflow and resident queue tests
         run: python -m unittest discover -s scripts/tests -v

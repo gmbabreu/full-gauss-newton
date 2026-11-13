@@ -106,6 +106,358 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(f['load_checkpoint'], 'trainstate_params::gs://gfn-soo/checkpoints/warmup_150m/1_0/streaming_train_state')
         self.assertEqual(len({t['plan']['run_id'] for t in plan['trials']}), len(expectation))
 
+    def test_adam_spec_strict_validation(self):
+        p = {'preset': 'adam', 'default_solve_tokens': 1200000000,
+             'schedule_tokens': 2000000000, 'target_loss': 3.25,
+             'trials': [{'name': 'Adam_B128', 'batch': 128, 'lr': .01,
+                         'b2': .95, 'weight_decay': 0}]}
+        queue.parse_spec(p)
+        invalid = [
+            {'batch': 0}, {'batch': 127}, {'lr': float('nan')},
+            {'lr': 0}, {'b2': 1}, {'b2': 0}, {'weight_decay': -1},
+            {'name': '../escape'}, {'solve_tokens': 100}
+        ]
+        for patch in invalid:
+            bad = dict(p, trials=[dict(p['trials'][0], **patch)])
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                queue.parse_spec(bad)
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            queue.parse_spec(dict(p, trials=p['trials'] * 2))
+        with self.assertRaisesRegex(ValueError, 'target_loss'):
+            queue.parse_spec(dict(p, target_loss=float('nan')))
+
+    def test_adam_followup_real_config_and_short_notes(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup.json'
+        spec = json.loads(path.read_text())
+        plan = queue.make_queue_plan(spec, queue_id='adam-controlled')
+        expected = [(128,.01,.95,0), (128,.015,.95,0),
+                    (128,.02,.95,0), (64,.015,.95,0),
+                    (192,.01,.95,0), (256,.015,.95,0),
+                    (128,.01,.98,0), (128,.01,.99,0),
+                    (128,.01,.95,.001), (128,.01,.95,.01)]
+        self.assertEqual(len(plan['trials']), len(expected))
+        run_ids = set()
+        for item, (b, lr, b2, wd) in zip(plan['trials'], expected):
+            p = item['plan']
+            f = p['flags']
+            self.assertEqual(p['preset'], 'adam')
+            self.assertEqual(p['route'], 'direct')
+            self.assertEqual(p['program'], 'EasyLM.models.llama.llama_train')
+            self.assertEqual(int(f['train_dataset_batch_size']), b)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
+            self.assertEqual(int(f['total_steps']), 1200000000 // (b*1024))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             -(-2000000000 // (b*1024)))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             max(1, __import__('math').ceil(.01 * (-(-2000000000 // (b*1024))))))
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.b2']), b2)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.1)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+            self.assertEqual(f['optimizer.adamw_optimizer.lr_sched'], 'cosine')
+            self.assertEqual(float(f['target_loss']), 3.25)
+            self.assertEqual(int(f['eval_steps']), 50)
+            self.assertEqual(int(f['optimizer.accumulate_gradient_steps']), 1)
+            self.assertIn('150m', f['load_checkpoint'])
+            self.assertEqual(f['notes'], f'Adam_B{b}_lr{lr:g}_b2{b2:g}_wd{wd:g}')
+            self.assertNotIn('_T', f['notes'])
+            self.assertNotIn('seed42', f['notes'])
+            self.assertNotIn('_0', p['experiment_id'])
+            self.assertEqual(item['actual_solve_tokens'], b * 1024 * int(f['total_steps']))
+            run_ids.add(p['run_id'])
+        self.assertEqual(len(run_ids), len(expected))
+        self.assertEqual(plan['preset'], 'adam')
+
+    def test_adam_legacy_eight_batch_comparability(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup_comparable.json'
+        spec = json.loads(path.read_text())
+        self.assertEqual(spec['protocol'], 'adam_followup_600m')
+        self.assertEqual(spec['schedule_tokens'], 599982080)
+        plan = queue.make_queue_plan(spec, queue_id='legacy-comparable')
+        self.assertEqual(len(plan['trials']), 7)
+        self.assertEqual(plan['trials'][0]['plan']['flags']['notes'],
+                         'Adam_B128_lr0.015_b20.95_wd0')
+        omitted = {'Adam_B128_lr0.02_b20.95_wd0',
+                   'Adam_B128_lr0.01_b20.95_wd0',
+                   'Adam_B64_lr0.015_b20.95_wd0'}
+        self.assertTrue(omitted.isdisjoint(
+            {t['plan']['flags']['notes'] for t in plan['trials']}))
+        for t in plan['trials']:
+            f = t['plan']['flags']
+            batch = int(f['train_dataset_batch_size'])
+            unit = batch * 1024
+            old_horizon = 599982080 // unit
+            old_eval = -(-old_horizon // 30)
+            self.assertEqual(int(f['eval_steps']), 8)
+            self.assertEqual(f['log_initial_eval'], 'False')
+            self.assertEqual(int(f['log_freq']), old_eval)
+            self.assertEqual(int(f['eval_freq']), old_eval)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             old_horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']), 10)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']), 0)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.end_lr']),
+                             float(f['optimizer.adamw_optimizer.lr']) * .1)
+            self.assertEqual(f['checkpointer.save_optimizer_state'], 'True')
+            self.assertEqual(int(f['total_steps']), 1200000000 // unit)
+            self.assertEqual(float(f['target_loss']), 3.25)
+        # Original pasted B32 command (600M solve tokens).
+        historical = queue.build_adam_plan(
+            1, {'batch': 32, 'lr': .005, 'b2': .95, 'weight_decay': 0},
+            599982080, 599982080, 3.25, protocol='adam_followup_600m')['flags']
+        for key, expected in {
+            'total_steps': 18310,
+            'log_freq': 611,
+            'eval_freq': 611,
+            'eval_steps': 8,
+            'optimizer.adamw_optimizer.lr_warmup_steps': 10,
+            'optimizer.adamw_optimizer.lr_decay_steps': 18310,
+            'optimizer.adamw_optimizer.init_lr': 0.0,
+            'optimizer.adamw_optimizer.end_lr': .0005,
+            'checkpointer.save_optimizer_state': 'True',
+            'log_initial_eval': 'False',
+        }.items():
+            if isinstance(expected, (int, float)):
+                self.assertEqual(float(historical[key]), float(expected))
+            else:
+                self.assertEqual(historical[key], expected)
+        # B128 keeps the historical ~20M-token cadence: 153 steps.
+        self.assertEqual(int(plan['trials'][0]['plan']['flags']['eval_freq']), 153)
+        old = queue.make_queue_plan(json.loads(
+            (Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_followup.json').read_text()),
+            queue_id='original-new')
+        self.assertEqual(int(old['trials'][0]['plan']['flags']['eval_steps']), 50)
+        self.assertEqual(old['trials'][0]['plan']['flags']['log_initial_eval'], 'True')
+        # Both versions intentionally evaluate around every 20M tokens,
+        # but differ in validation batch count and warmup.
+        self.assertEqual(old['trials'][0]['plan']['flags']['eval_freq'],
+                         plan['trials'][0]['plan']['flags']['eval_freq'])
+
+    def test_adam_long_horizon_queues_exact_protocol(self):
+        from math import ceil
+        root = Path(__file__).resolve().parents[1] / 'sweeps'
+        expected = {
+            'adamw_long_horizon_primary.json': [
+                (128, .01, .95, 0),
+                (256, .01, .95, 0),
+                (384, .01, .95, 0),
+                (720, .01, .95, .01),
+                (128, .015, .95, 0),
+            ],
+            'adamw_long_horizon_optional.json': [
+                (128, .01, .95, .01),
+                (512, .01, .95, 0),
+                (192, .0125, .95, 0),
+            ],
+        }
+        for filename, rows in expected.items():
+            with self.subTest(filename=filename):
+                spec = json.loads((root / filename).read_text())
+                self.assertEqual(spec['target_loss'], 0)
+                self.assertEqual(spec['schedule_tokens'], 2_211_840_000)
+                self.assertEqual(spec['default_solve_tokens'], 2_211_840_000)
+                plan = queue.make_queue_plan(spec, queue_id='long-horizon')
+                self.assertEqual(len(plan['trials']), len(rows))
+                for trial, (batch, lr, beta2, wd) in zip(plan['trials'], rows):
+                    f = trial['plan']['flags']
+                    unit = batch * 1024
+                    horizon = 2_211_840_000 // unit
+                    self.assertEqual(int(f['train_dataset_batch_size']), batch)
+                    self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), batch)
+                    self.assertEqual(int(f['total_steps']), horizon)
+                    self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']), horizon)
+                    self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                                     ceil(7_372_800 / unit))
+                    self.assertEqual(int(f['eval_steps']), 8)
+                    self.assertEqual(f['log_initial_eval'], 'False')
+                    self.assertEqual(int(f['log_freq']), ceil(horizon / 30))
+                    self.assertEqual(int(f['eval_freq']), ceil(horizon / 30))
+                    self.assertEqual(float(f['target_loss']), 0)
+                    self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+                    self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
+                    self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+                    self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.b2']), beta2)
+                    self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+                    self.assertEqual(f['optimizer.adamw_optimizer.lr_sched'], 'cosine')
+                    self.assertIn('150m', f['load_checkpoint'])
+                    self.assertEqual(f['checkpointer.save_optimizer_state'], 'True')
+                    self.assertEqual(int(trial['actual_solve_tokens']), horizon*unit)
+        # Historical B720 reference is 3000 updates at 2,211,840,000 tokens.
+        b720 = queue.build_adam_plan(
+            1, {'batch': 720, 'lr': .01, 'b2': .95, 'weight_decay': 0},
+            2_211_840_000, 2_211_840_000, 0,
+            protocol='adam_followup_600m',
+            init_lr_fraction=.01, warmup_tokens=7_372_800)['flags']
+        self.assertEqual(int(b720['total_steps']), 3000)
+        self.assertEqual(int(b720['optimizer.adamw_optimizer.lr_decay_steps']), 3000)
+        self.assertEqual(int(b720['optimizer.adamw_optimizer.lr_warmup_steps']), 10)
+        self.assertEqual(float(b720['optimizer.adamw_optimizer.init_lr']), .0001)
+        self.assertEqual(float(b720['optimizer.adamw_optimizer.end_lr']), .001)
+
+    def test_eight_trial_overnight_queue(self):
+        from math import ceil
+        root = Path(__file__).resolve().parents[1] / 'sweeps'
+        spec = json.loads((root / 'adamw_long_horizon_eight.json').read_text())
+        plan = queue.make_queue_plan(spec, queue_id='overnight-controlled')
+        expected = [
+            (128, .01, 0),
+            (720, .01, .01),
+            (256, .01, 0),
+            (128, .015, 0),
+            (384, .01, 0),
+            (128, .01, .01),
+            (512, .01, 0),
+            (192, .0125, 0),
+        ]
+        self.assertEqual(len(plan['trials']), 8)
+        self.assertEqual(spec['target_loss'], 0)
+        self.assertEqual(spec['schedule_tokens'], 2_211_840_000)
+        self.assertEqual(spec['default_solve_tokens'], 2_211_840_000)
+        self.assertEqual(spec['warmup_tokens'], 7_372_800)
+        self.assertEqual(spec['init_lr_fraction'], .01)
+        self.assertEqual(spec['eval_interval_tokens'], 20_000_000)
+        self.assertEqual(spec['protocol'], 'adam_followup_600m')
+        names = []
+        for trial, (batch, lr, wd) in zip(plan['trials'], expected):
+            f = trial['plan']['flags']
+            names.append(trial['name'])
+            unit = batch * 1024
+            horizon = 2_211_840_000 // unit
+            self.assertEqual(int(f['train_dataset_batch_size']), batch)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), batch)
+            self.assertEqual(int(f['total_steps']), horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']), horizon)
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             ceil(7_372_800 / unit))
+            self.assertEqual(int(f['eval_steps']), 8)
+            self.assertEqual(int(f['eval_freq']), ceil(20_000_000 / unit))
+            self.assertEqual(int(f['log_freq']), ceil(20_000_000 / unit))
+            self.assertEqual(f['log_initial_eval'], 'False')
+            self.assertEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
+            self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.b2']), .95)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertEqual(float(f['target_loss']), 0)
+            self.assertEqual(int(trial['actual_solve_tokens']), horizon * unit)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertNotIn('Adam_B720_lr0.01_long', names)
+
+    def test_adam_remaining_queue_preserves_ordinal_wandb_names(self):
+        root = Path(__file__).resolve().parents[1] / 'sweeps'
+        spec = json.loads((root / 'adamw_long_horizon_remaining.json').read_text())
+        self.assertTrue(spec['notes_from_trial_name'])
+        self.assertEqual(spec['eval_interval_tokens'], 20_000_000)
+        plan = queue.make_queue_plan(spec, queue_id='remaining-controlled')
+        expected = [
+            (2,720,.01,.01,2_211_840_000),
+            (3,256,.01,0,1_450_000_000),
+            (4,128,.015,0,2_211_840_000),
+            (5,384,.01,0,1_450_000_000),
+            (6,128,.01,.01,1_450_000_000),
+            (7,512,.01,0,1_450_000_000),
+            (8,192,.0125,0,1_450_000_000),
+        ]
+        self.assertEqual(len(plan['trials']), len(expected))
+        for trial,(ordinal,batch,lr,wd,requested_tokens) in zip(plan['trials'],expected):
+            f=trial['plan']['flags']
+            self.assertEqual(trial['index'], ordinal-1)
+            self.assertEqual(trial['name'], f'adam_trial{ordinal}_B{batch}_lr{lr}_wd{wd}')
+            self.assertEqual(f['notes'], trial['name'])
+            self.assertEqual(int(f['train_dataset_batch_size']), batch)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertEqual(int(f['eval_steps']),8)
+            self.assertEqual(int(f['eval_freq']), -(-20_000_000//(batch*1024)))
+            self.assertEqual(trial['requested_solve_tokens'], requested_tokens)
+            self.assertEqual(int(f['total_steps']), requested_tokens//(batch*1024))
+            self.assertEqual(trial['actual_solve_tokens'],
+                             (requested_tokens//(batch*1024))*batch*1024)
+            # Truncated screening trials keep the same 2.21B-token LR
+            # schedule; only their run length differs.
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             2_211_840_000//(batch*1024))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             -(-7_372_800//(batch*1024)))
+            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
+            self.assertEqual(float(f['target_loss']),0)
+        self.assertEqual(sum(t['requested_solve_tokens'] for t in plan['trials']),
+                         2*2_211_840_000 + 5*1_450_000_000)
+        self.assertFalse(any(t['name']=='adam_trial1_B128_lr0.01_wd0' for t in plan['trials']))
+        # Old queues still retain their previous name generation.
+        original=json.loads((root/'adamw_long_horizon_eight.json').read_text())
+        old=queue.make_queue_plan(original,queue_id='historical-eight')
+        self.assertTrue(old['trials'][0]['plan']['flags']['notes'].startswith('Adam_B128_'))
+        with self.assertRaisesRegex(ValueError, 'notes_from_trial_name'):
+            queue.parse_spec(dict(spec,notes_from_trial_name='yes'))
+
+    def test_adam_long_horizon_rejects_invalid_overrides(self):
+        spec = {'preset': 'adam', 'default_solve_tokens': 2_211_840_000,
+                'schedule_tokens': 2_211_840_000, 'target_loss': 0,
+                'protocol': 'adam_followup_600m',
+                'init_lr_fraction': .01, 'warmup_tokens': 7_372_800,
+                'trials': [{'name': 'test', 'batch': 128, 'lr': .01,
+                            'b2': .95, 'weight_decay': 0}]}
+        queue.parse_spec(spec)
+        for override in ({'init_lr_fraction': -1}, {'init_lr_fraction': 1.1},
+                         {'init_lr_fraction': float('nan')}, {'warmup_tokens': 0},
+                         {'target_loss': -1}, {'target_loss': float('nan')},
+                         {'eval_interval_tokens': 0},
+                         {'eval_interval_tokens': 0.5},
+                         {'protocol': 'unknown'}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                queue.parse_spec(dict(spec, **override))
+        with self.assertRaisesRegex(ValueError, 'require'):
+            queue.parse_spec(dict(spec, protocol=None))
+        # The old 600M run had ~20M-token evaluation intervals.
+        old = queue.build_adam_plan(
+            1, {'batch': 32, 'lr': .005, 'b2': .95, 'weight_decay': 0},
+            599_982_080, 599_982_080, 0,
+            protocol='adam_followup_600m', eval_interval_tokens=20_000_000)['flags']
+        self.assertEqual(int(old['eval_freq']), 611)
+        self.assertEqual(int(old['eval_steps']), 8)
+        # Explicit evaluation cadence must not alter the LR schedule.
+        reference = queue.build_adam_plan(
+            1, spec['trials'][0], 2_211_840_000, 2_211_840_000, 0,
+            protocol='adam_followup_600m', init_lr_fraction=.01,
+            warmup_tokens=7_372_800)['flags']
+        modified = queue.build_adam_plan(
+            1, spec['trials'][0], 2_211_840_000, 2_211_840_000, 0,
+            protocol='adam_followup_600m', init_lr_fraction=.01,
+            warmup_tokens=7_372_800, eval_interval_tokens=20_000_000)['flags']
+        for key in ('total_steps', 'optimizer.adamw_optimizer.lr_decay_steps',
+                    'optimizer.adamw_optimizer.lr_warmup_steps',
+                    'optimizer.adamw_optimizer.init_lr',
+                    'optimizer.adamw_optimizer.end_lr'):
+            self.assertEqual(reference[key], modified[key])
+        self.assertNotEqual(reference['eval_freq'], modified['eval_freq'])
+
+    def test_adam_smoke_evaluates_each_single_update(self):
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_smoke.json'
+        plan = queue.make_queue_plan(json.loads(path.read_text()), queue_id='smoke-controlled')
+        self.assertEqual(len(plan['trials']), 2)
+        for item in plan['trials']:
+            f = item['plan']['flags']
+            self.assertEqual(int(f['total_steps']), 1)
+            self.assertEqual(int(f['eval_freq']), 1)
+            self.assertEqual(int(f['log_freq']), 1)
+            self.assertEqual(int(f['eval_steps']), 50)
+            self.assertEqual(float(f['target_loss']), 3.25)
+            self.assertEqual(item['requested_solve_tokens'], 131072)
+
+    def test_gn_queue_still_uses_existing_builder(self):
+        p = queue.make_queue_plan({
+            'preset': 'gn_adam', 'default_solve_tokens': 150000000,
+            'schedule_tokens': 1000000000,
+            'trials': [{'name': 'GN_B4096', 'batch': 4096,
+                        'inner_lr': .002, 'n_micro': 8}]},
+            queue_id='gn-controlled')
+        self.assertEqual(p['preset'], 'gn_adam')
+        self.assertEqual(p['trials'][0]['plan']['route'], 'sweep')
+        self.assertEqual(int(p['trials'][0]['plan']['flags']['inner_loop_iter']), 50)
+
     def test_plan_hash_and_worker_count(self):
         p = fixture((2, 3), count=1)
         queue.verify_plan(p, 2)
