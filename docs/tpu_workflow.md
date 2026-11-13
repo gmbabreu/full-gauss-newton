@@ -654,8 +654,14 @@ It does **not** repeat historical B720/.01/WD0.
 
 This queue preserves 2,211,840,000-token training and cosine horizon,
 7,372,800 warmup tokens, initial LR 1% peak, final LR 10% peak,
-8 validation batches at roughly 74M training-token intervals,
+8 validation batches at **approximately 20M training-token intervals**
+(controlled independently by `eval_interval_tokens: 20000000`),
 a common checkpoint, and `target_loss=0` (full-budget final-loss comparison).
+The earlier version of this queue evaluated approximately every 74M
+tokens; the revised source changes only future launches. It cannot
+retroactively add evaluations to a queue already running, whose trial
+plans were resolved at launch. Do not replace running workers or restart
+the existing queue solely for plotting cadence.
 **Eight full runs may last far beyond one night.** There is no total
 wall-clock deadline: a healthy queue keeps executing after the operator
 disconnects. It does not recover automatically from preemption or
