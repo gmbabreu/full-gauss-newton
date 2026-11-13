@@ -344,6 +344,43 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertNotIn('Adam_B720_lr0.01_long', names)
 
+    def test_adam_remaining_queue_preserves_ordinal_wandb_names(self):
+        root = Path(__file__).resolve().parents[1] / 'sweeps'
+        spec = json.loads((root / 'adamw_long_horizon_remaining.json').read_text())
+        self.assertTrue(spec['notes_from_trial_name'])
+        self.assertEqual(spec['eval_interval_tokens'], 20_000_000)
+        plan = queue.make_queue_plan(spec, queue_id='remaining-controlled')
+        expected = [
+            (2,720,.01,.01),
+            (3,256,.01,0),
+            (4,128,.015,0),
+            (5,384,.01,0),
+            (6,128,.01,.01),
+            (7,512,.01,0),
+            (8,192,.0125,0),
+        ]
+        self.assertEqual(len(plan['trials']), len(expected))
+        for trial,(ordinal,batch,lr,wd) in zip(plan['trials'],expected):
+            f=trial['plan']['flags']
+            self.assertEqual(trial['index'], ordinal-1)
+            self.assertEqual(trial['name'], f'adam_trial{ordinal}_B{batch}_lr{lr}_wd{wd}')
+            self.assertEqual(f['notes'], trial['name'])
+            self.assertEqual(int(f['train_dataset_batch_size']), batch)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
+            self.assertEqual(int(f['eval_steps']),8)
+            self.assertEqual(int(f['eval_freq']), -(-20_000_000//(batch*1024)))
+            self.assertEqual(int(f['total_steps']), 2_211_840_000//(batch*1024))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),2_211_840_000//(batch*1024))
+            self.assertEqual(float(f['target_loss']),0)
+        self.assertFalse(any(t['name']=='adam_trial1_B128_lr0.01_wd0' for t in plan['trials']))
+        # Old queues still retain their previous name generation.
+        original=json.loads((root/'adamw_long_horizon_eight.json').read_text())
+        old=queue.make_queue_plan(original,queue_id='historical-eight')
+        self.assertTrue(old['trials'][0]['plan']['flags']['notes'].startswith('Adam_B128_'))
+        with self.assertRaisesRegex(ValueError, 'notes_from_trial_name'):
+            queue.parse_spec(dict(spec,notes_from_trial_name='yes'))
+
     def test_adam_long_horizon_rejects_invalid_overrides(self):
         spec = {'preset': 'adam', 'default_solve_tokens': 2_211_840_000,
                 'schedule_tokens': 2_211_840_000, 'target_loss': 0,
