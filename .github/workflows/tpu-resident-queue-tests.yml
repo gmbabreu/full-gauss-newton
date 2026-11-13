@@ -68,5 +68,11 @@ jobs:
           grep 'Adam_B720_lr0.01_wd0.01_long' /tmp/adamw-long-eight.log
           grep 'Adam_B192_lr0.0125_long' /tmp/adamw-long-eight.log
           grep 'DRY RUN: no GCP calls' /tmp/adamw-long-eight.log
+      - name: Numbered remaining AdamW queue dry-run
+        run: |
+          bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json --dry-run > /tmp/adamw-long-remaining.log
+          grep 'adam_trial2_B720_lr0.01_wd0.01' /tmp/adamw-long-remaining.log
+          grep 'adam_trial8_B192_lr0.0125_wd0' /tmp/adamw-long-remaining.log
+          grep 'DRY RUN: no GCP calls' /tmp/adamw-long-remaining.log
       - name: Repository TPU workflow and resident queue tests
         run: python -m unittest discover -s scripts/tests -v
