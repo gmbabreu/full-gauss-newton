@@ -63,5 +63,6 @@
       "b2": 0.95,
       "weight_decay": 0
     }
-  ]
+  ],
+  "eval_interval_tokens": 20000000
 }
