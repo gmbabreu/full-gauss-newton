@@ -592,3 +592,51 @@ bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_followup_comparable.json
 ```
 
 Never change or restart active TPU2 training in order to deploy this.
+
+
+### Long-horizon AdamW final-loss comparison
+
+`scripts/sweeps/adamw_long_horizon_primary.json` (five experiments)
+and `scripts/sweeps/adamw_long_horizon_optional.json` (three independent
+follow-ups) are opt-in, full-budget queues. **Neither reruns the historical
+B720 / LR .01 / WD0 / 3000-update result**. The primary set compares
+B128/.01, B256/.01, B384/.01, B720/.01/WD.01, B128/.015
+(β₂=.95, WD0 otherwise). Optional runs are B128/.01/WD.01,
+B512/.01/WD0, and B192/.0125/WD0.
+
+Every run uses **2,211,840,000** solve tokens (rounded down to full updates),
+matching the historical B720/3000-step token budget and cosine horizon.
+The common schedule has 1% peak initial LR (B720 historical run: .0001
+at peak .01), 10% peak final LR, and 7,372,800 warmup tokens
+(10 B720 updates, scaled to the other batch sizes). Each run uses
+8 validation batches per ~74M solve-token interval, the same 150M warmup
+checkpoint, and full FP32. `target_loss=0` disables target-based stopping
+to compare **terminal validation loss** at a common budget. The previous
+B720 reference evaluated 50 batches every update; its validation results
+are not directly interchangeable without a common evaluation protocol.
+
+These are **new independent training runs**, not resumes, and are not limited
+to 20 hours total. Running all five full 2.2B-token primary experiments
+may exceed available TPU time. Do not automatically launch optional runs.
+
+Before launching, check TPU2 idle and clean and synchronize all four
+TPU2 worker checkouts to the exact controller branch and commit.
+Keep TPU1 untouched. Preview, then operator-only launch:
+
+```bash
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_primary.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_primary.json
+```
+
+Only after results are reviewed, if worthwhile:
+
+```bash
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_optional.json --dry-run
+```
+
+The two new fields in long-horizon specifications
+(`init_lr_fraction`, `warmup_tokens`) affect only the explicit
+`adam_followup_600m` planning mode, not the historical JSON,
+previous runs, GN, or trainer math. Only make branch changes while TPU2
+is confirmed fully idle; never switch running workers.
