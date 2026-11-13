@@ -32,10 +32,13 @@ def parse_adam_spec(spec):
     """Strict AdamW queue schema; GN queue schema remains unchanged."""
     required = {'preset', 'default_solve_tokens', 'schedule_tokens',
                 'target_loss', 'trials'}
-    optional = {'protocol', 'init_lr_fraction', 'warmup_tokens', 'eval_interval_tokens'}
+    optional = {'protocol', 'init_lr_fraction', 'warmup_tokens', 'eval_interval_tokens',
+                'notes_from_trial_name'}
     if not required.issubset(spec) or set(spec) - required - optional:
         raise ValueError('Invalid Adam queue configuration fields')
     protocol = spec.get('protocol')
+    if type(spec.get('notes_from_trial_name', False)) is not bool:
+        raise ValueError('notes_from_trial_name must be a boolean')
     if protocol not in (None, 'adam_followup_600m'):
         raise ValueError('Unsupported Adam evaluation/schedule protocol')
     if 'init_lr_fraction' in spec:
@@ -92,7 +95,7 @@ def parse_adam_spec(spec):
 
 def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
                     protocol=None, init_lr_fraction=None, warmup_tokens=None,
-                    eval_interval_tokens=None):
+                    eval_interval_tokens=None, notes=None):
     """One AdamW run. The named legacy protocol preserves old follow-up settings."""
     from run_experiment import make_plan
     batch = item['batch']
@@ -148,7 +151,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
         'weight_average': False,
         'save_model_freq': 0, 'save_milestone_freq': 0,
         'checkpointer.save_optimizer_state': protocol == 'adam_followup_600m',
-        'notes': f'Adam_B{batch}_lr{lr:g}_b2{b2:g}_wd{wd:g}',
+        'notes': notes if notes is not None else f'Adam_B{batch}_lr{lr:g}_b2{b2:g}_wd{wd:g}',
     }
     return make_plan('adam', [f'--{key}={value}' for key, value in flags.items()])
 
@@ -217,7 +220,8 @@ def make_queue_plan(spec, *, queue_id=None):
                                 spec['target_loss'], protocol=spec.get('protocol'),
                                 init_lr_fraction=spec.get('init_lr_fraction'),
                                 warmup_tokens=spec.get('warmup_tokens'),
-                                eval_interval_tokens=spec.get('eval_interval_tokens'))
+                                eval_interval_tokens=spec.get('eval_interval_tokens'),
+                                notes=item['name'] if spec.get('notes_from_trial_name', False) else None)
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
