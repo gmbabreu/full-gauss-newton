@@ -316,6 +316,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(spec['default_solve_tokens'], 2_211_840_000)
         self.assertEqual(spec['warmup_tokens'], 7_372_800)
         self.assertEqual(spec['init_lr_fraction'], .01)
+        self.assertEqual(spec['eval_interval_tokens'], 20_000_000)
         self.assertEqual(spec['protocol'], 'adam_followup_600m')
         names = []
         for trial, (batch, lr, wd) in zip(plan['trials'], expected):
@@ -330,8 +331,8 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
                              ceil(7_372_800 / unit))
             self.assertEqual(int(f['eval_steps']), 8)
-            self.assertEqual(int(f['eval_freq']), ceil(horizon / 30))
-            self.assertEqual(int(f['log_freq']), ceil(horizon / 30))
+            self.assertEqual(int(f['eval_freq']), ceil(20_000_000 / unit))
+            self.assertEqual(int(f['log_freq']), ceil(20_000_000 / unit))
             self.assertEqual(f['log_initial_eval'], 'False')
             self.assertEqual(float(f['optimizer.adamw_optimizer.lr']), lr)
             self.assertAlmostEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
@@ -354,11 +355,35 @@ class QueueTests(unittest.TestCase):
         for override in ({'init_lr_fraction': -1}, {'init_lr_fraction': 1.1},
                          {'init_lr_fraction': float('nan')}, {'warmup_tokens': 0},
                          {'target_loss': -1}, {'target_loss': float('nan')},
+                         {'eval_interval_tokens': 0},
+                         {'eval_interval_tokens': 0.5},
                          {'protocol': 'unknown'}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 queue.parse_spec(dict(spec, **override))
         with self.assertRaisesRegex(ValueError, 'require'):
             queue.parse_spec(dict(spec, protocol=None))
+        # The old 600M run had ~20M-token evaluation intervals.
+        old = queue.build_adam_plan(
+            1, {'batch': 32, 'lr': .005, 'b2': .95, 'weight_decay': 0},
+            599_982_080, 599_982_080, 0,
+            protocol='adam_followup_600m', eval_interval_tokens=20_000_000)['flags']
+        self.assertEqual(int(old['eval_freq']), 611)
+        self.assertEqual(int(old['eval_steps']), 8)
+        # Explicit evaluation cadence must not alter the LR schedule.
+        reference = queue.build_adam_plan(
+            1, spec['trials'][0], 2_211_840_000, 2_211_840_000, 0,
+            protocol='adam_followup_600m', init_lr_fraction=.01,
+            warmup_tokens=7_372_800)['flags']
+        modified = queue.build_adam_plan(
+            1, spec['trials'][0], 2_211_840_000, 2_211_840_000, 0,
+            protocol='adam_followup_600m', init_lr_fraction=.01,
+            warmup_tokens=7_372_800, eval_interval_tokens=20_000_000)['flags']
+        for key in ('total_steps', 'optimizer.adamw_optimizer.lr_decay_steps',
+                    'optimizer.adamw_optimizer.lr_warmup_steps',
+                    'optimizer.adamw_optimizer.init_lr',
+                    'optimizer.adamw_optimizer.end_lr'):
+            self.assertEqual(reference[key], modified[key])
+        self.assertNotEqual(reference['eval_freq'], modified['eval_freq'])
 
     def test_adam_smoke_evaluates_each_single_update(self):
         path = Path(__file__).resolve().parents[1] / 'sweeps' / 'adamw_smoke.json'
