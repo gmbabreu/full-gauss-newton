@@ -32,17 +32,25 @@ def parse_adam_spec(spec):
     """Strict AdamW queue schema; GN queue schema remains unchanged."""
     required = {'preset', 'default_solve_tokens', 'schedule_tokens',
                 'target_loss', 'trials'}
-    optional = {'protocol'}
+    optional = {'protocol', 'init_lr_fraction', 'warmup_tokens'}
     if not required.issubset(spec) or set(spec) - required - optional:
         raise ValueError('Invalid Adam queue configuration fields')
     protocol = spec.get('protocol')
     if protocol not in (None, 'adam_followup_600m'):
         raise ValueError('Unsupported Adam evaluation/schedule protocol')
+    if 'init_lr_fraction' in spec:
+        ratio = spec['init_lr_fraction']
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise ValueError('init_lr_fraction must be finite in [0, 1]')
+    if 'warmup_tokens' in spec:
+        positive_int(spec['warmup_tokens'], 'warmup_tokens')
+    if ('init_lr_fraction' in spec or 'warmup_tokens' in spec) and protocol != 'adam_followup_600m':
+        raise ValueError('Explicit Adam LR warmup overrides require adam_followup_600m protocol')
     positive_int(spec['default_solve_tokens'], 'default_solve_tokens')
     positive_int(spec['schedule_tokens'], 'schedule_tokens')
     target = spec['target_loss']
-    if type(target) not in (int, float) or not math.isfinite(target) or target <= 0:
-        raise ValueError('target_loss must be finite and positive')
+    if type(target) not in (int, float) or not math.isfinite(target) or target < 0:
+        raise ValueError('target_loss must be finite and nonnegative (0 disables stopping)')
     if not isinstance(spec['trials'], list) or not spec['trials']:
         raise ValueError('Missing ordered Adam trials')
     names, configurations = set(), set()
@@ -79,7 +87,8 @@ def parse_adam_spec(spec):
     return spec
 
 
-def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, protocol=None):
+def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
+                    protocol=None, init_lr_fraction=None, warmup_tokens=None):
     """One AdamW run. The named legacy protocol preserves old follow-up settings."""
     from run_experiment import make_plan
     batch = item['batch']
@@ -93,7 +102,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, 
         # Larger batches scale the cadence by tokens, not by raw updates.
         # If the token cap exceeds the decay horizon, Optax holds end_lr.
         horizon = schedule_tokens // unit
-        warmup = 10
+        warmup = 10 if warmup_tokens is None else max(1, math.ceil(warmup_tokens / unit))
         cadence = max(1, min(steps, math.ceil(horizon / 30)))
         eval_steps = 8
         log_initial_eval = False
@@ -118,7 +127,9 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *, 
         'optimizer.adamw_optimizer.b1': .9,
         'optimizer.adamw_optimizer.b2': b2,
         'optimizer.adamw_optimizer.lr_sched': 'cosine',
-        'optimizer.adamw_optimizer.init_lr': 0.0 if protocol == 'adam_followup_600m' else lr * .1,
+        'optimizer.adamw_optimizer.init_lr': (
+            lr * init_lr_fraction if init_lr_fraction is not None else
+            (0.0 if protocol == 'adam_followup_600m' else lr * .1)),
         'optimizer.adamw_optimizer.end_lr': lr * .1,
         'optimizer.adamw_optimizer.lr_warmup_steps': warmup,
         'optimizer.adamw_optimizer.lr_decay_steps': horizon,
@@ -195,7 +206,9 @@ def make_queue_plan(spec, *, queue_id=None):
                                       inner_loop_iter=item.get('inner_loop_iter', 50))
         else:
             p = build_adam_plan(i, item, budget, spec['schedule_tokens'],
-                                spec['target_loss'], protocol=spec.get('protocol'))
+                                spec['target_loss'], protocol=spec.get('protocol'),
+                                init_lr_fraction=spec.get('init_lr_fraction'),
+                                warmup_tokens=spec.get('warmup_tokens'))
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
