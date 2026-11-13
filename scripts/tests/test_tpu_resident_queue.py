@@ -351,16 +351,16 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(spec['eval_interval_tokens'], 20_000_000)
         plan = queue.make_queue_plan(spec, queue_id='remaining-controlled')
         expected = [
-            (2,720,.01,.01),
-            (3,256,.01,0),
-            (4,128,.015,0),
-            (5,384,.01,0),
-            (6,128,.01,.01),
-            (7,512,.01,0),
-            (8,192,.0125,0),
+            (2,720,.01,.01,2_211_840_000),
+            (3,256,.01,0,1_450_000_000),
+            (4,128,.015,0,2_211_840_000),
+            (5,384,.01,0,1_450_000_000),
+            (6,128,.01,.01,1_450_000_000),
+            (7,512,.01,0,1_450_000_000),
+            (8,192,.0125,0,1_450_000_000),
         ]
         self.assertEqual(len(plan['trials']), len(expected))
-        for trial,(ordinal,batch,lr,wd) in zip(plan['trials'],expected):
+        for trial,(ordinal,batch,lr,wd,requested_tokens) in zip(plan['trials'],expected):
             f=trial['plan']['flags']
             self.assertEqual(trial['index'], ordinal-1)
             self.assertEqual(trial['name'], f'adam_trial{ordinal}_B{batch}_lr{lr}_wd{wd}')
@@ -370,9 +370,21 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(float(f['optimizer.adamw_optimizer.weight_decay']), wd)
             self.assertEqual(int(f['eval_steps']),8)
             self.assertEqual(int(f['eval_freq']), -(-20_000_000//(batch*1024)))
-            self.assertEqual(int(f['total_steps']), 2_211_840_000//(batch*1024))
-            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),2_211_840_000//(batch*1024))
+            self.assertEqual(trial['requested_solve_tokens'], requested_tokens)
+            self.assertEqual(int(f['total_steps']), requested_tokens//(batch*1024))
+            self.assertEqual(trial['actual_solve_tokens'],
+                             (requested_tokens//(batch*1024))*batch*1024)
+            # Truncated screening trials keep the same 2.21B-token LR
+            # schedule; only their run length differs.
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_decay_steps']),
+                             2_211_840_000//(batch*1024))
+            self.assertEqual(int(f['optimizer.adamw_optimizer.lr_warmup_steps']),
+                             -(-7_372_800//(batch*1024)))
+            self.assertEqual(float(f['optimizer.adamw_optimizer.init_lr']), lr*.01)
+            self.assertEqual(float(f['optimizer.adamw_optimizer.end_lr']), lr*.1)
             self.assertEqual(float(f['target_loss']),0)
+        self.assertEqual(sum(t['requested_solve_tokens'] for t in plan['trials']),
+                         2*2_211_840_000 + 5*1_450_000_000)
         self.assertFalse(any(t['name']=='adam_trial1_B128_lr0.01_wd0' for t in plan['trials']))
         # Old queues still retain their previous name generation.
         original=json.loads((root/'adamw_long_horizon_eight.json').read_text())
