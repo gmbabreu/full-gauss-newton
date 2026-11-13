@@ -683,3 +683,36 @@ bash scripts/tpu.sh 2 logs 0
 Do not launch this queue if the five-run primary queue has already begun;
 the new queue would duplicate its first runs and preflight would reject
 active workers. Preserve active training instead.
+
+
+### Remaining AdamW runs with numbered W&B names
+
+`scripts/sweeps/adamw_long_horizon_remaining.json` is a separate,
+future-only, seven-run configuration that excludes the first B128/.01/WD0
+experiment, which the operator has already mostly completed. It retains
+the other distinct B128 experiments and all B720/B256/B384/B512/B192
+candidates. Names and W&B `notes` explicitly preserve original ordinal
+labels `adam_trial2_...` through `adam_trial8_...`.
+Inside this new queue their synchronization/index sequence is 1 through 7;
+the preserved numbering is only a readable W&B name, **not** a resume
+index, and every run starts independently from the warmup checkpoint.
+
+The `notes_from_trial_name: true` flag is opt-in and affects only the
+new queue; older queues retain existing W&B notes. The 20M-token
+evaluation cadence, eight validation batches, 2.21B-token common
+schedule, token-matched warmup, and `target_loss=0` are unchanged.
+No checkpoint/resume behavior was added.
+
+**Do not deploy while the old eight-run queue is still active.** A
+currently running resident queue has fixed plans, so changing the
+file or updating its repository cannot remove the queued trial safely.
+If it is already running, preserve it and use the revised queue only
+after the original queue exits and the operator confirms which
+experiments remain necessary. Do not launch duplicate trials.
+
+```bash
+# After all four TPU2 workers are idle, clean, and on the same new commit:
+cd ~/Desktop/full-gauss-newton-adamw
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json --dry-run
+bash scripts/tpu.sh 2 queue scripts/sweeps/adamw_long_horizon_remaining.json
+```
