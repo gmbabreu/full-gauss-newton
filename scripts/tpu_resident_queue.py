@@ -29,7 +29,7 @@ def positive_int(x, label):
 
 
 def parse_spec(spec):
-    if not isinstance(spec, dict) or set(spec) != {
+    if not isinstance(spec, dict) or set(spec) - {'protocol'} != {
             'preset', 'default_solve_tokens', 'schedule_tokens', 'trials'}:
         raise ValueError('Invalid queue configuration fields')
     if spec['preset'] != 'gn_adam':
@@ -38,9 +38,11 @@ def parse_spec(spec):
     positive_int(spec['schedule_tokens'], 'schedule_tokens')
     if not isinstance(spec['trials'], list) or not spec['trials']:
         raise ValueError('Missing ordered trials')
+    if spec.get('protocol') not in (None, 'paper_300m'):
+        raise ValueError('Unknown protocol')
     names, configurations = set(), set()
     for item in spec['trials']:
-        if not isinstance(item, dict) or set(item) not in (
+        if not isinstance(item, dict) or set(item) - {'optimizer_wd'} not in (
                 {'name', 'batch', 'inner_lr', 'n_micro'},
                 {'name', 'batch', 'inner_lr', 'n_micro', 'solve_tokens'},
                 {'name', 'batch', 'inner_lr', 'n_micro', 'inner_loop_iter'},
@@ -62,7 +64,10 @@ def parse_spec(spec):
             raise ValueError('Invalid solve/schedule token budget')
         if batch % 16 or micro > batch // 16:
             raise ValueError('Batch and microbatch must fit the 16-device data-parallel mesh')
-        signature = (batch, float(lr), micro, budget, item.get('inner_loop_iter', 50))
+        wd = item.get('optimizer_wd', .001)
+        if type(wd) not in (int, float) or not math.isfinite(wd) or wd < 0:
+            raise ValueError('optimizer_wd must be finite and nonnegative')
+        signature = (batch, float(lr), micro, budget, item.get('inner_loop_iter', 50), wd)
         if name in names or signature in configurations:
             raise ValueError('Duplicate trial or trial name')
         names.add(name)
@@ -84,6 +89,15 @@ def make_queue_plan(spec, *, queue_id=None):
         p = build_plan_for_config(i, item['batch'], item['inner_lr'],
                                   item['n_micro'], budget, spec['schedule_tokens'],
                                   inner_loop_iter=item.get('inner_loop_iter', 50))
+        f = p['flags']
+        f['optimizer_wd'] = item.get('optimizer_wd', .001)
+        if spec.get('protocol') == 'paper_300m':
+            f.update(schedule_steps=spec['schedule_tokens'] // (item['batch'] * 1024),
+                     eval_steps=50, log_initial_eval=True, seed=42, target_loss=0,
+                     log_freq=math.ceil(50000000 / (item['batch'] * 1024)),
+                     eval_freq=math.ceil(50000000 / (item['batch'] * 1024)))
+            f['train_dataset.huggingface_dataset.shuffle_seed'] = 42
+            f['notes'] = item['name']
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))

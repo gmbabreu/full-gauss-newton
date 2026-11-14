@@ -143,12 +143,15 @@ class QueueTests(unittest.TestCase):
             p, store = fixture(), MemoryStore()
             started, errors = [], []
             lock = threading.Lock()
+            first_launch = threading.Barrier(len(p['workers']))
             def fake_popen(args, env=None):
                 directory = Path(args[-1]).parent.name
                 worker = int(directory[len('worker'):])
                 trial = int(Path(args[-1]).stem.rsplit('_', 1)[1])
                 with lock:
                     started.append((worker, trial))
+                if trial == 1:
+                    first_launch.wait(timeout=2)
                 return Finished(1 if worker == bad_worker and trial == 1 else 0)
             def run(w, path):
                 try:
