@@ -33,9 +33,11 @@ def parse_adam_spec(spec):
     required = {'preset', 'default_solve_tokens', 'schedule_tokens',
                 'target_loss', 'trials'}
     optional = {'protocol', 'init_lr_fraction', 'warmup_tokens', 'eval_interval_tokens',
-                'notes_from_trial_name'}
+                'notes_from_trial_name', 'eval_steps'}
     if not required.issubset(spec) or set(spec) - required - optional:
         raise ValueError('Invalid Adam queue configuration fields')
+    if 'eval_steps' in spec:
+        positive_int(spec['eval_steps'], 'eval_steps')
     protocol = spec.get('protocol')
     if type(spec.get('notes_from_trial_name', False)) is not bool:
         raise ValueError('notes_from_trial_name must be a boolean')
@@ -62,8 +64,9 @@ def parse_adam_spec(spec):
     names, configurations = set(), set()
     for item in spec['trials']:
         required_trial = {'name', 'batch', 'lr', 'b2', 'weight_decay'}
-        if not isinstance(item, dict) or set(item) not in (
-                required_trial, required_trial | {'solve_tokens'}):
+        if (not isinstance(item, dict)
+                or not required_trial.issubset(item)
+                or set(item) - required_trial - {'solve_tokens', 'end_ratio'}):
             raise ValueError('Invalid Adam trial fields')
         name = item['name']
         if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', name):
@@ -85,7 +88,11 @@ def parse_adam_spec(spec):
             raise ValueError('Invalid Adam token budget')
         if budget > spec['schedule_tokens'] and protocol != 'adam_followup_600m':
             raise ValueError('Adam solve budget exceeds schedule horizon without explicit legacy protocol')
-        signature = (batch, float(lr), float(b2), float(wd), budget)
+        end_ratio = item.get('end_ratio', .1)
+        if (type(end_ratio) not in (int, float)
+                or not math.isfinite(end_ratio) or not 0 <= end_ratio <= 1):
+            raise ValueError('end_ratio must be finite in [0, 1]')
+        signature = (batch, float(lr), float(b2), float(wd), budget, float(end_ratio))
         if name in names or signature in configurations:
             raise ValueError('Duplicate Adam trial or name')
         names.add(name)
@@ -95,7 +102,7 @@ def parse_adam_spec(spec):
 
 def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
                     protocol=None, init_lr_fraction=None, warmup_tokens=None,
-                    eval_interval_tokens=None, notes=None):
+                    eval_interval_tokens=None, notes=None, eval_steps_override=None):
     """One AdamW run. The named legacy protocol preserves old follow-up settings."""
     from run_experiment import make_plan
     batch = item['batch']
@@ -126,6 +133,9 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
         log_initial_eval = True
     else:
         raise ValueError('Unsupported Adam evaluation/schedule protocol')
+    if eval_steps_override is not None:
+        positive_int(eval_steps_override, 'eval_steps')
+        eval_steps = eval_steps_override
     flags = {
         'mesh_dim': '16,1,1', 'dtype': 'fp32', 'param_dtype': 'fp32',
         'seed': 42, 'train_dataset_batch_size': batch,
@@ -141,7 +151,7 @@ def build_adam_plan(trial_index, item, tokens, schedule_tokens, target_loss, *,
         'optimizer.adamw_optimizer.init_lr': (
             lr * init_lr_fraction if init_lr_fraction is not None else
             (0.0 if protocol == 'adam_followup_600m' else lr * .1)),
-        'optimizer.adamw_optimizer.end_lr': lr * .1,
+        'optimizer.adamw_optimizer.end_lr': lr * item.get('end_ratio', .1),
         'optimizer.adamw_optimizer.lr_warmup_steps': warmup,
         'optimizer.adamw_optimizer.lr_decay_steps': horizon,
         'optimizer.adamw_optimizer.weight_decay': wd,
@@ -221,7 +231,8 @@ def make_queue_plan(spec, *, queue_id=None):
                                 init_lr_fraction=spec.get('init_lr_fraction'),
                                 warmup_tokens=spec.get('warmup_tokens'),
                                 eval_interval_tokens=spec.get('eval_interval_tokens'),
-                                notes=item['name'] if spec.get('notes_from_trial_name', False) else None)
+                                notes=item['name'] if spec.get('notes_from_trial_name', False) else None,
+                                eval_steps_override=spec.get('eval_steps'))
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))

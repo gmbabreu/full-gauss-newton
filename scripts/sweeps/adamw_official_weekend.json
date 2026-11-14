@@ -1,0 +1,110 @@
+{
+  "preset": "adam",
+  "default_solve_tokens": 2849988096,
+  "schedule_tokens": 2849988096,
+  "target_loss": 0,
+  "protocol": "adam_followup_600m",
+  "init_lr_fraction": 0.01,
+  "warmup_tokens": 7372800,
+  "eval_interval_tokens": 50000000,
+  "eval_steps": 50,
+  "notes_from_trial_name": true,
+  "trials": [
+    {
+      "name": "adam_official_trial0_B128_lr0.015_wd0_b20.95_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial1_B128_lr0.01_wd0_b20.95_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial2_B128_lr0.02_wd0_b20.95_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.02,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial3_B128_lr0.015_wd0.001_b20.95_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0.001,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial4_B128_lr0.015_wd0.01_b20.95_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0.01,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial5_B256_lr0.01_wd0_b20.95_end0.1_seed42",
+      "batch": 256,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial6_B192_lr0.0125_wd0_b20.95_end0.1_seed42",
+      "batch": 192,
+      "lr": 0.0125,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial7_B64_lr0.01_wd0_b20.95_end0.1_seed42",
+      "batch": 64,
+      "lr": 0.01,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial8_B64_lr0.015_wd0_b20.95_end0.1_seed42",
+      "batch": 64,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial9_B128_lr0.015_wd0_b20.99_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.99,
+      "weight_decay": 0,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial10_B128_lr0.015_wd0_b20.95_end0.2_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0.2
+    },
+    {
+      "name": "adam_official_trial11_B128_lr0.015_wd0_b20.95_end0_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "b2": 0.95,
+      "weight_decay": 0,
+      "end_ratio": 0
+    }
+  ]
+}
