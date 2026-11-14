@@ -1,0 +1,23 @@
+{
+  "preset": "gn_adam",
+  "default_solve_tokens": 150000000,
+  "schedule_tokens": 1000000000,
+  "trials": [
+    {
+      "name": "recovery_original_trial5_B2048_lr0.002_K50",
+      "batch": 2048,
+      "inner_lr": 0.002,
+      "n_micro": 4,
+      "inner_loop_iter": 50,
+      "solve_tokens": 200000000
+    },
+    {
+      "name": "recovery_original_trial6_B3072_lr0.002_K50",
+      "batch": 3072,
+      "inner_lr": 0.002,
+      "n_micro": 6,
+      "inner_loop_iter": 50,
+      "solve_tokens": 200000000
+    }
+  ]
+}

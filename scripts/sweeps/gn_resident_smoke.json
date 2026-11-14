@@ -1,0 +1,21 @@
+{
+  "preset": "gn_adam",
+  "default_solve_tokens": 262144,
+  "schedule_tokens": 1000000000,
+  "trials": [
+    {
+      "name": "smoke_B256_K1",
+      "batch": 256,
+      "inner_lr": 0.002,
+      "n_micro": 1,
+      "inner_loop_iter": 1
+    },
+    {
+      "name": "smoke_B256_K2",
+      "batch": 256,
+      "inner_lr": 0.002,
+      "n_micro": 1,
+      "inner_loop_iter": 2
+    }
+  ]
+}

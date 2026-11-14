@@ -1,0 +1,208 @@
+"""CPU-only resident queue integration tests. Never call GCP, TPU, W&B or JAX."""
+import json
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import tpu_resident_queue as queue
+
+
+class MemoryStore:
+    def __init__(self):
+        self.objects = {}
+        self.lock = threading.Lock()
+        self.fail_read = False
+
+    def create(self, key, value):
+        with self.lock:
+            if key in self.objects:
+                raise RuntimeError('GCS if_generation_match=0 conflict')
+            self.objects[key] = json.loads(queue.canonical(value))
+
+    def read(self, key):
+        with self.lock:
+            if self.fail_read:
+                raise PermissionError('GCS auth error')
+            return self.objects.get(key)
+
+
+def fixture(workers=(0, 1, 2, 3), count=2):
+    return queue.finish_plan(dict(
+        route='queue', run_id='testqueue', workers=[], plan_sha256='',
+        trials=[dict(index=i, name='t'+str(i), plan=dict(run_id='run'+str(i)))
+                for i in range(1, count + 1)]), list(workers))
+
+
+class Finished:
+    def __init__(self, rc=0):
+        self.rc = rc
+
+    def poll(self):
+        return self.rc
+
+    def wait(self, timeout=None):
+        return self.rc
+
+    def terminate(self):
+        self.rc = 143
+
+    def kill(self):
+        self.rc = -9
+
+
+class QueueTests(unittest.TestCase):
+    def test_spec_rejects_unsafe_duplicate_and_invalid(self):
+        good = dict(preset='gn_adam', default_solve_tokens=150000000,
+                    schedule_tokens=1000000000,
+                    trials=[dict(name='B8192_lr0.001', batch=8192,
+                                 inner_lr=.001, n_micro=16)])
+        queue.parse_spec(good)
+        for change in (dict(name='../bad'), dict(inner_lr=float('nan')),
+                       dict(inner_lr=0), dict(batch=15), dict(n_micro=0),
+                       dict(solve_tokens=100)):
+            bad = dict(good, trials=[dict(good['trials'][0], **change)])
+            with self.assertRaises(ValueError):
+                queue.parse_spec(bad)
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            queue.parse_spec(dict(good, trials=good['trials'] * 2))
+        with self.assertRaisesRegex(ValueError, 'inner_loop_iter'):
+            queue.parse_spec(dict(good, trials=[
+                dict(good['trials'][0], inner_loop_iter=0)]))
+        queue.parse_spec(dict(good, trials=[
+            dict(good['trials'][0], inner_loop_iter=25)]))
+
+    def test_queue_spec_real_followup_order_and_exact_parameters(self):
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / 'sweeps' / 'gn_batch_k_followup.json'
+        spec = json.loads(path.read_text())
+        plan = queue.make_queue_plan(spec, queue_id='controlled')
+        expectation = [
+            (8192, .002, 50, 150_000_000, 16),
+            (4096, .002, 25, 150_000_000, 8),
+            (4096, .002, 100, 75_000_000, 8),
+            (4096, .004, 50, 200_000_000, 8),
+            (2048, .002, 50, 200_000_000, 4),
+            (3072, .002, 50, 200_000_000, 6),
+        ]
+        self.assertEqual(len(plan['trials']), len(expectation))
+        for t, (b, lr, k, requested, micro) in zip(plan['trials'], expectation):
+            f = t['plan']['flags']
+            self.assertEqual(int(f['train_dataset_batch_size']), b)
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
+            self.assertEqual(float(f['inner_loop_lr']), lr)
+            self.assertEqual(int(f['inner_loop_iter']), k)
+            self.assertEqual(int(f['n_micro']), micro)
+            self.assertEqual(t['requested_solve_tokens'], requested)
+            self.assertEqual(int(f['total_steps']), requested // (b * 1024))
+            self.assertEqual(int(f['schedule_steps']), -(-1_000_000_000 // (b * 1024)))
+            self.assertEqual(t['actual_solve_tokens'], requested // (b * 1024) * b * 1024)
+            self.assertIn(f'_K{k}_', f['notes'])
+            self.assertEqual(f['load_checkpoint'], 'trainstate_params::gs://gfn-soo/checkpoints/warmup_150m/1_0/streaming_train_state')
+        self.assertEqual(len({t['plan']['run_id'] for t in plan['trials']}), len(expectation))
+
+    def test_plan_hash_and_worker_count(self):
+        p = fixture((2, 3), count=1)
+        queue.verify_plan(p, 2)
+        with self.assertRaises(ValueError):
+            queue.verify_plan(p, 0)
+        p['trials'][0]['plan']['run_id'] = 'tampered'
+        with self.assertRaisesRegex(ValueError, 'hash'):
+            queue.verify_plan(p, 2)
+
+    def test_barrier_validates_identity_and_conditional_create(self):
+        p, s = fixture((0, 1), 1), MemoryStore()
+        for w in p['workers']:
+            s.create(f'ready/{w}.json', queue.record(p, w, 0, p['run_id']))
+        queue.barrier(s, p, 'ready', 0, p['run_id'], .01)
+        with self.assertRaisesRegex(RuntimeError, 'conflict'):
+            s.create('ready/0.json', {})
+        s.create('result/1/0.json', queue.record(p, 0, 1, 'run1', 0))
+        s.create('result/1/1.json', queue.record(p, 1, 1, 'stale', 0))
+        with self.assertRaisesRegex(RuntimeError, 'Invalid result'):
+            queue.barrier(s, p, 'result', 1, 'run1', .01)
+
+    def test_absent_worker_timeout_and_gcs_failure(self):
+        p = fixture((0, 1), 1)
+        with self.assertRaises(TimeoutError):
+            queue.barrier(MemoryStore(), p, 'ready', 0, p['run_id'],
+                          .005, poll_s=.001)
+        s = MemoryStore()
+        s.fail_read = True
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(PermissionError):
+                queue.ResidentRunner(fixture((0,), 1), 0, s).run(root, install_signals=False)
+
+    def test_success_and_failure_stop_every_worker_before_next_trial(self):
+        def simulate(bad_worker=None):
+            p, store = fixture(), MemoryStore()
+            started, errors = [], []
+            lock = threading.Lock()
+            first_launch = threading.Barrier(len(p['workers']))
+            def fake_popen(args, env=None):
+                directory = Path(args[-1]).parent.name
+                worker = int(directory[len('worker'):])
+                trial = int(Path(args[-1]).stem.rsplit('_', 1)[1])
+                with lock:
+                    started.append((worker, trial))
+                if trial == 1:
+                    first_launch.wait(timeout=2)
+                return Finished(1 if worker == bad_worker and trial == 1 else 0)
+            def run(w, path):
+                try:
+                    queue.ResidentRunner(p, w, store, sleep=lambda _: time.sleep(.001)).run(
+                        path / ('worker'+str(w)), startup_s=1, barrier_s=1,
+                        install_signals=False)
+                except Exception as error:
+                    with lock:
+                        errors.append(w)
+            with tempfile.TemporaryDirectory() as root, patch.object(
+                    queue.subprocess, 'Popen', side_effect=fake_popen):
+                threads = [threading.Thread(target=run, args=(w, Path(root))) for w in p['workers']]
+                for t in threads: t.start()
+                for t in threads: t.join(4)
+                self.assertFalse(any(t.is_alive() for t in threads), 'deadlocked queue')
+            return sorted(started), sorted(errors)
+        self.assertEqual(simulate(), ([(w, i) for w in range(4) for i in (1, 2)], []))
+        started, errors = simulate(2)
+        self.assertEqual(started, [(w, 1) for w in range(4)])
+        self.assertEqual(errors, list(range(4)))
+
+    def test_signal_terminates_owned_child(self):
+        p = fixture((0,), 1)
+        runner = queue.ResidentRunner(p, 0, MemoryStore())
+        child = Finished()
+        child.poll = lambda: None
+        runner.child = child
+        runner.terminate(15, None)
+        self.assertTrue(runner.cancelled)
+        self.assertEqual(child.rc, 143)
+
+    def test_new_queue_plan_preserves_existing_gn_science_settings(self):
+        from gn_sweep_queue import build_plan, build_plan_for_config, TRIALS
+        known = TRIALS[8]  # trial 9: B2048, LR .001, micro 4
+        old = build_plan(known[0], 150000000, 1000000000)
+        new = build_plan_for_config(*known, 150000000, 1000000000)
+        scientific = lambda plan: {k:v for k,v in plan['flags'].items()
+                                   if k not in ('experiment_id', 'wandb_run_id')}
+        self.assertEqual(scientific(old), scientific(new))
+        self.assertEqual(new['flags']['train_dataset.huggingface_dataset.batch_size'],
+                         new['flags']['train_dataset_batch_size'])
+        for b, lr, micro in ((4096, .002, 8), (8192, .001, 16)):
+            plan = build_plan_for_config(1, b, lr, micro, 150000000, 1000000000)
+            f = plan['flags']
+            self.assertEqual(int(f['total_steps']), 150000000 // (b * 1024))
+            self.assertEqual(int(f['schedule_steps']), -(-1000000000 // (b * 1024)))
+            self.assertEqual(int(f['train_dataset.huggingface_dataset.batch_size']), b)
+            self.assertEqual(int(f['n_micro']), micro)
+            self.assertEqual(float(f['inner_loop_lr']), lr)
+            self.assertEqual(int(f['inner_loop_iter']), 50)
+
+
+if __name__ == '__main__':
+    unittest.main()

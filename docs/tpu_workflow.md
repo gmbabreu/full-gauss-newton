@@ -349,3 +349,125 @@ them, mocked tmux, local Git fixture repositories, and harmless local sleep
 processes for ownership/termination checks. They do not contact real TPUs or import
 trainers/JAX. AST checks verify every preset flag against the checked-out branch's
 trainer and nested configuration definitions.
+
+## TPU-resident synchronized GN-Adam queues (experimental, operator approval required)
+
+Unlike `sweep_launcher.py` (one SLURM-selected job) and `gn_sweep_queue.py`
+(which polls worker manifests from box248), the resident queue uses a **managed
+queue process on every TPU worker**. A one-time authenticated launch from box248
+reserves, preflights and starts the same immutable queue on every discovered
+worker; the controller returns. Worker-local processes exchange small conditional
+GCS markers, so **box248 authentication and SSH are not required between trials**.
+
+The ordered default screening configuration is
+`scripts/sweeps/gn_large_batch_remaining.json`. The **new six-trial
+follow-up**, including K25/K100 and per-trial 75M/150M/200M solve-token
+budgets, is `scripts/sweeps/gn_batch_k_followup.json`.
+
+Before the expensive six-trial follow-up, run the minimal **two-trial
+integration smoke test** in `scripts/sweeps/gn_resident_smoke.json`:
+each B256 trial performs one outer update, first K1 then K2. This verifies
+real TPU worker initialization, GCS ready/result synchronization, W&B,
+and automatic progression after a completed trial. It **does not**
+benchmark the scientific value of these K settings.
+
+```bash
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_resident_smoke.json
+bash scripts/tpu.sh 1 logs 0
+bash scripts/tpu.sh 1 status
+```
+
+Do not start the full queue until all workers have returned successful
+exit statuses and the worker0 log says `ALL TRIALS COMPLETE`.
+On failure, inspect `logs` and the managed worker manifests;
+**do not assume CPU-only CI proves GCS permissions or live JAX initialization**.
+
+For the follow-up run, use:
+
+```bash
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_batch_k_followup.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_batch_k_followup.json
+```
+
+Its ordered trials are B8192/LR0.002/K50 (150M), B4096/LR0.002/K25
+(150M), B4096/LR0.002/K100 (75M), B4096/LR0.004/K50 (200M),
+B2048/LR0.002/K50 (200M), B3072/LR0.002/K50 (200M). The B3072
+trial uses `n_micro=6`; each B3072, B2048, B4096, and B8192 configuration
+uses 32 samples per data-shard microbatch with mesh `16,1,1`.
+All runs preserve the **1B solve-token cosine horizon** and start from the
+same warmup checkpoint, not from a preceding trial. K25/K100 entries
+set `inner_loop_iter` individually, leaving legacy defaults at K50. Do not launch if the original
+box248 queue controller is active or TPU workers show active processes.
+
+```bash
+cd ~/Desktop/full-gauss-newton
+git status --short
+bash scripts/tpu.sh 1 status
+
+# After the branch has been safely deployed to the four idle TPU1 workers:
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_large_batch_remaining.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_large_batch_remaining.json
+
+# Inspect remotely (this requires auth only when you choose to inspect):
+bash scripts/tpu.sh 1 status
+bash scripts/tpu.sh 1 logs 0
+
+# Immediate cancel of the managed queue AND current training:
+bash scripts/tpu.sh 1 stop
+```
+
+Each trial receives a unique ID, its own W&B run, and the complete existing
+GN-Adam scientific flags from `gn_sweep_queue.build_plan_for_config`. All
+workers wait for each other's successful result before the next trial. Queue
+coordination objects live under
+`gs://gfn-soo/checkpoints/queue_runs/<queue-id>/` and are conditionally created
+(immutable); mismatched/stale markers and failed workers prevent advancement.
+Trial outputs remain under normal `script_runs/` paths. `logs` follows each
+worker's combined queue and trainer output in the managed worker log.
+
+The JSON supports per-trial `solve_tokens`; for a longer run edit a **new
+committed file** with e.g. `"solve_tokens": 300000000` while retaining
+`"schedule_tokens": 1000000000`. Do not reuse an active queue identity or
+change its committed spec in place. Each new launch receives independent
+experiment IDs. 300M runs start from the same warmup checkpoint, **not**
+from an earlier 150M run's final state.
+
+### Mandatory manual bootstrap for helper-changing branches
+
+**Do not** attempt `bash scripts/tpu.sh 1 switch codex/tpu-resident-queue-implementation`
+from the old `98b2928` checkout: `tpu_worker.verify_target` deliberately
+refuses target commits with changed helpers.
+
+1. Operator: from box248 first verify no old `tmux` sweep queue is active,
+   and `bash scripts/tpu.sh 1 status` reports **all TPU1 workers idle and clean**.
+   Leave TPU2 (`gn-v4-32-2`) entirely untouched.
+2. For each TPU1 worker 0,1,2,3, **read-only first**, using the previously
+   working version of `scripts/tpu.sh 1 ssh <WORKER>` or:
+   ```bash
+   gcloud compute tpus tpu-vm ssh ga2740@gn-v4-32 \
+     --project=fast-second-order --zone=us-central2-b --worker=0 \
+     --command='cd /full-gauss-newton && git status --short && git branch --show-current && git rev-parse HEAD && tmux ls || true'
+   ```
+   Repeat for worker 1,2,3 and confirm no training processes with the
+   original controller status before changing anything.
+3. After the branch has been reviewed and the operator confirms all workers are
+   idle and clean, **operator only**: on box248 fetch and switch the feature
+   branch; on each TPU1 worker `cd /full-gauss-newton && git fetch origin &&
+   git switch -c codex/tpu-resident-queue-implementation
+   --track origin/codex/tpu-resident-queue-implementation`.
+   If the branch already exists on a host, use `git switch` and
+   `git merge --ff-only origin/codex/tpu-resident-queue-implementation`.
+   Never reset, stash, or force checkout. Repeat for all workers, verify exact
+   common SHA and clean work trees, then perform the dry-run and launch above.
+4. Stop if ANY worker fails to synchronize. No training or branch deployment
+   is part of the Codex/ChatGPT implementation task.
+
+### Limitations
+
+This removes the **box248 controller's repeated gcloud auth/polling** from the
+critical path *after launch*. It does not guarantee recovery from spot
+preemption, missing TPU-local GCS credentials, lost HF/W&B connectivity, or a
+GN training crash. Workers time out rather than hanging forever. No intermediate
+GN optimizer/data checkpoints are introduced; interrupted individual trials
+are not automatically resumable.
