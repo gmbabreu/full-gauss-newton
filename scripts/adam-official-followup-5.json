@@ -1,0 +1,54 @@
+{
+  "preset": "adam",
+  "protocol": "adam_followup_600m",
+  "default_solve_tokens": 2849988096,
+  "schedule_tokens": 2849988096,
+  "target_loss": 0,
+  "init_lr_fraction": 0.01,
+  "warmup_tokens": 7372800,
+  "eval_interval_tokens": 50000000,
+  "eval_steps": 50,
+  "notes_from_trial_name": true,
+  "trials": [
+    {
+      "name": "adam_official_trial12_B128_lr0.015_wd0.01_b20.99_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "weight_decay": 0.01,
+      "b2": 0.99,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial13_B128_lr0.015_wd0.01_b20.995_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "weight_decay": 0.01,
+      "b2": 0.995,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial14_B128_lr0.015_wd0.03_b20.99_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.015,
+      "weight_decay": 0.03,
+      "b2": 0.99,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial15_B128_lr0.01_wd0.01_b20.99_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.01,
+      "weight_decay": 0.01,
+      "b2": 0.99,
+      "end_ratio": 0.1
+    },
+    {
+      "name": "adam_official_trial16_B128_lr0.02_wd0.01_b20.99_end0.1_seed42",
+      "batch": 128,
+      "lr": 0.02,
+      "weight_decay": 0.01,
+      "b2": 0.99,
+      "end_ratio": 0.1
+    }
+  ]
+}
