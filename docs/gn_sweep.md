@@ -46,6 +46,22 @@ disconnection, not controller-host shutdown. The full queue can exceed one night
 
 ## Four long paper-protocol candidates
 
+The long sweep enables `ls_reuse_lag=100`, with `_reuse100` in run names.
+Using zero-based outer steps, line search uses the current solve batch at step 0,
+the previous solve batch at steps 1–99, and the batch from 100 steps ago thereafter.
+It reevaluates losses at current parameters and reads no extra training batches.
+`ls_batch_age`, `ls_batch_step`, and cumulative `phase_linesearch_reused_tokens`
+record reuse; fresh line-search tokens stay zero. The existing solve-token axis
+and schedule are unchanged. Old runs consumed fresh LS batches, so their solve
+data sequence and updates differ from these runs immediately, including startup.
+Reused training data is not an independent held-out generalization test.
+
+This optional flag defaults to 0 (legacy fresh LS). Reuse currently requires
+fixed-batch raw-HF single-batch GN-Adam, nonadaptive solves, one LS batch and no
+checkpoint saves or dataset-state resume. The bounded NumPy cache lives on CPU;
+100 full B2048/L1024 batches with int32 input/target and float32 masks require
+about 2.34 GiB per host. Other configurations and the 300M sweep remain unchanged.
+
 `scripts/sweeps/gn_paper_long.json` runs B2048/K50/n_micro4 with
 (LR, optimizer_wd) in order: (.002,.001), (.002,.01), (.003,.001), (.001,.001).
 Each starts afresh from the shared warmup checkpoint. The continuation cap and

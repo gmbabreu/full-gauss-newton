@@ -29,7 +29,7 @@ def positive_int(x, label):
 
 
 def parse_spec(spec):
-    if not isinstance(spec, dict) or set(spec) - {'protocol', 'trial_hours'} != {
+    if not isinstance(spec, dict) or set(spec) - {'protocol', 'trial_hours', 'ls_reuse_lag'} != {
             'preset', 'default_solve_tokens', 'schedule_tokens', 'trials'}:
         raise ValueError('Invalid queue configuration fields')
     if spec['preset'] != 'gn_adam':
@@ -41,6 +41,9 @@ def parse_spec(spec):
     if spec.get('protocol') not in (None, 'paper_300m', 'paper'):
         raise ValueError('Unknown protocol')
     positive_int(spec.get('trial_hours', 72), 'trial_hours')
+    lag = spec.get('ls_reuse_lag', 0)
+    if type(lag) is not int or lag < 0:
+        raise ValueError('ls_reuse_lag must be a nonnegative integer')
     names, configurations = set(), set()
     for item in spec['trials']:
         if not isinstance(item, dict) or set(item) - {'optimizer_wd'} not in (
@@ -92,6 +95,8 @@ def make_queue_plan(spec, *, queue_id=None):
                                   inner_loop_iter=item.get('inner_loop_iter', 50))
         f = p['flags']
         f['optimizer_wd'] = item.get('optimizer_wd', .001)
+        if 'ls_reuse_lag' in spec:
+            f['ls_reuse_lag'] = spec['ls_reuse_lag']
         if spec.get('protocol') in ('paper_300m', 'paper'):
             f.update(schedule_steps=spec['schedule_tokens'] // (item['batch'] * 1024),
                      eval_steps=50, log_initial_eval=True, seed=42, target_loss=0,

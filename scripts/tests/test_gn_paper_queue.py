@@ -40,7 +40,17 @@ class PaperQueueTests(unittest.TestCase):
             self.assertEqual(int(f['eval_steps']),50)
             self.assertEqual(int(f['eval_freq']),24)
             self.assertEqual(int(f['n_micro']),4)
+            self.assertEqual(int(f['ls_reuse_lag']),100)
+            self.assertTrue(t['name'].endswith('_reuse100'))
             self.assertEqual(t['actual_solve_tokens'],2847932416)
             self.assertEqual(int(f['save_model_freq']),0)
         spec['trial_hours']=0
         with self.assertRaises(ValueError): parse_spec(spec)
+
+    def test_reuse_is_optional_and_validated(self):
+        spec = json.loads((Path(__file__).resolve().parents[1] / 'sweeps/gn_paper_300m.json').read_text())
+        self.assertTrue(all('ls_reuse_lag' not in t['plan']['flags']
+                            for t in make_queue_plan(spec)['trials']))
+        for invalid in (-1, 1.5, True):
+            spec['ls_reuse_lag'] = invalid
+            with self.assertRaises(ValueError): parse_spec(spec)
