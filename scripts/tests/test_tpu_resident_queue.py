@@ -56,6 +56,15 @@ class Finished:
 
 
 class QueueTests(unittest.TestCase):
+    def test_plan_timeout_reaches_trial_runner(self):
+        p = fixture((0,), 1)
+        p['trial_hours'] = 120
+        p['plan_sha256'] = queue.digest(p)
+        runner = queue.ResidentRunner(p, 0, MemoryStore())
+        with tempfile.TemporaryDirectory() as root, patch.object(runner, 'train') as train:
+            runner.run(root, install_signals=False)
+        self.assertEqual(train.call_args.kwargs['hours'], 120)
+
     def test_spec_rejects_unsafe_duplicate_and_invalid(self):
         good = dict(preset='gn_adam', default_solve_tokens=150000000,
                     schedule_tokens=1000000000,

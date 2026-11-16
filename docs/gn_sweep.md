@@ -43,3 +43,24 @@ controllers on the same controller host. Do not interrupt launch/stop operations
 
 Keep the controller host awake and connected. A tmux session survives terminal
 disconnection, not controller-host shutdown. The full queue can exceed one night.
+
+## Four long paper-protocol candidates
+
+`scripts/sweeps/gn_paper_long.json` runs B2048/K50/n_micro4 with
+(LR, optimizer_wd) in order: (.002,.001), (.002,.01), (.003,.001), (.001,.001).
+Each starts afresh from the shared warmup checkpoint. The continuation cap and
+cosine horizon are both 1,358 outer updates (2,847,932,416 solve tokens).
+The common paper settings use FP32, seed/shuffle42, zero warmup/end LR,
+50 validation batches, initial/final evaluation and cadence24 (~50.33M tokens).
+No model checkpoints are saved. Terminal evaluation metrics are in W&B summary.
+The queue spec sets a 120-hour per-trial timeout; legacy specs retain72 hours.
+
+After the operator has deployed this helper revision to idle workers:
+```bash
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_paper_long.json --dry-run
+bash scripts/tpu.sh 1 queue scripts/sweeps/gn_paper_long.json
+bash scripts/tpu.sh 1 logs 0
+```
+A failure or cancellation halts the queue. `tpu.sh 1 stop` cancels both the
+queue and current training; it does not automatically advance to the next trial.
+Interrupted GN-Adam trials cannot exactly resume with the current trainer.

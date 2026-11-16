@@ -29,7 +29,7 @@ def positive_int(x, label):
 
 
 def parse_spec(spec):
-    if not isinstance(spec, dict) or set(spec) - {'protocol'} != {
+    if not isinstance(spec, dict) or set(spec) - {'protocol', 'trial_hours'} != {
             'preset', 'default_solve_tokens', 'schedule_tokens', 'trials'}:
         raise ValueError('Invalid queue configuration fields')
     if spec['preset'] != 'gn_adam':
@@ -38,8 +38,9 @@ def parse_spec(spec):
     positive_int(spec['schedule_tokens'], 'schedule_tokens')
     if not isinstance(spec['trials'], list) or not spec['trials']:
         raise ValueError('Missing ordered trials')
-    if spec.get('protocol') not in (None, 'paper_300m'):
+    if spec.get('protocol') not in (None, 'paper_300m', 'paper'):
         raise ValueError('Unknown protocol')
+    positive_int(spec.get('trial_hours', 72), 'trial_hours')
     names, configurations = set(), set()
     for item in spec['trials']:
         if not isinstance(item, dict) or set(item) - {'optimizer_wd'} not in (
@@ -91,7 +92,7 @@ def make_queue_plan(spec, *, queue_id=None):
                                   inner_loop_iter=item.get('inner_loop_iter', 50))
         f = p['flags']
         f['optimizer_wd'] = item.get('optimizer_wd', .001)
-        if spec.get('protocol') == 'paper_300m':
+        if spec.get('protocol') in ('paper_300m', 'paper'):
             f.update(schedule_steps=spec['schedule_tokens'] // (item['batch'] * 1024),
                      eval_steps=50, log_initial_eval=True, seed=42, target_loss=0,
                      log_freq=math.ceil(50000000 / (item['batch'] * 1024)),
@@ -101,9 +102,12 @@ def make_queue_plan(spec, *, queue_id=None):
         trials.append(dict(index=i, name=item['name'], plan=p,
                            requested_solve_tokens=budget,
                            actual_solve_tokens=int(p['flags']['total_steps']) * item['batch'] * 1024))
-    return dict(route='queue', preset='gn_adam', run_id=queue_id, flags={},
+    result = dict(route='queue', preset='gn_adam', run_id=queue_id, flags={},
                 explicit_overrides=[], workers=[], plan_sha256='', trials=trials,
                 queue_root='gs://gfn-soo/checkpoints/queue_runs/' + queue_id)
+    if 'trial_hours' in spec:
+        result['trial_hours'] = spec['trial_hours']
+    return result
 
 
 def finish_plan(plan, workers):
@@ -263,6 +267,7 @@ class ResidentRunner:
 
     def run(self, directory, *, startup_s=1800, barrier_s=1800, trial_hours=72,
             install_signals=True):
+        trial_hours = self.plan.get('trial_hours', trial_hours)
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         old_term, old_int = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
