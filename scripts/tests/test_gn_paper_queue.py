@@ -40,8 +40,8 @@ class PaperQueueTests(unittest.TestCase):
             self.assertEqual(int(f['eval_steps']),50)
             self.assertEqual(int(f['eval_freq']),24)
             self.assertEqual(int(f['n_micro']),4)
-            self.assertEqual(int(f['ls_reuse_lag']),100)
-            self.assertTrue(t['name'].endswith('_reuse100'))
+            self.assertEqual(int(f['ls_reuse_lag']),0)
+            self.assertTrue(t['name'].endswith('_fresh'))
             self.assertEqual(t['actual_solve_tokens'],2847932416)
             self.assertEqual(int(f['save_model_freq']),0)
         spec['trial_hours']=0

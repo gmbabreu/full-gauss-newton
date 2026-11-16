@@ -6,33 +6,33 @@
   "trial_hours": 120,
   "trials": [
     {
-      "name": "GN_Adam_long_t1_B2048_lr0.002_K50_wd0.001_seed42_reuse100",
+      "name": "GN_Adam_long_t1_B2048_lr0.002_K50_wd0.001_seed42_fresh",
       "batch": 2048,
       "inner_lr": 0.002,
       "n_micro": 4,
       "optimizer_wd": 0.001
     },
     {
-      "name": "GN_Adam_long_t2_B2048_lr0.002_K50_wd0.01_seed42_reuse100",
+      "name": "GN_Adam_long_t2_B2048_lr0.002_K50_wd0.01_seed42_fresh",
       "batch": 2048,
       "inner_lr": 0.002,
       "n_micro": 4,
       "optimizer_wd": 0.01
     },
     {
-      "name": "GN_Adam_long_t3_B2048_lr0.003_K50_wd0.001_seed42_reuse100",
+      "name": "GN_Adam_long_t3_B2048_lr0.003_K50_wd0.001_seed42_fresh",
       "batch": 2048,
       "inner_lr": 0.003,
       "n_micro": 4,
       "optimizer_wd": 0.001
     },
     {
-      "name": "GN_Adam_long_t4_B2048_lr0.001_K50_wd0.001_seed42_reuse100",
+      "name": "GN_Adam_long_t4_B2048_lr0.001_K50_wd0.001_seed42_fresh",
       "batch": 2048,
       "inner_lr": 0.001,
       "n_micro": 4,
       "optimizer_wd": 0.001
     }
   ],
-  "ls_reuse_lag": 100
+  "ls_reuse_lag": 0
 }
