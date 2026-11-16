@@ -496,6 +496,53 @@ class WorkerTests(unittest.TestCase):
             self.assertIn(key, value)
         self.assertEqual(value['explicit_overrides'], ['--notes=a b=c'])
 
+    def test_queue_supervisor_uses_short_authenticated_file_pointer(self):
+        # Reproduce the real failure: a multi-trial queue cannot fit into
+        # a single tmux command-line argument.
+        from tpu_resident_queue import finish_plan
+        bulky = {'route': 'queue', 'preset': 'gn_adam', 'run_id': 'queue-test',
+                 'explicit_overrides': [], 'flags': {},
+                 'trials': [{'index': i, 'name': f'trial_{i}',
+                             'plan': {'run_id': f'trial{i}', 'flags': {
+                                 'notes': 'x' * 2500}}} for i in range(20)],
+                 'queue_root': 'gs://example/queue-test',
+                 'workers': [], 'plan_sha256': ''}
+        self.w.p['plan'] = finish_plan(bulky, [0, 1, 2, 3])
+        original_payload = dict(self.w.p)
+        observed = []
+
+        def fake_tmux(argv, **kwargs):
+            self.assertEqual(argv[:3], ['tmux', 'new-session', '-d'])
+            shell = argv[-1]
+            observed.append(shell)
+            self.assertLess(len(shell), 4096)
+            self.assertIn('supervise-file', shell)
+            directory = self.w.run_dir()
+            saved = json.loads((directory / 'supervisor_payload.json').read_text())
+            self.assertEqual(saved, original_payload)
+            # Emulate supervisor state acknowledgement.
+            manifest = json.loads((directory / 'manifest.json').read_text())
+            self.assertEqual(manifest['pane_command'], shell)
+            manifest.update(state='started', pgid=99999)
+            worker.atomic_json(directory / 'manifest.json', manifest)
+            return ''
+
+        with patch.object(self.w, 'preflight', return_value=self.clean), \
+                patch.object(worker, 'command', side_effect=fake_tmux), \
+                patch.object(self.w, 'group', return_value=[{}]):
+            result = self.w.launch()
+
+        self.assertIn('initialization is NOT verified', result['message'])
+        self.assertEqual(len(observed), 1)
+        encoded = shlex.split(shlex.split(observed[0])[2])[-1]
+        pointer = json.loads(worker.base64.urlsafe_b64decode(encoded))
+        self.assertEqual(worker.load_supervisor_payload(pointer), original_payload)
+        for bad in [dict(pointer, token='wrong'),
+                    dict(pointer, run_id='another'),
+                    dict(pointer, state=pointer['state'] + '/../bad')]:
+            with self.assertRaises((RuntimeError, ValueError, FileNotFoundError)):
+                worker.load_supervisor_payload(bad)
+
     def test_stop_cancels_pre_acknowledgement_tmux_owned_by_launch(self):
         directory = self.w.state / 'pending'
         directory.mkdir()
@@ -558,7 +605,7 @@ class LocalGitUpdateTests(unittest.TestCase):
         git(self.origin, 'init', '-b', 'tooling')
         git(self.origin, 'config', 'user.email', 'test@example.invalid')
         git(self.origin, 'config', 'user.name', 'Local test')
-        for name in ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'):
+        for name in (Path(path).name for path in worker.HELPER_PATHS):
             (self.origin / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(SCRIPTS / name, self.origin / 'scripts' / name)
         shutil.copytree(SCRIPTS / 'presets', self.origin / 'scripts' / 'presets')

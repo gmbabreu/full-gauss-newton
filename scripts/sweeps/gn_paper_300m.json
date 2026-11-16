@@ -1,0 +1,64 @@
+{
+  "preset": "gn_adam",
+  "protocol": "paper_300m",
+  "default_solve_tokens": 300000000,
+  "schedule_tokens": 2849988096,
+  "trials": [
+    {
+      "name": "GN_Adam_t1_B2048_lr0.001_K50_wd0.001_seed42",
+      "batch": 2048,
+      "inner_lr": 0.001,
+      "n_micro": 4,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t2_B4096_lr0.002_K50_wd0.001_seed42",
+      "batch": 4096,
+      "inner_lr": 0.002,
+      "n_micro": 8,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t3_B3072_lr0.002_K50_wd0.001_seed42",
+      "batch": 3072,
+      "inner_lr": 0.002,
+      "n_micro": 6,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t4_B2048_lr0.002_K50_wd0.001_seed42",
+      "batch": 2048,
+      "inner_lr": 0.002,
+      "n_micro": 4,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t5_B1024_lr0.002_K50_wd0.001_seed42",
+      "batch": 1024,
+      "inner_lr": 0.002,
+      "n_micro": 2,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t6_B4096_lr0.004_K50_wd0.001_seed42",
+      "batch": 4096,
+      "inner_lr": 0.004,
+      "n_micro": 8,
+      "optimizer_wd": 0.001
+    },
+    {
+      "name": "GN_Adam_t7_B2048_lr0.001_K50_wd0_seed42",
+      "batch": 2048,
+      "inner_lr": 0.001,
+      "n_micro": 4,
+      "optimizer_wd": 0
+    },
+    {
+      "name": "GN_Adam_t8_B2048_lr0.001_K50_wd0.01_seed42",
+      "batch": 2048,
+      "inner_lr": 0.001,
+      "n_micro": 4,
+      "optimizer_wd": 0.01
+    }
+  ]
+}
