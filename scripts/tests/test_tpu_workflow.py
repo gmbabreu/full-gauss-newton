@@ -27,7 +27,7 @@ import tpu_worker as worker
 class PresetTests(unittest.TestCase):
     def test_all_presets_and_solver_settings(self):
         self.assertEqual(set(experiment.choices()), {'adam', 'gn_adam', 'gn_muon', 'gn_rmsprop',
-                          'gn_sgd', 'pcg_jacobi', 'pcg_interpolated'})
+                          'gn_sgd', 'gn_prefix_probe', 'pcg_jacobi', 'pcg_interpolated'})
         for name in experiment.choices():
             with self.subTest(name=name):
                 p = experiment.make_plan(name, [], 'shared')

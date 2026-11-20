@@ -36,6 +36,7 @@ from EasyLM.data import DatasetFactory, HuggingfaceDataset
 from EasyLM.training_progress import ProcessTiming, configure_wandb_run, resolve_progress
 from EasyLM.pcg import estimate_gn_diagonal, gn_jacobi_preconditioner
 from EasyLM import cg_resume
+from EasyLM import gn_prefix
 from EasyLM import update_geometry
 from EasyLM.condition_diagnostics import ConditionDiagnostics
 from EasyLM.training_resume import resume_companion_paths, validate_branch_parent
@@ -79,6 +80,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_time_offset_s=0.0,
     log_initial_eval=False,
     log_inner_steps=False,
+    gn_prefix_probe_steps='',
+    gn_prefix_ks='10,20,50,100',
+    gn_prefix_holdout_batches=2,
     save_model_freq=0,
     save_milestone_freq=0,
     eval_freq=0,
@@ -252,7 +256,7 @@ def update_balance_metrics(direction):
     return metrics
 
 
-def gn_quadratic_summary(direction, gradient, g_direction):
+def gn_quadratic_summary(direction, gradient, g_direction, include_residual=False):
     """Predicted data-loss improvements for a raw displacement; no applied scale."""
     def dot(left, right):
         return sum(jnp.sum(x.astype(jnp.float32) * y.astype(jnp.float32))
@@ -276,16 +280,21 @@ def gn_quadratic_summary(direction, gradient, g_direction):
         g_norm > 0,
         jnp.sqrt(dot(residual, residual)) / jnp.where(g_norm > 0, g_norm, 1.0),
         jnp.nan)
-    return {
+    result = {
         'gn_quad/g_dot_d': a,
         'gn_quad/d_G_d': b,
         'gn_quad/loss_improvement': -a - 0.5 * b,
         'gn_quad/optimal_scaled_loss_improvement': optimal,
         'gn_quad/final_relative_residual': relative_residual,
     }
+    if include_residual:
+        residual_norm = jnp.sqrt(dot(residual, residual))
+        result.update(residual_norm=residual_norm,
+                      relative_residual=residual_norm / (g_norm + 1e-12))
+    return result
 
 
-def measure_gn_quadratic(logits_fn, logits_loss, params0, final_params):
+def measure_gn_quadratic(logits_fn, logits_loss, params0, final_params, include_residual=False):
     """Read the final iterate against the frozen, penalty-free GN quadratic."""
     direction = jax.tree.map(lambda p, p0: p - p0, final_params, params0)
     logits0, jvp_fn = linearize(logits_fn, params0)
@@ -294,7 +303,7 @@ def measure_gn_quadratic(logits_fn, logits_loss, params0, final_params):
     pullback = linear_transpose(jvp_fn, params0)
     gradient = pullback(logit_gradient)[0]
     g_direction = pullback(h_jd)[0]
-    return gn_quadratic_summary(direction, gradient, g_direction)
+    return gn_quadratic_summary(direction, gradient, g_direction, include_residual)
 
 
 def accepted_gn_comparison(metrics, base_params, updated_params, solve_batch,
@@ -522,6 +531,7 @@ def reused_ls_batch(history, current):
 
 
 def main(argv):
+    prefix_steps, prefix_ks = gn_prefix.validate(FLAGS)
     validate_ls_reuse(FLAGS)
     if FLAGS.n_micro < 0 or FLAGS.cg_n_micro <= 0:
         raise ValueError('n_micro must be nonnegative; cg_n_micro must be positive')
@@ -732,9 +742,16 @@ def main(argv):
         )
         eval_iterator = iter(eval_dataset)
 
+    # A new loader owns its cursor, packing buffers and underlying dataset iterator.
+    # Deep-copy config as the packed loader mutates token counters on its config.
+    if prefix_steps:
+        prefix_dataset = DatasetFactory.load_dataset(
+            copy.deepcopy(FLAGS.eval_dataset), dataset.tokenizer)
+        prefix_iterator = iter(prefix_dataset)
+
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    if (FLAGS.log_gn_quadratic or FLAGS.export_update_geometry
+    if (prefix_steps or FLAGS.log_gn_quadratic or FLAGS.export_update_geometry
             or (FLAGS.gauss_newton and FLAGS.optimizer_type != "cg"
                 and FLAGS.n_micro > 1)):
         stochastic = ('embedding_dropout', 'feedforward_dropout',
@@ -1110,7 +1127,7 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
-    def gn_quadratic_metrics(params0, final_params, rng, batch):
+    def gn_quadratic_metrics(params0, final_params, rng, batch, prefix=False):
         # Local reuse of the last solve RNG; no training RNG is returned or advanced.
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -1139,8 +1156,8 @@ def main(argv):
                 jnp.bool_(True))
             direction = jax.tree.map(lambda p, p0: p - p0, final_params, params0)
             gd = jax.tree.map(lambda r, g: r - g, residual, base)
-            return gn_quadratic_summary(direction, base, gd)
-        return measure_gn_quadratic(logits_fn, logits_loss, params0, final_params)
+            return gn_quadratic_summary(direction, base, gd, prefix)
+        return measure_gn_quadratic(logits_fn, logits_loss, params0, final_params, prefix)
 
     def loss_fn(params, batch, rng):
         rng_generator = JaxRNG(rng)
@@ -1552,6 +1569,12 @@ def main(argv):
                           PS(), batch_partition),
             out_shardings=PS(),
         )
+
+    if prefix_steps:
+        sharded_prefix_quadratic = pjit(
+            partial(gn_quadratic_metrics, prefix=True),
+            in_shardings=(train_state_partition.params, train_state_partition.params,
+                          PS(), batch_partition), out_shardings=PS())
 
     if FLAGS.optimizer_type == 'cg':
         sharded_train_step_cg = pjit(
@@ -2047,6 +2070,10 @@ def main(argv):
         cg_checkpoint_safe = True
         for step in step_counter:
             geometry_capture = None
+            prefix_capture = None
+            do_prefix = step in prefix_steps
+            prefix_used_updates = []
+            prefix_seconds = 0.0
             cg_checkpoint_safe = False
             timing.start()
             k = FLAGS.train_batch_growth_interval
@@ -2450,9 +2477,21 @@ def main(argv):
                     )
                     if do_gn_quadratic and (i + 1) == FLAGS.inner_loop_iter:
                         gn_quadratic_rng = sharded_rng
+                    if do_prefix:
+                        # Synchronize and exclude counter inspection from normal time.
+                        jax.block_until_ready((inner_state, sharded_rng))
+                        timing.stop_train_interval(completed_update=False)
+                        prefix_started = timeit.default_timer()
+                        prefix_used_updates.append(gn_prefix.optimizer_usage(inner_state, lr_sched))
+                        prefix_seconds += timeit.default_timer() - prefix_started
+                        timing.start()
                     inner_state, sharded_rng, metrics = sharded_train_step(
                         inner_state, train_state.params, sharded_rng, batch, FLAGS.inner_loop_wd, is_last_step
                     )
+                    if do_prefix and (i + 1) == FLAGS.inner_loop_iter:
+                        # Capture BEFORE line search splits the normal RNG. No donation
+                        # in sharded_train_step: immutable buffers may safely be shared.
+                        prefix_capture = (inner_state, sharded_rng, batch, outer_params_before)
                     if (i + 1) == 1 or (i + 1) % 100 == 0 or (i + 1) == FLAGS.inner_loop_iter:
                         print(f"  inner step {i+1}/{FLAGS.inner_loop_iter} done", flush=True)
                     if FLAGS.log_inner_steps:
@@ -2619,6 +2658,23 @@ def main(argv):
                 finally:
                     condition_batch = None
             timing.stop_train_interval(completed_update=True)
+            if prefix_capture is not None:
+                probe_state, probe_rng, probe_batch, probe_base = prefix_capture
+                prefix_metrics = gn_prefix.run_probe(
+                    step=step, ks=prefix_ks, base=probe_base, state=probe_state,
+                    rng=probe_rng, solve_batch=probe_batch, solve_rng=probe_rng,
+                    ls_batches=ls_batches, ls_rngs=ls_rngs, baseline_loss=baseline_loss,
+                    selected_step=step_size, losses=losses,
+                    holdout_iterator=prefix_iterator,
+                    holdout_batches=FLAGS.gn_prefix_holdout_batches,
+                    inner_step=sharded_train_step, quadratic=sharded_prefix_quadratic,
+                    loss_fn=lambda p, b, r: microbatched_loss_fn(p, b, r, FLAGS.n_micro),
+                    search=run_linesearch, schedule=lr_sched,
+                    used_updates=prefix_used_updates)
+                prefix_metrics['gn_prefix/runtime_s'] += prefix_seconds
+                defer_wandb(prefix_metrics, step=step)
+                del prefix_capture, probe_state, probe_rng, probe_batch, probe_base, prefix_metrics
+                prefix_capture = None
             defer_wandb({'train_batch_size': actual_solve_batch_size}, step=step)
             if FLAGS.optimizer_type == 'cg':
                 n_actual, groups = microbatch_groups(
@@ -2646,6 +2702,7 @@ def main(argv):
                 or FLAGS.train_batch_growth_interval > 0
                 or FLAGS.optimizer_type == 'cg'
                 or do_condition
+                or do_prefix
                 or FLAGS.stop_after_first_outer_step)
             if should_log:
                 log_metrics = {}

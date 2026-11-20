@@ -1,0 +1,17 @@
+{
+  "program": "EasyLM.models.llama.llama_train_gn",
+  "route": "sweep",
+  "inner_adam": true,
+  "flags": {
+    "inner_loop_iter": 10,
+    "inner_loop_wd": 0,
+    "lr_sched": "global_cosine",
+    "ls_reuse_lag": 0,
+    "outer_momentum_beta": 0,
+    "outer_weight_decay": 0,
+    "fixed_step_size": 0,
+    "gn_prefix_probe_steps": "0,10,100,1000,2500",
+    "gn_prefix_ks": "10,20,50,100",
+    "gn_prefix_holdout_batches": 2
+  }
+}

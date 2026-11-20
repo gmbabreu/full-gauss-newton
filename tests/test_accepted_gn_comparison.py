@@ -4,6 +4,7 @@ Extract trainer functions/blocks as in the other host logging checks; only the
 solver is replaced with a fixed displacement on a tiny masked data-loss model.
 """
 import ast
+import copy
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
 import io
@@ -27,6 +28,11 @@ def execute(nodes, namespace, *, loop=False):
         nodes = [ast.For(target=ast.Name(id='_once', ctx=ast.Store()),
                          iter=ast.Tuple(elts=[ast.Constant(0)], ctx=ast.Load()),
                          body=nodes, orelse=[])]
+    nodes = copy.deepcopy(nodes)
+    for n in nodes:
+        if isinstance(n, ast.FunctionDef):
+            n.body = [ast.Global(names=c.names) if isinstance(c, ast.Nonlocal) else c
+                      for c in n.body]
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  str(TRAINER), 'exec'), namespace)
 
@@ -61,7 +67,7 @@ class AcceptedGNComparisonTest(unittest.TestCase):
             cg_interpolation_lambda=1., cg_lambda_batch_denominator=0,
             cg_lambda_final=-1., fixed_step_size=fixed, armijo_linesearch=armijo,
             armijo_init_step=1., armijo_beta=.5, patience=1, ls_range=7,
-            ls_eval_batches=2)
+            ls_eval_batches=2, ls_reuse_lag=0)
         if restricted:
             setattr(flags, *restricted)
         # Paired targets, unequal sequence mask lengths, and one all-masked row.
@@ -125,7 +131,7 @@ class AcceptedGNComparisonTest(unittest.TestCase):
                   pull_training_batch=pull, dataset=None, step=step,
                   train_state=State(jnp.array(1.)), inner_state=State(jnp.array(1.)),
                   sharded_rng=initial_rng, single_batch_=solve, single_dataset_metrics_={},
-                  do_condition=False, cg_first_moment=jnp.array(0.),
+                  do_condition=False, do_prefix=False, cg_first_moment=jnp.array(0.),
                   cg_second_moment=jnp.array(0.), cg_x0=jnp.array(0.), cg_adam_step=0,
                   sharded_train_step_cg=cg_solver, sharded_train_step=gn_solver,
                   sharded_gn_quadratic_metrics=quadratic,
