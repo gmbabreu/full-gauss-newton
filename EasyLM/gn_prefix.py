@@ -1,4 +1,4 @@
-"""Observational prefixes on the committed K=10 trajectory.
+"""Observational prefixes on the committed configured-K trajectory.
 
 Callbacks are the trainer's normal inner step, quadratic, loss and line search.
 No optimizer snapshots are accumulated; only scalar measurements survive a prefix.
@@ -24,9 +24,9 @@ def validate(flags):
     steps, ks = integers(flags.gn_prefix_probe_steps), integers(flags.gn_prefix_ks)
     if any(s < 0 for s in steps) or len(set(steps)) != len(steps):
         raise ValueError('GN prefix probe steps must be distinct zero-based steps')
-    if not ks or ks[0] != 10 or any(b <= a for a, b in zip(ks, ks[1:])):
-        raise ValueError('GN prefix Ks must be strictly increasing and begin with 10')
-    required = dict(gauss_newton=True, inner_loop_iter=10, single_batch_inner=True,
+    if not ks or ks[0] != flags.inner_loop_iter or flags.inner_loop_iter <= 0 or any(b <= a for a, b in zip(ks, ks[1:])):
+        raise ValueError('GN prefix Ks must be strictly increasing and begin with inner_loop_iter')
+    required = dict(gauss_newton=True, single_batch_inner=True,
                     adaptive_inner_loop=False, reset_start=False, linesearch=True,
                     ls_eval_batches=1, weight_average=False, normalize_step=False,
                     outer_momentum_beta=0, outer_weight_decay=0, fixed_step_size=0,
@@ -112,14 +112,14 @@ def run_probe(*, step, ks, base, state, rng, solve_batch, solve_rng,
         result[f'gn_prefix/heldout_{i}_fingerprint'] = fingerprint(batch)
         result[f'gn_prefix/heldout_{i}_rng_fingerprint'] = fingerprint({'rng': key})
     radius = None
-    k10_improvement = None
-    previous = 10
+    first_improvement = None
+    previous = ks[0]
     for k in ks:
         for update in range(previous, k):
             used_updates.append(optimizer_usage(state, schedule))
             state, rng, _ = inner_step(state, base, rng, solve_batch, 0., jnp.bool_(False))
         direction = jax.tree.map(lambda p, p0: p - p0, state.params, base)
-        alpha, candidates = ((selected_step, losses) if k == 10 else
+        alpha, candidates = ((selected_step, losses) if k == ks[0] else
                              search(base, direction, ls_batches, ls_rngs))
         alpha = float(jax.device_get(alpha))
         raw_norm = float(jax.device_get(norm(direction)))
@@ -137,10 +137,10 @@ def run_probe(*, step, ks, base, state, rng, solve_batch, solve_rng,
         a, b = float(q['gn_quad/g_dot_d']), float(q['gn_quad/d_G_d'])
         chosen_loss = next(float(jax.device_get(loss)) for scale, loss in candidates
                            if float(jax.device_get(scale)) == alpha)
-        if k10_improvement is None:
-            k10_improvement = improvement
+        if first_improvement is None:
+            first_improvement = improvement
         values = dict(heldout_improvement=improvement,
-                      marginal_heldout_improvement=improvement - k10_improvement,
+                      marginal_heldout_improvement=improvement - first_improvement,
                       matched_norm_heldout_improvement=matched_improvement,
                       predicted_raw_improvement=-a - .5 * b,
                       predicted_accepted_improvement=-alpha * a - .5 * alpha**2 * b,

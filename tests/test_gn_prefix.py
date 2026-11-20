@@ -144,6 +144,15 @@ class PrefixTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 gn_prefix.validate(flags(**changes))
         self.assertEqual(gn_prefix.validate(flags())[1], (10, 20, 50, 100))
+        self.assertEqual(
+            gn_prefix.validate(
+                flags(inner_loop_iter=20, gn_prefix_ks='20,50,100')
+            )[1],
+            (20, 50, 100),
+        )
+        with self.assertRaises(ValueError):
+            gn_prefix.validate(flags(inner_loop_iter=20))
+
 
     def test_off_cadence_probe_row_does_not_trigger_normal_evaluation(self):
         assignments = {ast.unparse(n.targets[0]): n for n in ast.walk(node('main'))
