@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import tempfile
@@ -17,6 +18,20 @@ import spot_queue as queue
 IDENTITY = '598447672993-compute@developer.gserviceaccount.com'
 STATE = Path('/var/lib/gfn-spot')
 CONFIG = STATE / 'queue.json'
+SERVICE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+SNAP_GCLOUD = '/snap/google-cloud-cli/current/bin/gcloud'
+
+
+def find_gcloud():
+    # Prefer ordinary installations using only the service's fixed search path.
+    # Invoke Snap's SDK entry point directly, avoiding the /snap/bin launcher
+    # and its additional confinement machinery inside the service sandbox.
+    executable = shutil.which('gcloud', path=SERVICE_PATH)
+    if executable:
+        return executable
+    if Path(SNAP_GCLOUD).is_file() and os.access(SNAP_GCLOUD, os.X_OK):
+        return SNAP_GCLOUD
+    raise ValueError('No executable gcloud in service PATH or at ' + SNAP_GCLOUD)
 
 
 @contextmanager
@@ -30,7 +45,7 @@ def isolated_environment(state=STATE):
         (configurations / 'config_watchdog').write_text('[core]\ndisable_prompts = true\n')
         (Path(directory) / 'active_config').write_text('watchdog')
         environment = {
-            'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+            'PATH': SERVICE_PATH,
             'HOME': str(state), 'LANG': 'C.UTF-8',
             'CLOUDSDK_CONFIG': directory,
             'CLOUDSDK_ACTIVE_CONFIG_NAME': 'watchdog',
@@ -86,10 +101,13 @@ def preflight():
     actual = metadata_identity()
     if actual != IDENTITY:
         raise ValueError(f'Attached identity mismatch: {actual!r}; expected {IDENTITY}')
+    queue.GCLOUD_EXECUTABLE = find_gcloud()
+    queue.log('Using gcloud executable: ' + queue.GCLOUD_EXECUTABLE)
     requests = queue.inventory('queued-resources')
     nodes = queue.inventory('tpu-vm')
     # Full snapshots allow the operator to compare existing states at handoff.
-    queue.log(json.dumps({'identity': actual, 'queued_resources': requests, 'nodes': nodes},
+    queue.log(json.dumps({'identity': actual, 'gcloud_executable': queue.GCLOUD_EXECUTABLE,
+                         'queued_resources': requests, 'nodes': nodes},
                          sort_keys=True))
     queue.log('Read-only preflight passed; create/delete permissions are NOT verified')
 

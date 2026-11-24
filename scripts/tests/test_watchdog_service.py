@@ -16,6 +16,60 @@ import install_watchdog as installer
 
 
 class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        executable = patch.object(queue, 'GCLOUD_EXECUTABLE', 'gcloud')
+        executable.start()
+        self.addCleanup(executable.stop)
+
+    def test_ordinary_gcloud_discovery_uses_fixed_path(self):
+        for executable in ('/usr/bin/gcloud', '/usr/local/bin/gcloud'):
+            with self.subTest(executable=executable), \
+                    patch.dict(os.environ, {'PATH': '/untrusted/bin'}), \
+                    patch.object(service.shutil, 'which', return_value=executable) as which, \
+                    patch.object(service.Path, 'is_file') as is_file:
+                self.assertEqual(service.find_gcloud(), executable)
+                which.assert_called_once_with('gcloud', path=service.SERVICE_PATH)
+                is_file.assert_not_called()
+
+    @patch.object(service.shutil, 'which', return_value=None)
+    @patch.object(service.Path, 'is_file', return_value=True)
+    @patch.object(service.os, 'access', return_value=True)
+    def test_snap_discovery_uses_direct_sdk_entry_point(self, access, is_file, which):
+        self.assertEqual(service.find_gcloud(), '/snap/google-cloud-cli/current/bin/gcloud')
+        access.assert_called_once_with(service.SNAP_GCLOUD, os.X_OK)
+
+    @patch.object(service.shutil, 'which', return_value=None)
+    def test_missing_or_nonexecutable_gcloud_fails_closed(self, which):
+        for exists, executable in ((False, True), (True, False)):
+            with self.subTest(exists=exists, executable=executable), \
+                    patch.object(service.Path, 'is_file', return_value=exists), \
+                    patch.object(service.os, 'access', return_value=executable), \
+                    patch.object(service, 'metadata_identity', return_value=service.IDENTITY), \
+                    patch.object(queue, 'inventory') as inventory:
+                with self.assertRaisesRegex(ValueError, 'No executable gcloud'):
+                    service.preflight()
+                inventory.assert_not_called()
+
+    @patch.object(service, 'metadata_identity', return_value=service.IDENTITY)
+    def test_selected_executable_is_reported_and_used_for_all_commands(self, identity):
+        for executable in ('/usr/bin/gcloud', service.SNAP_GCLOUD):
+            with self.subTest(executable=executable), \
+                    patch.object(service, 'find_gcloud', return_value=executable), \
+                    patch.object(queue, 'log') as log, \
+                    patch.object(queue.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='[]')) as run:
+                with tempfile.TemporaryDirectory() as state, service.isolated_environment(Path(state)) as env:
+                    service.preflight()
+                    self.assertEqual(len(run.call_args_list), 2)
+                    for call in run.call_args_list:
+                        self.assertEqual(call.args[0][0], executable)
+                        self.assertEqual(call.kwargs['env'], env)
+                    for action in ('create', 'delete'):
+                        self.assertEqual(queue.gcloud('queued-resources', action)[0], executable)
+                log.assert_any_call('Using gcloud executable: ' + executable)
+                snapshot = next(json.loads(call.args[0]) for call in log.call_args_list
+                                if call.args[0].startswith('{'))
+                self.assertEqual(snapshot['gcloud_executable'], executable)
+
     def test_environment_is_fresh_allowlist_and_restored(self):
         hostile = {'CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE': '/user/key',
                    'CLOUDSDK_AUTH_ACCESS_TOKEN': 'token',
@@ -24,7 +78,8 @@ class ServiceTests(unittest.TestCase):
                    'GOOGLE_APPLICATION_CREDENTIALS': '/user/adc',
                    'CLOUDSDK_AUTH_ACCESS_TOKEN_FILE': '/token',
                    'CLOUDSDK_ACTIVE_CONFIG_NAME': 'user', 'HOME': '/user',
-                   'HTTPS_PROXY': 'proxy', 'PYTHONPATH': '/user/code'}
+                   'HTTPS_PROXY': 'proxy', 'PYTHONPATH': '/user/code',
+                   'PATH': '/user/bin:/snap/bin'}
         with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, hostile, clear=True):
             with service.isolated_environment(Path(state)) as env:
                 self.assertEqual(dict(os.environ), env)
@@ -65,17 +120,19 @@ class ServiceTests(unittest.TestCase):
                 service.metadata_identity()
 
     @patch.object(service, 'metadata_identity', return_value=service.IDENTITY)
+    @patch.object(service, 'find_gcloud', return_value='/usr/bin/gcloud')
     @patch.object(queue, 'inventory', return_value={})
     @patch.object(queue, 'reconcile')
-    def test_preflight_reads_both_inventories_only(self, reconcile, inventory, identity):
+    def test_preflight_reads_both_inventories_only(self, reconcile, inventory, executable, identity):
         service.preflight()
         self.assertEqual([x.args[0] for x in inventory.call_args_list], ['queued-resources', 'tpu-vm'])
         reconcile.assert_not_called()
 
     @patch.object(service, 'metadata_identity', return_value=service.IDENTITY)
+    @patch.object(service, 'find_gcloud', return_value='/usr/bin/gcloud')
     @patch.object(queue, 'inventory', side_effect=RuntimeError('permission denied'))
     @patch.object(queue, 'main')
-    def test_preflight_failure_never_enters_watchdog(self, main, inventory, identity):
+    def test_preflight_failure_never_enters_watchdog(self, main, inventory, executable, identity):
         with tempfile.TemporaryDirectory() as directory, patch.object(service, 'STATE', Path(directory)), \
                 patch.object(service, 'validate_files'), patch.object(sys, 'argv', ['service']):
             # Explicit context keeps this test independent of the production state path.
@@ -128,7 +185,9 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual((root / 'code/spot_queue.py').read_bytes(), (TPU / 'spot_queue.py').read_bytes())
             unit = (root / 'unit').read_text()
             for setting in ['User=gfn-spot', 'Restart=on-failure', 'RestartSec=60',
-                            'StandardOutput=journal', 'WantedBy=multi-user.target']:
+                            'StandardOutput=journal', 'WantedBy=multi-user.target',
+                            'NoNewPrivileges=true', 'ProtectSystem=strict', 'ProtectHome=true',
+                            'PrivateTmp=true', 'ReadWritePaths=/var/lib/gfn-spot']:
                 self.assertIn(setting, unit)
 
     @patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='active', stderr=''))

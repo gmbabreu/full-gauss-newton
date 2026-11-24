@@ -16,6 +16,7 @@ PROJECT = 'fast-second-order'
 ZONE = 'us-central2-b'
 TARGETS = {'3': 'gn-v4-32-spot-1', '4': 'gn-v4-32-spot-2'}
 OWNER = 'gfn-spot-queue'
+GCLOUD_EXECUTABLE = 'gcloud'
 
 
 def log(message, *, file=None):
@@ -25,7 +26,7 @@ def log(message, *, file=None):
 
 
 def gcloud(group, action, *args):
-    return ['gcloud', 'compute', 'tpus', group, action, *args,
+    return [GCLOUD_EXECUTABLE, 'compute', 'tpus', group, action, *args,
             '--project=' + PROJECT, '--zone=' + ZONE, '--quiet']
 
 

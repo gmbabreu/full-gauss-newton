@@ -107,6 +107,16 @@ refreshed by gcloud from the attached identity; this is not a promise that IAM,
 OAuth scopes or host availability cannot change. The captured resource service
 account in queue.json is preserved independently of controller authentication.
 
+Executable discovery prefers `gcloud` in the service's fixed system PATH and
+falls back to `/snap/google-cloud-cli/current/bin/gcloud` directly. It does not
+invoke `/snap/bin/gcloud`, inherit the operator's PATH or add Snap environment
+overrides. Preflight logs the chosen absolute executable before cloud calls and
+includes `gcloud_executable` in its inventory snapshot; the watchdog uses that
+same executable for subsequent commands. Missing/nonexecutable installations
+block preflight. The systemd restrictions and credential isolation are unchanged.
+The operator reports that this direct Snap path passed sandboxed preflight on
+TPU1; this repository change has not been deployed or checked against live TPUs.
+
 ### Install while box248 is still monitoring
 
 Run these **operator-only** commands on box248, from a separate clean checkout of
@@ -461,8 +471,9 @@ permissions, installation without activation, both targets and 300-second pollin
 provisioning, package downloads, IAM, actual startup and TPU execution require
 operator validation. The scripts do not claim these local tests cover them.
 
-Implementation validation on 2026-11-24: **66 CPU tests passed** in local Ubuntu
-WSL (15.505s); both Bash syntax checks and systemd unit verification exited 0;
+Implementation validation on 2026-11-24: **70 CPU tests passed** in local Ubuntu
+WSL (10.476s), including mocked ordinary/Snap executable discovery, failure and
+preflight-reporting checks; both Bash syntax checks and systemd unit verification exited 0;
 `git diff --check` passed. The initial Windows working-tree run had 62/63 tests
 pass, with the existing shell entrypoint test failing on CRLF line endings;
 setup_vm.sh syntax checking also hit existing CRLF. Final validation used a
