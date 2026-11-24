@@ -94,13 +94,13 @@ def reconcile(target, requests, nodes, args):
     # Recreation follows only after a later successful inventory confirms absence.
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--targets', nargs='+', choices=sorted(TARGETS), default=['3'])
     p.add_argument('--config', required=True, help='queue.json from capture_setup.py')
     p.add_argument('--apply', action='store_true', help='Allow creates and terminal request cleanup')
     p.add_argument('--watch', action='store_true', help='Poll every 300 seconds')
-    a = p.parse_args()
+    a = p.parse_args(argv)
     config = json.loads(Path(a.config).expanduser().read_text())
     if set(config) != {'runtime_version', 'service_account', 'startup_script'}:
         p.error('Invalid queue configuration keys')
@@ -112,7 +112,7 @@ def main():
         p.error('startup-script must be a prepared local file')
     if not a.runtime_version or '@' not in a.service_account:
         p.error('Provide the verified runtime and service-account email')
-    # Fixed per-project/zone lock: two controllers cannot maintain overlapping targets here.
+    # This lock is local to this user's home on this host, not cross-host coordination.
     state = Path.home() / '.local/state/gfn-spot'
     state.mkdir(parents=True, exist_ok=True)
     with (state / 'watchdog.lock').open('a') as lock:

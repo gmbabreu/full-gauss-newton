@@ -329,6 +329,15 @@ on epoch. None of these restrictions are relaxed by the tooling.
 
 ## Branch delivery and local validation
 
+Capacity watchdog deployment status (2026-11-24): TPU1 worker-0 systemd service
+with isolated attached-service-account authentication is **pending operator
+deployment and confirmation**. See [the installation, IAM review, controller
+handoff and rollback commands](../scripts/tpu/README.md#tpu1-service-deployment-pending-operator-deployment).
+No IAM, TPU resources, training checkout or experiment launching is changed by
+this implementation. Keep box248 as sole controller until the documented handoff;
+the local file lock does not coordinate hosts. TPU1 availability is required for
+the proposed monitoring service. IAM and reboot behavior require operator checks.
+
 The implementation is committed on `codex/tpu-workflow` from `origin/main`, then
 cherry-picked onto `codex/tpu-workflow-epoch` from `origin/epoch`. Open separate PRs
 against `main` and `epoch`; do not merge either base into the other. All changed
