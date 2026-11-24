@@ -337,6 +337,10 @@ No IAM, TPU resources, training checkout or experiment launching is changed by
 this implementation. Keep box248 as sole controller until the documented handoff;
 the local file lock does not coordinate hosts. TPU1 availability is required for
 the proposed monitoring service. IAM and reboot behavior require operator checks.
+Controller handoff also requires recording descendants before shutdown, verifying
+exit of the old watchdog and every cloud-command subprocess, and resolving any
+in-flight mutation from fresh inventory before activation. Parent exit alone is
+insufficient; see the migration guide. Deployment remains pending confirmation.
 
 The implementation is committed on `codex/tpu-workflow` from `origin/main`, then
 cherry-picked onto `codex/tpu-workflow-epoch` from `origin/epoch`. Open separate PRs

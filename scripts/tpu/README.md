@@ -217,9 +217,45 @@ tmux list-sessions
 Also inspect any supervisor/container wrapper or site scheduler used for this
 process, and `/etc/cron.d`, `/etc/crontab` and user login startup files if relevant.
 Save the old exact command, config path, working directory and relaunch settings
-for rollback. Verify `OLD_PID` is this watchdog, not a trainer or reused PID. If
-managed by systemd, inspect and disable only the identified unit (`OLD_UNIT` must
-be its real name):
+for rollback. Verify `OLD_PID` is this watchdog, not a trainer or reused PID.
+**Before stopping it, record its descendants**, including gcloud launchers,
+Python processes running gcloud, and any subprocesses they launched. A parent
+exiting does not prove its children exited; they may be reparented and continue
+a cloud operation. On box248, save a process tree and a process table containing
+start times and command lines:
+
+```bash
+HANDOFF=$(mktemp -d "$HOME/.local/state/gfn-spot/handoff.XXXXXXXX")
+pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-before.txt"
+ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-before.txt"
+# Pause only the verified watchdog so it cannot launch another cloud command.
+kill -STOP "$OLD_PID"
+pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-paused.txt"
+ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-paused.txt"
+```
+
+The first snapshot precedes the pause; the second captures children launched
+between that snapshot and the pause. Review both and record **all descendant
+process PIDs**, not thread IDs shown in braces by pstree. Check identities against
+the saved start times and commands. Include children of gcloud wrappers, not
+just processes named `gcloud`. Keep tracking any further descendants of those
+commands until they finish. If the tree cannot be inspected or any process's
+ownership/outcome is uncertain, stop the handoff and do not activate TPU1.
+
+Populate this array with the actual recorded descendant PIDs; use an empty array
+only when both snapshots establish there were none:
+
+```bash
+OLD_DESCENDANT_PIDS=()  # fill with the verified PIDs from the saved trees
+OLD_ALL_PIDS=("$OLD_PID" "${OLD_DESCENDANT_PIDS[@]}")
+OLD_PID_LIST=$(IFS=,; echo "${OLD_ALL_PIDS[*]}")
+printf '%s\n' "${OLD_ALL_PIDS[@]}" > "$HANDOFF/pids.txt"
+ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args \
+  | tee "$HANDOFF/identified-processes.txt"
+```
+
+If managed by systemd, inspect and disable only the identified unit (`OLD_UNIT`
+must be its real name). Record descendants above **before** `--now` stops it:
 
 ```bash
 # Run only for an identified user service; for a system service use sudo systemctl.
@@ -229,27 +265,76 @@ systemctl --user disable --now "$OLD_UNIT"
 # For cron, use crontab -e and remove only this watchdog's relaunch entry.
 ```
 
-For the documented nohup process, after verifying the PID and disabling any
-configured relaunch:
+For the documented nohup process, after recording descendants and disabling any
+configured relaunch, send TERM to the verified parent and then CONT so the paused
+process can receive the pending termination signal. Do not resume it without
+first requesting termination:
 
 ```bash
 kill -TERM "$OLD_PID"
-timeout 30 tail --pid="$OLD_PID" -f /dev/null
-if kill -0 "$OLD_PID" 2>/dev/null; then echo 'STOP: old PID still exists'; false; fi
+kill -CONT "$OLD_PID"
+WAIT_ARGS=()
+for pid in "${OLD_ALL_PIDS[@]}"; do WAIT_ARGS+=(--pid="$pid"); done
+timeout 240 tail "${WAIT_ARGS[@]}" -f /dev/null
+ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args
+# Expected: header only, no recorded process remains (ps exits 1).
 pgrep -af '[s]pot_queue.py'  # expected no watchdog; inspect any output
 ```
 
-If a manager already stopped it, skip `kill` but still verify exit. Do not proceed
-unless the watchdog has exited and no mechanism can restart it. Never use broad
-`pkill python`, stop trainers, or cancel queued requests.
+If a manager already stopped it, skip the TERM/CONT commands but perform the
+same descendant wait and verification. A timeout is a blocked handoff, not
+permission to proceed. Inspect remaining recorded processes and their descendants
+using their identities, saved process table and process groups, even if they have
+been reparented. Prefer waiting for cloud commands to finish; if one is stuck,
+resolve it individually after rechecking its PID, start time and command. Never
+use broad process kills or signal an unverified process group. Do not stop
+trainers or cancel queued requests. Reused PIDs require identity inspection;
+they must never be killed based solely on the saved PID.
+
+Activation requires verified exit of **both the old watchdog and every cloud
+command/subprocess it launched**, and disabled automatic relaunch. Parent PID
+exit alone is insufficient. If descendants escaped observation, or completion
+cannot be established, keep TPU1 stopped and disabled until resolved.
+
+### Resolve any in-flight mutation before activation
+
+Inspect the recorded command lines and the old watchdog log around shutdown:
+
+```bash
+tail -n 200 "$HOME/.local/state/gfn-spot/watchdog.log" \
+  | tee "$HANDOFF/watchdog-shutdown.log"
+```
+
+If a create/delete was in flight, or its completion is uncertain, local process
+exit is still insufficient: `--async` API operations can continue server-side.
+After **all** old local processes have exited, obtain fresh read-only inventory
+with the preflight command below and inspect the affected queued request, node
+and corresponding operation status/errors. Repeat read-only checks until its
+outcome is resolved: creation is confirmed, deletion is confirmed with no node,
+or a completed failure is understood. A successfully accepted create may leave
+a pending request; preserve it. Do not delete/recreate a pending request to settle
+the handoff. An ambiguous, still-running or failed-to-read operation blocks
+activation; absence in one snapshot or a log line saying `APPLY` does not prove
+completion. Record the affected resource/operation and the resolved outcome in
+`$HANDOFF` on box248. Do not activate the new controller to discover the outcome.
 
 Back on TPU1 worker 0, rerun read-only preflight, compare resource snapshots, then
-activate only after the exit and permission checks above:
+review any in-flight mutation as above. **Stop here** unless all old controller
+and subprocess exits, relaunch disablement, mutation outcomes and permission
+checks are verified. Take another fresh preflight snapshot after resolving any
+mutation, then activate:
 
 ```bash
 set -o pipefail
 sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
   --preflight | tee "$HOME/gfn-preflight-handoff.log" || { echo 'STOP: preflight failed'; exit 1; }
+```
+
+Review this inventory before running the separate activation block. Proceed only
+after recording that the parent and all relevant descendants have exited, no
+relaunch is configured, and every in-flight mutation has a resolved outcome:
+
+```bash
 sudo systemctl enable --now gfn-spot-watchdog.service
 sudo systemctl status --no-pager gfn-spot-watchdog.service
 sudo systemctl is-enabled gfn-spot-watchdog.service
@@ -276,7 +361,10 @@ separately approved reboot, run the same status commands and
 
 ### Rollback without overlapping controllers
 
-On TPU1 worker 0:
+Before stopping the TPU1 service, record its MainPID and descendant tree/process
+identities using the same procedure above, substituting the service MainPID for
+`OLD_PID` and using `sudo` for process inspection and signals where needed. Keep this record
+outside the service state directory. Then, on TPU1 worker 0:
 
 ```bash
 sudo systemctl disable --now gfn-spot-watchdog.service
@@ -286,8 +374,11 @@ sudo systemctl show gfn-spot-watchdog.service -p MainPID -p ControlGroup -p SubS
 pgrep -af '/opt/gfn-spot/[w]atchdog_service.py'  # expected no process
 ```
 
-Require MainPID=0, inactive state and no remaining service process before
-restarting box248. If TPU1 is unreachable, do not assume it has stopped: establish
+Require MainPID=0, inactive state, an empty service control group, and verified
+exit of all recorded descendants (including reparented cloud commands) before
+restarting box248. Apply the same fresh-inventory and in-flight mutation outcome
+checks above; a parent exiting or a local cloud process exiting alone is
+insufficient. If TPU1 is unreachable, do not assume it has stopped: establish
 that it cannot run before restarting another controller. Leave all requests and
 nodes untouched. On box248, restore its saved command/config and authenticate
 there as needed. For the original nohup deployment maintaining both targets:
@@ -347,7 +438,9 @@ kill -TERM "$(cat "$HOME/.local/state/gfn-spot/watchdog.pid")"
 
 Stopping the watchdog leaves existing TPU VMs and pending requests running. It
 does not cancel capacity charges. To maintain both, relaunch the same nohup command
-with `--targets 3 4` after the old process exits. Do not delete a node while the
+with `--targets 3 4` only after the parent and all its cloud-command descendants
+have exited and any in-flight mutation's outcome is resolved, using the handoff
+procedure above. Do not delete a node while the
 watchdog is running unless recreation is intended. Use target 4's exact name for
 its startup/topology checks.
 
