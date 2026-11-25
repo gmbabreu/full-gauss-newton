@@ -345,6 +345,9 @@ migrates captured v4 settings/bytes to managed 3–4 and leaves 5–8 disabled.
 New-generation runtime/topology/data/IAM/quota compatibility remains pending
 per target/location; no trainer, optimizer, experiment or dependency version is
 changed. See [safe installation/update and staged activation](../scripts/tpu/DEPLOYMENT.md).
+Unallocated targets 5–8 use names ending in their controller IDs. Names/requests
+1–4 remain unchanged. New Spot nodes add the informational `gfn-target=ID` label
+alongside `managed-by`; legacy ownership does not require the new label.
 Updating Git does not update `/opt/gfn-spot` or its existing cloud requests.
 Before controller replacement, record descendants, verify parent and all cloud
 subprocess exits, and resolve in-flight mutations from fresh inventory. Parent

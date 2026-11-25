@@ -24,6 +24,15 @@ import watchdog_service as service
 
 
 class RoutingTests(unittest.TestCase):
+    def test_stable_legacy_names_and_numeric_suffixes_for_new_targets(self):
+        expected = {'1': 'gn-v4-32', '2': 'gn-v4-32-2', '3': 'gn-v4-32-spot-1',
+                    '4': 'gn-v4-32-spot-2', '5': 'gn-v6e-16-spot-5', '6': 'gn-v6e-16-spot-6',
+                    '7': 'gn-v5e-16-spot-7', '8': 'gn-v5e-16-spot-8'}
+        self.assertEqual({key: value.name for key, value in registry.TARGETS.items()}, expected)
+        for key in ('5', '6', '7', '8'):
+            self.assertTrue(registry.TARGETS[key].name.endswith('-' + key))
+            self.assertFalse(registry.TARGETS[key].managed)
+
     def test_numeric_routing_and_dynamic_worker_counts(self):
         for key, target in registry.TARGETS.items():
             with self.subTest(key=key):
@@ -51,7 +60,10 @@ class RoutingTests(unittest.TestCase):
                     patch.object(control.Controller, 'operate') as operate:
                 for args in (['status'], ['ssh', '0'], ['logs', '0'], ['run', 'gn_adam'],
                              ['stop'], ['pull'], ['switch', 'main']):
-                    self.assertEqual(control.main([key, *args]), 0)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(control.main([key, *args]), 0)
+                    self.assertTrue(output.getvalue().startswith(f'Target {key}: {registry.TARGETS[key].name} '))
                 self.assertEqual(operate.call_count, 4)
                 self.assertEqual([c.args[0] for c in operate.call_args_list], ['run', 'stop', 'pull', 'switch'])
                 self.assertEqual(operate.call_args.kwargs['branch'], 'main')
@@ -63,7 +75,7 @@ class RoutingTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output), patch.object(control.subprocess, 'run', side_effect=AssertionError('cloud')):
                 control.main([key, 'run', 'gn_adam', '--dry-run', '--mesh_dim=1,2,4', '--inner_loop_iter=17'])
-            for value in (target.name, target.zone, target.accelerator, target.allocation,
+            for value in (f'Target {key}:', target.name, target.zone, target.accelerator, target.allocation,
                           '--mesh_dim=1,2,4', '--inner_loop_iter=17'):
                 self.assertIn(value, output.getvalue())
 
@@ -281,9 +293,10 @@ class RegistryWatchdogTests(unittest.TestCase):
             self.enable(key)
             resource = self.resource(key, 'FAILED')
             queue.validate_owned(resource, target)
-            command = queue.create_command(target, config.preparation(self.configuration, key))
+            command = queue.create_command(key, config.preparation(self.configuration, key))
             for flag in ('--zone=' + target.zone, '--project=' + target.project,
-                         '--accelerator-type=' + target.api_accelerator, '--node-id=' + target.name, '--spot'):
+                         '--accelerator-type=' + target.api_accelerator, '--node-id=' + target.name, '--spot',
+                         '--labels=managed-by=' + queue.OWNER + ',gfn-target=' + key):
                 self.assertIn(flag, command)
             for field in ('nodeId', 'parent', 'acceleratorType', 'labels', 'allocation', 'resource_name'):
                 changed = deepcopy(resource)
@@ -300,6 +313,36 @@ class RegistryWatchdogTests(unittest.TestCase):
                     changed['name'] = changed['name'].replace(target.zone, 'wrong-zone')
                 with self.subTest(key=key, field=field), self.assertRaises(ValueError):
                     queue.validate_owned(changed, target)
+
+    def test_target_label_is_optional_for_legacy_ownership(self):
+        for key in ('3', '4'):
+            target = registry.TARGETS[key]
+            resource = self.resource(key, 'ACTIVE')
+            self.assertNotIn('gfn-target', resource['tpu']['nodeSpec'][0]['node']['labels'])
+            queue.validate_owned(resource, target)
+            resource['tpu']['nodeSpec'][0]['node']['labels']['gfn-target'] = key
+            queue.validate_owned(resource, target)
+            del resource['tpu']['nodeSpec'][0]['node']['labels']['managed-by']
+            with self.assertRaisesRegex(ValueError, 'not owned'):
+                queue.validate_owned(resource, target)
+
+    def test_numeric_id_in_watchdog_state_apply_and_preview_logs(self):
+        for key in ('3', '4', '5', '6', '7', '8'):
+            self.enable(key)
+            name = registry.TARGETS[key].name
+            prefix = f'Target {key} [{name}]: '
+            with patch.object(queue, 'log') as log, patch.object(queue, 'call') as call:
+                queue.reconcile(key, {name: self.resource(key, 'WAITING_FOR_RESOURCES')}, {}, self.args)
+                log.assert_called_once_with(prefix + 'WAITING_FOR_RESOURCES')
+                call.assert_not_called()
+                self.args.apply = True
+                queue.reconcile(key, {}, {}, self.args)
+                self.assertTrue(log.call_args.args[0].startswith(prefix + 'APPLY '))
+                self.assertIn('gfn-target=' + key, log.call_args.args[0])
+                self.args.apply = False
+                queue.reconcile(key, {name: self.resource(key, 'FAILED')}, {}, self.args)
+                self.assertTrue(log.call_args.args[0].startswith(prefix + 'PREVIEW '))
+            self.args.apply = True
 
     def test_all_spot_targets_preserve_pending_and_terminal_recovery(self):
         for key, target in registry.TARGETS.items():
@@ -344,7 +387,7 @@ class RegistryWatchdogTests(unittest.TestCase):
             self.assertEqual(target.api_accelerator, 'v5litepod-16')
             self.enable(key)
             self.assertIn('--accelerator-type=v5litepod-16',
-                          queue.create_command(target, config.preparation(self.configuration, key)))
+                          queue.create_command(key, config.preparation(self.configuration, key)))
             queue.validate_owned(self.resource(key, 'ACTIVE'), target)
             self.assertIn((target.project, target.zone, 'v5e-16', 'spot'), registry.validate_registry())
 

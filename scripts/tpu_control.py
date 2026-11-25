@@ -45,6 +45,7 @@ def local_git(*args):
 
 class Controller:
     def __init__(self, target):
+        self.target_id = target
         self.cfg = dict(DEFAULTS)
         specification = TARGETS[target]
         self.cfg.update(project=os.environ.get('GFN_PROJECT', specification.project),
@@ -145,11 +146,11 @@ class Controller:
         if not self.base['expected_branch']:
             raise RuntimeError('Controller must be on a named branch')
         self.all_workers('preflight')
-        print('All workers passed preflight. Starting ' + plan['run_id'], flush=True)
+        print(f'Target {self.target_id}: All workers passed preflight. Starting ' + plan['run_id'], flush=True)
         try:
             for worker in self.workers:
                 result = self.rpc(worker, 'launch', {'plan': plan})
-                print(f'worker {worker}: {result["message"]}; {result["log"]}', flush=True)
+                print(f'Target {self.target_id} worker {worker}: {result["message"]}; {result["log"]}', flush=True)
         except BaseException as error:
             errors = []
             # Clean only this launch, including ambiguous SSH outcomes.
@@ -161,7 +162,7 @@ class Controller:
             raise RuntimeError(f'Partial launch failure: {error}\n'
                                f'Cleanup attempted for run {plan["run_id"]} on workers {self.workers}. '
                                + ('Cleanup incomplete: ' + '; '.join(errors) if errors else 'Owned processes stopped.')) from error
-        print('Processes started on all workers. Use status/logs to check training initialization.', flush=True)
+        print(f'Target {self.target_id}: Processes started on all workers. Use status/logs to check training initialization.', flush=True)
 
     def update(self, branch=None):
         before = self.all_workers('preflight_update')
@@ -185,7 +186,7 @@ class Controller:
         except Exception as error:
             raise RuntimeError(f'Update incomplete; workers may differ. Target {branch} {target}. '
                                'Inspect status; no rollback/reset was attempted.\n' + str(error)) from error
-        print(f'All workers converged: {branch} {target}')
+        print(f'Target {self.target_id}: All workers converged: {branch} {target}')
 
     def operate(self, action, plan=None, branch=None):
         self.discover()
@@ -207,9 +208,9 @@ class Controller:
                 elif action == 'stop':
                     results = self.all_workers('stop')
                     for worker, report in results.items():
-                        print(f'worker {worker}: ' + json.dumps(report))
+                        print(f'Target {self.target_id} worker {worker}: ' + json.dumps(report))
                         if report['unmanaged'] or report['remaining_tmux']:
-                            print(f'worker {worker}: unmanaged/legacy activity remains; inspect it explicitly')
+                            print(f'Target {self.target_id} worker {worker}: unmanaged/legacy activity remains; inspect it explicitly')
             except BaseException as error:
                 try:
                     self.release()
@@ -231,6 +232,10 @@ def main(argv=None):
     if action not in {'run', 'status', 'logs', 'stop', 'pull', 'switch', 'ssh'}:
         raise ValueError(HELP)
     controller = Controller(target)
+    print(f'Target {target}: {controller.cfg["target"]} '
+          f'({controller.cfg["project"]}, {controller.cfg["zone"]})\n'
+          f'Type: {controller.cfg["accelerator"]}; API type: {TARGETS[target].api_accelerator}; '
+          f'allocation: {controller.cfg["allocation"]}', flush=True)
     if action == 'run':
         if not rest or rest[0].startswith('--'):
             raise ValueError('run requires a preset. Choose: ' + ', '.join(choices()))
@@ -238,10 +243,7 @@ def main(argv=None):
         dry = '--dry-run' in overrides
         overrides = [arg for arg in overrides if arg != '--dry-run']
         plan = make_plan(preset, overrides)
-        print(f'Target: {controller.cfg["target"]} ({controller.cfg["project"]}, {controller.cfg["zone"]})\n'
-              f'Type: {controller.cfg["accelerator"]}; API type: {TARGETS[target].api_accelerator}; '
-              f'allocation: {controller.cfg["allocation"]}\n'
-              f'Preset: {preset}; run ID: {plan["run_id"]}\n'
+        print(f'Preset: {preset}; run ID: {plan["run_id"]}\n'
               f'Output: {plan["output_location"]}\nCommand: {preview(plan)}\n'
               'Launch plan: discover workers; reserve ALL; preflight clean/matching branch/SHA, tooling, '
               'environment, tmux and processes on ALL; start managed tmux/process groups; '
@@ -271,7 +273,7 @@ def main(argv=None):
         for worker in controller.workers:
             try:
                 reports[worker] = controller.rpc(worker, 'status')
-                print(f'worker {worker}: ' + json.dumps(reports[worker], indent=2))
+                print(f'Target {target} worker {worker}: ' + json.dumps(reports[worker], indent=2))
             except Exception as error:
                 errors.append(str(error))
         if errors:

@@ -11,10 +11,18 @@ not a claim that capacity is allocated or ready for training.
 | 2 | gn-v4-32-2 | v4-32 | On-demand | us-central2-b | Never |
 | 3 | gn-v4-32-spot-1 | v4-32 | Spot | us-central2-b | Enabled |
 | 4 | gn-v4-32-spot-2 | v4-32 | Spot | us-central2-b | Enabled |
-| 5 | gn-v6e-16-spot-1 | v6e-16 | Spot | us-east1-d | Disabled |
-| 6 | gn-v6e-16-spot-2 | v6e-16 | Spot | europe-west4-a | Disabled |
-| 7 | gn-v5e-16-spot-1 | v5e-16 | Spot | us-central1-a | Disabled |
-| 8 | gn-v5e-16-spot-2 | v5e-16 | Spot | europe-west4-b | Disabled |
+| 5 | gn-v6e-16-spot-5 | v6e-16 | Spot | us-east1-d | Disabled |
+| 6 | gn-v6e-16-spot-6 | v6e-16 | Spot | europe-west4-a | Disabled |
+| 7 | gn-v5e-16-spot-7 | v5e-16 | Spot | us-central1-a | Disabled |
+| 8 | gn-v5e-16-spot-8 | v5e-16 | Spot | europe-west4-b | Disabled |
+
+Only the unallocated 5–8 slots use numeric-ID suffixes. Existing 1–4 names and
+requests are preserved, including the historical Spot suffixes 1 and 2 for
+controller IDs 3 and 4. New Spot nodes carry both `managed-by=gfn-spot-queue` and
+`gfn-target=ID`. The identifying label is informational and is not required for
+ownership of existing resources; the original ownership checks remain in force.
+Optional [in-place identifying labels/descriptions](TROUBLESHOOTING.md#identify-existing-nodes-without-recreation)
+can make existing allocated nodes easier to find without recreating them.
 
 The logical v5e-16 targets use the documented Cloud TPU API accelerator token
 `v5litepod-16` for creation and exact ownership checks; previews show both names.
@@ -64,6 +72,10 @@ bash scripts/tpu.sh 5 switch main
 ```
 
 Preview shows the registry's accelerator, allocation, project, zone and name.
+Every controller command starts with `Target ID: NAME`; worker reports also
+include the numeric ID. Watchdog state/action lines start with
+`Target ID [NAME]:`, for example
+`Target 3 [gn-v4-32-spot-1]: WAITING_FOR_RESOURCES`.
 No mesh, flags or packages are chosen for a generation. Supply reviewed topology
 settings explicitly through `GN_ARGS`; presets are starter settings. A missing or
 unreadable allocation produces a describe/access error, not zero workers. A
@@ -174,10 +186,10 @@ runtime/generation compatibility, IAM, quotas, live provisioning, startup, train
 readiness or reboot behavior. No training, optimizer, experiment or dependency
 versions are changed by this implementation.
 
-Local implementation validation (2026-11-24): **92 tests passed in 11.141s** in
+Local implementation validation (2026-11-24): **95 tests passed in 9.028s** in
 an Ubuntu WSL temporary Linux snapshot of Git's stored files plus these changes,
 avoiding the Windows checkout's existing CRLF shell files. Both script syntax
-checks and `systemd-analyze verify` exited 0; all 24 Bash blocks in the operator
+checks and `systemd-analyze verify` exited 0; all 27 Bash blocks in the operator
 and workflow docs passed `bash -n`; Git diff whitespace checks passed. Installer
 system commands/cloud calls were mocked; staged and installed module imports
 were actually checked with `python -I`. No service was installed/started locally,

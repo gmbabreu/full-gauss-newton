@@ -170,6 +170,60 @@ v4-specific. It must not be used as evidence of v5e/v6e compatibility. Original
 bootstrap clones a pinned new-worker checkout and refuses an existing checkout;
 do not rerun it on a training host. Captured/generated files remain outside Git.
 
+## Identify existing nodes without recreation
+
+These are optional **operator-run metadata updates**, not part of watchdog
+reconciliation. Run from the reviewed controller repository root. Select one
+existing node by its numeric ID; start with 1 or 2, and use 3 or 4 only after a
+node is allocated. A pending queued request without a node cannot be labeled
+this way; leave that request untouched. No node names, queued requests or startup
+payloads are changed by these commands.
+
+Resolve the exact project/zone/name from the shared registry and inspect it first:
+
+```bash
+TARGET_ID=1  # choose one existing allocated target; repeat deliberately for others
+read -r PROJECT ZONE NAME < <(
+  python3 -c 'import sys; sys.path.insert(0, "scripts"); from tpu_targets import TARGETS; t = TARGETS[sys.argv[1]]; print(t.project, t.zone, t.name)' "$TARGET_ID"
+)
+printf 'Target %s: %s (%s/%s)\n' "$TARGET_ID" "$NAME" "$PROJECT" "$ZONE"
+gcloud compute tpus tpu-vm describe "$NAME" --project="$PROJECT" --zone="$ZONE" \
+  --format='json(name,state,labels,description)'
+```
+
+After verifying the identity, add just the identifying label in place:
+
+```bash
+gcloud compute tpus tpu-vm update "$NAME" --project="$PROJECT" --zone="$ZONE" \
+  --update-labels="gfn-target=$TARGET_ID"
+```
+
+`--update-labels` preserves other label keys, including any existing ownership
+label. Do not use `--clear-labels`, remove `managed-by`, or add a watchdog ownership
+label to fixed targets 1–2. The watchdog does not require `gfn-target` on legacy
+resources, so these updates are optional. New Spot creates include the label
+automatically; existing queued-resource templates remain unchanged.
+
+Optionally append an identifying description while preserving the previous
+text. Inspect the proposed value before applying this separate metadata update:
+
+```bash
+OLD_DESCRIPTION=$(gcloud compute tpus tpu-vm describe "$NAME" \
+  --project="$PROJECT" --zone="$ZONE" --format='value(description)') || exit 1
+NEW_DESCRIPTION="${OLD_DESCRIPTION}${OLD_DESCRIPTION:+ | }GFN controller target $TARGET_ID"
+printf 'Proposed description: %s\n' "$NEW_DESCRIPTION"
+# Run only after reviewing the proposed text:
+gcloud compute tpus tpu-vm update "$NAME" --project="$PROJECT" --zone="$ZONE" \
+  --description="$NEW_DESCRIPTION"
+gcloud compute tpus tpu-vm describe "$NAME" --project="$PROJECT" --zone="$ZONE" \
+  --format='json(name,state,labels,description)'
+```
+
+The [TPU VM update command](https://docs.cloud.google.com/sdk/gcloud/reference/compute/tpus/tpu-vm/update)
+supports these label/description fields directly. Use the operator's existing
+update permission; do not change IAM or delete/recreate a node to add identifying
+metadata. No such updates were run by this implementation.
+
 ## Common failures
 
 - **Discovery fails:** check allocation, project/zone overrides and API/auth access.

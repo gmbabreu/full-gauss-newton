@@ -77,14 +77,15 @@ def validate_owned(resource, target):
         raise ValueError(name + ': existing request is not owned by this Spot watchdog')
 
 
-def create_command(target, preparation):
+def create_command(target_id, preparation):
+    target = REGISTRY[target_id]
     name = target.name
     return gcloud('queued-resources', 'create', name, '--node-id=' + name,
                   '--accelerator-type=' + target.api_accelerator, '--spot', '--async',
                   '--runtime-version=' + preparation['runtime_version'],
                   '--service-account=' + preparation['service_account'],
                   '--scopes=https://www.googleapis.com/auth/cloud-platform',
-                  '--labels=managed-by=' + OWNER,
+                  '--labels=managed-by=' + OWNER + ',gfn-target=' + target_id,
                   '--metadata-from-file=startup-script=' + str(Path(preparation['startup_script']).resolve()),
                   location=(target.project, target.zone))
 
@@ -96,15 +97,16 @@ def reconcile(target, requests, nodes, args):
         return
     specification = REGISTRY[target]
     name = specification.name
+    identity = f'Target {target} [{name}]'
     resource = requests.get(name)
     if resource is None:
         if name in nodes:
             raise ValueError(name + ': node exists without our queued request; inspect manually')
-        command = create_command(specification, queue_config.preparation(args.configuration, target))
+        command = create_command(target, queue_config.preparation(args.configuration, target))
     else:
         validate_owned(resource, specification)
         state = resource.get('state', {}).get('state', 'UNKNOWN')
-        log(name + ': ' + state)
+        log(identity + ': ' + state)
         if state not in {'SUSPENDED', 'FAILED'}:
             # Includes pending/active/deleting and unknown future states. Never reset a wait.
             return
@@ -113,7 +115,7 @@ def reconcile(target, requests, nodes, args):
         # No --force: server must also confirm that there are no nodes to delete.
         command = gcloud('queued-resources', 'delete', name, '--async',
                          location=(specification.project, specification.zone))
-    log(('APPLY ' if args.apply else 'PREVIEW ') + shlex.join(command))
+    log(identity + ': ' + ('APPLY ' if args.apply else 'PREVIEW ') + shlex.join(command))
     if args.apply:
         call(command)
     # Recreation follows only after a later successful inventory confirms absence.
