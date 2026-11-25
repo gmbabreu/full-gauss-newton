@@ -343,6 +343,32 @@ class StartupTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 startup.render(requirements, 'main', 'a'*40, '3.10', 'wandb-api-key')
 
+    def test_package_install_wait_option_and_failure_propagation(self):
+        body = Path(startup.__file__).with_name('setup_vm.sh').read_text()
+        packages = body.split('export DEBIAN_FRONTEND=noninteractive\n', 1)[1].split('actual_python=', 1)[0]
+        # Execute the real package setup fragment with a shell stub, never APT.
+        for failure, expected_calls in (('', 2), ('update', 1), ('install', 2)):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                calls = Path(directory) / 'calls'
+                stub = """
+set -euo pipefail
+apt-get() {
+    printf '%s\\n' "$*" >> CALLS
+    case " $* " in
+        *" FAILURE "*) return 100 ;;
+    esac
+}
+""".replace('CALLS', "'" + str(calls) + "'").replace('FAILURE', failure or 'never-match')
+                result = subprocess.run(['bash'], input=stub + packages + '\necho READY',
+                                        text=True, capture_output=True)
+                commands = calls.read_text().splitlines()
+                self.assertEqual(len(commands), expected_calls)
+                self.assertEqual(result.returncode, 100 if failure else 0)
+                self.assertEqual('READY' in result.stdout, not failure)
+                if len(commands) == 2:
+                    self.assertEqual(commands[1],
+                                     '-o DPkg::Lock::Timeout=3600 install -y git tmux python3-venv')
+
     def test_payload_quoting_and_syntax(self):
         requirements='jax==0.4.34\njaxlib==0.4.34\nlibtpu==0.0.1\nflax==0.8.3\noptax==0.2.2\n'
         result=startup.render(requirements, 'codex/spot-tpu-recovery', 'a'*40, '3.10', "quote'$(false)")

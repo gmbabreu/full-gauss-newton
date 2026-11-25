@@ -14,7 +14,8 @@ if [[ -e /full-gauss-newton ]]; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y git tmux python3-venv
+# Boot-time unattended upgrades may hold dpkg locks; wait up to one hour.
+apt-get -o DPkg::Lock::Timeout=3600 install -y git tmux python3-venv
 actual_python=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 [[ "$actual_python" == "$GFN_PYTHON_MINOR" ]]
 id ga2740 >/dev/null 2>&1 || useradd --create-home --shell /bin/bash ga2740

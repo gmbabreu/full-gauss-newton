@@ -323,6 +323,14 @@ same handoff gates; do not add a second nohup process.
 
 ## Troubleshooting and local validation
 
+Startup package installation waits up to one hour for dpkg locks held by Ubuntu
+updates; an expired wait or installation error still fails setup. This does not
+change APT list-update error handling. Deploy a regenerated prepared payload on
+TPU1 for future requests; updating Git alone does not replace it. Existing queued
+requests retain their captured payload. Retry failed workers only after checking
+setup has stopped and no checkout exists; never rerun setup on training workers.
+
+
 For identity/executable errors, check attached identity and fixed-path gcloud;
 do not weaken the sandbox or pass user credentials. Inventory errors fail the
 whole poll and retry after 60 seconds; inspect API/IAM/scopes. For terminal
