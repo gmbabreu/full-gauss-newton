@@ -14,7 +14,6 @@ class Target:
     managed: bool = False
     project: str = PROJECT
     project_number: str = PROJECT_NUMBER
-    chips: int = 16
 
     @property
     def api_accelerator(self):
@@ -45,8 +44,8 @@ def validate_registry(targets=None):
         if identity in identities:
             raise ValueError('Duplicate target identity: ' + key)
         identities.add(identity)
-        if target.chips != 16 or target.accelerator not in {'v4-32', 'v5e-16', 'v6e-16'}:
-            raise ValueError('Unreviewed chip accounting: ' + key)
+        if target.accelerator not in {'v4-32', 'v5e-16', 'v6e-16'}:
+            raise ValueError('Unsupported accelerator: ' + key)
         if target.managed and (key in {'1', '2'} or target.allocation != 'spot'):
             raise ValueError('Fixed/on-demand targets cannot be watchdog managed')
 

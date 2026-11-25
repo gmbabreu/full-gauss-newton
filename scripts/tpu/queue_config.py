@@ -74,10 +74,6 @@ def enabled(config, selected=None):
     return [key for key in keys if config['targets'][key]['managed']]
 
 
-def preparation(config, key):
-    return config['preparations'][config['targets'][key]['preparation']]
-
-
 def locations(config, selected=None):
     return sorted({(TARGETS[key].project, TARGETS[key].zone) for key in enabled(config, selected)})
 

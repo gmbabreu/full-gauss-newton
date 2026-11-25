@@ -121,7 +121,8 @@ def reconcile(target, requests, nodes, args):
     if resource is None:
         if name in nodes:
             raise ValueError(name + ': node exists without our queued request; inspect manually')
-        command = create_command(target, queue_config.preparation(args.configuration, target))
+        preparation = args.configuration['targets'][target]['preparation']
+        command = create_command(target, args.configuration['preparations'][preparation])
     else:
         validate_owned(resource, specification)
         state = resource.get('state', {}).get('state', 'UNKNOWN')

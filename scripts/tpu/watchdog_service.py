@@ -145,5 +145,5 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        queue.log('Service stopped: ' + str(error), file=__import__('sys').stderr)
+        queue.log('Service stopped: ' + str(error), file=sys.stderr)
         raise SystemExit(1)

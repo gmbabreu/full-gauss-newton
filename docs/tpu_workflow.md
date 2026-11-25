@@ -332,13 +332,8 @@ on epoch. None of these restrictions are relaxed by the tooling.
 
 ## Branch delivery and local validation
 
-The watchdog update on `codex/watchdog-service-account` is **pending operator
-deployment**. It preserves captured v4 runtime/account/startup bytes, routes
-3–4 to `gn-v4-32-spot-3`/`gn-v4-32-spot-4` with legacy-name conflict guards,
-and leaves 5–8 disabled. The deployed copy still uses legacy names. See the
-[target/configuration reference](../scripts/tpu/README.md) and
-[operator installation, handoff and rollback procedure](../scripts/tpu/DEPLOYMENT.md).
-Updating Git does not change the installed service or cloud resources.
+For capacity management, service installation and operator handoff, see the
+[watchdog reference](../scripts/tpu/README.md).
 
 The implementation is committed on `codex/tpu-workflow` from `origin/main`, then
 cherry-picked onto `codex/tpu-workflow-epoch` from `origin/epoch`. Open separate PRs
