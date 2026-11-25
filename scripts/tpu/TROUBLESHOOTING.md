@@ -179,6 +179,12 @@ node is allocated. A pending queued request without a node cannot be labeled
 this way; leave that request untouched. No node names, queued requests or startup
 payloads are changed by these commands.
 
+Numeric 3–4 now resolve to `gn-v4-32-spot-3` and `gn-v4-32-spot-4`. Inspect
+legacy `gn-v4-32-spot-1`/`gn-v4-32-spot-2` explicitly by their old names; adding
+an identifying label or description to them does not resolve the naming guard.
+Use the [stopped-service naming migration](DEPLOYMENT.md#resolve-the-spot-resource-name-migration-with-the-service-stopped)
+for their disposition before activating management of renamed targets.
+
 Resolve the exact project/zone/name from the shared registry and inspect it first:
 
 ```bash
@@ -225,6 +231,13 @@ update permission; do not change IAM or delete/recreate a node to add identifyin
 metadata. No such updates were run by this implementation.
 
 ## Common failures
+
+- **Targets 3–4 naming conflict:** either legacy Spot request or node blocks
+  reconciliation of both renamed slots, in every state and regardless of labels.
+  The entire managed poll stops before mutations; service preflight also fails.
+  Keep the service stopped/disabled, inspect both legacy/new identities, and
+  resolve their disposition under the stopped-service migration. Do not strip
+  labels, force deletion or create duplicate capacity to bypass the guard.
 
 - **Discovery fails:** check allocation, project/zone overrides and API/auth access.
   Do not infer absent capacity from a failed describe/list.

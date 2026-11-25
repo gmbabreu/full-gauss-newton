@@ -1,7 +1,7 @@
 # TPU capacity and numeric control
 
 The authoritative registry is [tpu_targets.py](../tpu_targets.py). Project is
-`fast-second-order` for every target. Names 1–4 and label
+`fast-second-order` for every target. Names 1–2 and label
 `managed-by=gfn-spot-queue` are unchanged. A configured target is a declared slot,
 not a claim that capacity is allocated or ready for training.
 
@@ -9,16 +9,22 @@ not a claim that capacity is allocated or ready for training.
 | --- | --- | --- | --- | --- | --- |
 | 1 | gn-v4-32 | v4-32 | On-demand | us-central2-b | Never |
 | 2 | gn-v4-32-2 | v4-32 | On-demand | us-central2-b | Never |
-| 3 | gn-v4-32-spot-1 | v4-32 | Spot | us-central2-b | Enabled |
-| 4 | gn-v4-32-spot-2 | v4-32 | Spot | us-central2-b | Enabled |
+| 3 | gn-v4-32-spot-3 | v4-32 | Spot | us-central2-b | Enabled after migration guard passes |
+| 4 | gn-v4-32-spot-4 | v4-32 | Spot | us-central2-b | Enabled after migration guard passes |
 | 5 | gn-v6e-16-spot-5 | v6e-16 | Spot | us-east1-d | Disabled |
 | 6 | gn-v6e-16-spot-6 | v6e-16 | Spot | europe-west4-a | Disabled |
 | 7 | gn-v5e-16-spot-7 | v5e-16 | Spot | us-central1-a | Disabled |
 | 8 | gn-v5e-16-spot-8 | v5e-16 | Spot | europe-west4-b | Disabled |
 
-Only the unallocated 5–8 slots use numeric-ID suffixes. Existing 1–4 names and
-requests are preserved, including the historical Spot suffixes 1 and 2 for
-controller IDs 3 and 4. New Spot nodes carry both `managed-by=gfn-spot-queue` and
+All Spot slots now use numeric-ID suffixes. Fixed targets 1–2 are unchanged.
+Legacy `gn-v4-32-spot-1` and `gn-v4-32-spot-2` requests/nodes are never renamed or
+deleted automatically. **Either legacy name in either inventory blocks both
+renamed targets 3–4**, regardless of state or labels. The whole poll stops before
+any reconciliation when a selected managed target 3 or 4 has this conflict.
+Read-only service preflight reports it too. Follow the
+[stopped-service naming migration](DEPLOYMENT.md#resolve-the-spot-resource-name-migration-with-the-service-stopped)
+before activation; pending or deleting legacy requests still block it.
+New Spot nodes carry both `managed-by=gfn-spot-queue` and
 `gfn-target=ID`. The identifying label is informational and is not required for
 ownership of existing resources; the original ownership checks remain in force.
 Optional [in-place identifying labels/descriptions](TROUBLESHOOTING.md#identify-existing-nodes-without-recreation)
@@ -44,7 +50,8 @@ Operator report, 2026-11-24: the **previous v4-only installed copy** is enabled 
 running on TPU1 (`gn-v4-32`), worker 0, independently under `/opt/gfn-spot`. Its
 isolated attached identity and direct Snap executable worked under the systemd
 sandbox; it deleted failed requests 3–4, recreated them and observed both in
-`WAITING_FOR_RESOURCES`. The us-central2 external IP quota was increased to 16.
+`WAITING_FOR_RESOURCES` under the legacy names `gn-v4-32-spot-1` and
+`gn-v4-32-spot-2`. The us-central2 external IP quota was increased to 16.
 Allocated-worker startup, training readiness and reboot survival remain untested.
 
 **The registry/version-2 update in this branch is not deployed.** Repository
@@ -75,7 +82,7 @@ Preview shows the registry's accelerator, allocation, project, zone and name.
 Every controller command starts with `Target ID: NAME`; worker reports also
 include the numeric ID. Watchdog state/action lines start with
 `Target ID [NAME]:`, for example
-`Target 3 [gn-v4-32-spot-1]: WAITING_FOR_RESOURCES`.
+`Target 3 [gn-v4-32-spot-3]: WAITING_FOR_RESOURCES`.
 No mesh, flags or packages are chosen for a generation. Supply reviewed topology
 settings explicitly through `GN_ARGS`; presets are starter settings. A missing or
 unreadable allocation produces a describe/access error, not zero workers. A
@@ -186,10 +193,10 @@ runtime/generation compatibility, IAM, quotas, live provisioning, startup, train
 readiness or reboot behavior. No training, optimizer, experiment or dependency
 versions are changed by this implementation.
 
-Local implementation validation (2026-11-24): **95 tests passed in 9.028s** in
+Local implementation validation (2026-11-24): **101 tests passed in 9.631s** in
 an Ubuntu WSL temporary Linux snapshot of Git's stored files plus these changes,
 avoiding the Windows checkout's existing CRLF shell files. Both script syntax
-checks and `systemd-analyze verify` exited 0; all 27 Bash blocks in the operator
+checks and `systemd-analyze verify` exited 0; all 30 Bash blocks in the operator
 and workflow docs passed `bash -n`; Git diff whitespace checks passed. Installer
 system commands/cloud calls were mocked; staged and installed module imports
 were actually checked with `python -I`. No service was installed/started locally,

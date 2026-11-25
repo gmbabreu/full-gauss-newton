@@ -24,13 +24,14 @@ import watchdog_service as service
 
 
 class RoutingTests(unittest.TestCase):
-    def test_stable_legacy_names_and_numeric_suffixes_for_new_targets(self):
-        expected = {'1': 'gn-v4-32', '2': 'gn-v4-32-2', '3': 'gn-v4-32-spot-1',
-                    '4': 'gn-v4-32-spot-2', '5': 'gn-v6e-16-spot-5', '6': 'gn-v6e-16-spot-6',
+    def test_fixed_names_and_numeric_suffixes_for_spot_targets(self):
+        expected = {'1': 'gn-v4-32', '2': 'gn-v4-32-2', '3': 'gn-v4-32-spot-3',
+                    '4': 'gn-v4-32-spot-4', '5': 'gn-v6e-16-spot-5', '6': 'gn-v6e-16-spot-6',
                     '7': 'gn-v5e-16-spot-7', '8': 'gn-v5e-16-spot-8'}
         self.assertEqual({key: value.name for key, value in registry.TARGETS.items()}, expected)
-        for key in ('5', '6', '7', '8'):
+        for key in ('3', '4', '5', '6', '7', '8'):
             self.assertTrue(registry.TARGETS[key].name.endswith('-' + key))
+        for key in ('5', '6', '7', '8'):
             self.assertFalse(registry.TARGETS[key].managed)
 
     def test_numeric_routing_and_dynamic_worker_counts(self):
@@ -285,6 +286,78 @@ class RegistryWatchdogTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'auth/API'):
                         queue.main(['--config', str(path), '--apply'])
                     reconcile.assert_not_called()
+
+    def test_either_legacy_request_or_node_blocks_both_renamed_targets(self):
+        for key in ('3', '4'):
+            for old_name in ('gn-v4-32-spot-1', 'gn-v4-32-spot-2'):
+                for kind in ('request', 'node'):
+                    for state in ('FAILED', 'SUSPENDED', 'WAITING_FOR_RESOURCES', 'ACTIVE', 'DELETING', 'UNKNOWN'):
+                        old = {old_name: {'state': {'state': state}}}
+                        requests, nodes = (old, {}) if kind == 'request' else ({}, old)
+                        with self.subTest(key=key, old_name=old_name, kind=kind, state=state), \
+                                patch.object(queue, 'call') as call:
+                            with self.assertRaisesRegex(ValueError, 'naming conflict.*' + old_name):
+                                queue.reconcile(key, requests, nodes, self.args)
+                            call.assert_not_called()
+
+    def test_legacy_conflict_blocks_cleanup_even_when_new_request_already_exists(self):
+        for key in ('3', '4'):
+            for state in ('FAILED', 'SUSPENDED', 'ACTIVE'):
+                name = registry.TARGETS[key].name
+                requests = {name: self.resource(key, state), 'gn-v4-32-spot-2': {}}
+                with patch.object(queue, 'call') as call:
+                    with self.assertRaisesRegex(ValueError, 'operator|resolve legacy'):
+                        queue.reconcile(key, requests, {}, self.args)
+                    call.assert_not_called()
+
+    def test_legacy_guard_reports_all_requests_and_nodes_without_ownership_assumptions(self):
+        old = {name: {} for name in registry.LEGACY_SPOT_NAMES.values()}
+        with self.assertRaises(ValueError) as caught:
+            queue.refuse_legacy_spot_conflicts(old, old)
+        message = str(caught.exception)
+        for name in old:
+            self.assertIn('queued request ' + name, message)
+            self.assertIn('node ' + name, message)
+        self.assertIn('fast-second-order/us-central2-b', message)
+        self.assertIn('service stopped', message)
+
+    def test_legacy_conflict_stops_poll_before_any_location_or_selected_target_reconciles(self):
+        self.enable('5')
+        path = self.root / 'queue.json'
+        path.write_text(json.dumps(self.configuration))
+        for selection in ([], ['--targets', '3'], ['--targets', '4']):
+            def inventory(group, location):
+                if group == 'tpu-vm' and location == (registry.PROJECT, 'us-central2-b'):
+                    return {'gn-v4-32-spot-1': {}}
+                return {}
+            with patch.object(queue.Path, 'home', return_value=self.root), \
+                    patch.object(queue, 'inventory', side_effect=inventory), \
+                    patch.object(queue, 'reconcile') as reconcile:
+                with self.assertRaisesRegex(ValueError, 'naming conflict'):
+                    queue.main(['--config', str(path), '--apply', *selection])
+                reconcile.assert_not_called()
+
+    def test_service_readonly_preflight_refuses_legacy_conflicts(self):
+        with patch.object(service, 'metadata_identity', return_value=service.IDENTITY), \
+                patch.object(service, 'find_gcloud', return_value='/usr/bin/gcloud'), \
+                patch.object(queue, 'GCLOUD_EXECUTABLE', 'gcloud'), \
+                patch.object(queue, 'inventory', return_value={'gn-v4-32-spot-2': {}}), \
+                patch.object(queue, 'log') as log:
+            with self.assertRaisesRegex(ValueError, 'naming conflict'):
+                service.preflight(self.configuration)
+        self.assertFalse(any('preflight passed' in c.args[0] for c in log.call_args_list))
+
+    def test_unmanaged_renamed_targets_do_not_block_independent_locations(self):
+        for key in ('3', '4'):
+            self.configuration['targets'][key]['managed'] = False
+            with patch.object(queue, 'call') as call:
+                queue.reconcile(key, {'gn-v4-32-spot-1': {}}, {}, self.args)
+                call.assert_not_called()
+        self.enable('5')
+        with patch.object(queue, 'inventory', return_value={}) as inventory:
+            queue.collect_inventory(self.configuration)
+        self.assertEqual({call.args[1] for call in inventory.call_args_list},
+                         {(registry.PROJECT, 'us-east1-d')})
 
     def test_per_target_create_and_ownership_checks(self):
         for key, target in registry.TARGETS.items():

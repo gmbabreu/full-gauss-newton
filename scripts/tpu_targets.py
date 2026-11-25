@@ -25,13 +25,15 @@ class Target:
 TARGETS = {
     '1': Target('gn-v4-32', 'us-central2-b', 'v4-32', 'on-demand'),
     '2': Target('gn-v4-32-2', 'us-central2-b', 'v4-32', 'on-demand'),
-    '3': Target('gn-v4-32-spot-1', 'us-central2-b', 'v4-32', 'spot', True),
-    '4': Target('gn-v4-32-spot-2', 'us-central2-b', 'v4-32', 'spot', True),
+    '3': Target('gn-v4-32-spot-3', 'us-central2-b', 'v4-32', 'spot', True),
+    '4': Target('gn-v4-32-spot-4', 'us-central2-b', 'v4-32', 'spot', True),
     '5': Target('gn-v6e-16-spot-5', 'us-east1-d', 'v6e-16', 'spot'),
     '6': Target('gn-v6e-16-spot-6', 'europe-west4-a', 'v6e-16', 'spot'),
     '7': Target('gn-v5e-16-spot-7', 'us-central1-a', 'v5e-16', 'spot'),
     '8': Target('gn-v5e-16-spot-8', 'europe-west4-b', 'v5e-16', 'spot'),
 }
+# Historical identities are conflict sentinels, never additional managed targets.
+LEGACY_SPOT_NAMES = {'3': 'gn-v4-32-spot-1', '4': 'gn-v4-32-spot-2'}
 # Project, zone, accelerator, allocation -> supplied TRC chips, not device counts.
 QUOTA_POOLS = {
     (PROJECT, 'us-central2-b', 'v4-32', 'on-demand'): 32,

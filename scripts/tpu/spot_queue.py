@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import queue_config
 from tpu_targets import TARGETS as REGISTRY
+from tpu_targets import LEGACY_SPOT_NAMES
 
 # Compatibility names for the original v4 helpers; routing uses REGISTRY below.
 PROJECT = REGISTRY['3'].project
@@ -54,8 +55,24 @@ def inventory(group, location=None):
 
 def collect_inventory(configuration, selected=None):
     # Fail the entire poll before ANY reconciliation if any required list fails.
-    return {location: (inventory('queued-resources', location), inventory('tpu-vm', location))
-            for location in queue_config.locations(configuration, selected)}
+    inventories = {location: (inventory('queued-resources', location), inventory('tpu-vm', location))
+                   for location in queue_config.locations(configuration, selected)}
+    # Check every renamed managed target before reconciling ANY location.
+    for key in queue_config.enabled(configuration, selected):
+        if key in LEGACY_SPOT_NAMES:
+            target = REGISTRY[key]
+            refuse_legacy_spot_conflicts(*inventories[(target.project, target.zone)])
+    return inventories
+
+
+def refuse_legacy_spot_conflicts(requests, nodes):
+    conflicts = [f'{kind} {name}' for kind, resources in (('queued request', requests), ('node', nodes))
+                 for name in LEGACY_SPOT_NAMES.values() if name in resources]
+    if conflicts:
+        raise ValueError('Targets 3–4 naming conflict in ' + PROJECT + '/' + ZONE + ': '
+                         + '; '.join(conflicts) + '. Refusing reconciliation; resolve legacy '
+                         'resources with the service stopped before managing renamed targets. '
+                         'No legacy deletion or replacement is automatic.')
 
 
 def validate_owned(resource, target):
@@ -95,6 +112,8 @@ def reconcile(target, requests, nodes, args):
         raise ValueError('Fixed/on-demand targets cannot be watchdog managed')
     if not args.configuration['targets'][target]['managed']:
         return
+    if target in LEGACY_SPOT_NAMES:
+        refuse_legacy_spot_conflicts(requests, nodes)
     specification = REGISTRY[target]
     name = specification.name
     identity = f'Target {target} [{name}]'
