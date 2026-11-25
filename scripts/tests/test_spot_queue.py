@@ -19,12 +19,14 @@ class SpotQueueTests(unittest.TestCase):
         self.name = q.TARGETS['3']
         self.args = SimpleNamespace(apply=True, runtime_version='test-runtime',
                                     service_account='test@example.invalid', startup_script='/tmp/startup.sh')
+        self.args.configuration = q.queue_config.normalize(
+            {key: getattr(self.args, key) for key in q.queue_config.LEGACY_KEYS}, check_files=False)
     def resource(self, state):
         return {'spot': {}, 'state': {'state': state}, 'tpu': {'nodeSpec': [{
             'nodeId': self.name, 'parent': f'projects/{q.PROJECT}/locations/{q.ZONE}',
             'node': {'acceleratorType': 'v4-32', 'labels': {'managed-by': q.OWNER}}}]}}
     def test_only_new_targets(self):
-        self.assertEqual(set(q.TARGETS), {'3', '4'})
+        self.assertEqual(set(q.TARGETS), {'3', '4', '5', '6', '7', '8'})
         self.assertNotIn('gn-v4-32', q.TARGETS.values())
         self.assertNotIn('gn-v4-32-2', q.TARGETS.values())
     @patch.object(q, 'call')

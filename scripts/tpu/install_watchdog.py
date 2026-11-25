@@ -8,13 +8,19 @@ from pathlib import Path
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
 
 SOURCE = Path(__file__).resolve().parent
+sys.path.insert(0, str(SOURCE))
+import queue_config
+
 CODE = Path('/opt/gfn-spot')
 STATE = Path('/var/lib/gfn-spot')
 UNIT = Path('/etc/systemd/system/gfn-spot-watchdog.service')
 SERVICE = UNIT.name
+BUNDLE = {name: SOURCE / name for name in ('spot_queue.py', 'watchdog_service.py', 'queue_config.py')}
+BUNDLE['tpu_targets.py'] = SOURCE.parent / 'tpu_targets.py'
 
 
 def run(*command):
@@ -31,37 +37,47 @@ def require_inactive():
             raise ValueError('Cannot confirm service is stopped and disabled: ' + result.stdout + result.stderr)
 
 
-def copy_configuration(config, startup, destination):
-    """Copy existing bytes, changing only the startup path in queue.json.
-
-    Startup is explicit because the captured path usually refers to box248.
-    """
+def copy_configuration(config, startup, destination, payload_dir=None):
+    """Migrate legacy settings and copy exact prepared bytes; never execute setup."""
     data = json.loads(Path(config).read_text())
-    if set(data) != {'runtime_version', 'service_account', 'startup_script'}:
-        raise ValueError('Invalid captured queue configuration')
-    if any(not isinstance(v, str) or not v for v in data.values()) or '@' not in data['service_account']:
-        raise ValueError('Invalid captured runtime/service account/startup path')
-    body = Path(startup).read_bytes()
-    if not body.startswith(b'#!/') or b'\x00' in body:
-        raise ValueError('Expected existing prepared startup script')
-    # Parse syntax, never execute the prepared training setup.
-    subprocess.run(['bash', '-n', str(Path(startup).resolve())], check=True)
+    if startup is not None:
+        if set(data) != queue_config.LEGACY_KEYS:
+            raise ValueError('--startup-script override is only for legacy configurations')
+        data['startup_script'] = str(Path(startup).resolve())
+    data = queue_config.normalize(data, check_files=False)
     destination = Path(destination).resolve()
-    data['startup_script'] = str(destination / 'startup.sh')
-    (destination / 'startup.sh').write_bytes(body)
+    used = {data['targets'][key]['preparation'] for key in queue_config.enabled(data)}
+    sources = [Path(prep['startup_script']).name for prep in data['preparations'].values()]
+    if payload_dir and len(sources) != len(set(sources)):
+        raise ValueError('Payload basenames must be unique when using --payload-dir')
+    for name, prep in data['preparations'].items():
+        source = Path(prep['startup_script'])
+        if payload_dir:
+            source = Path(payload_dir) / source.name
+        output = destination / f'startup-{name}.sh'
+        if source.is_file():
+            body = source.read_bytes()
+            if not body.startswith(b'#!/') or b'\x00' in body:
+                raise ValueError('Expected existing prepared startup script')
+            subprocess.run(['bash', '-n', str(source.resolve())], check=True)
+            output.write_bytes(body)
+            output.chmod(0o640)
+        elif name in used:
+            raise ValueError('Missing enabled preparation payload: ' + str(source))
+        prep['startup_script'] = str(output)
+    queue_config.normalize(data)  # Entire installed config validated before activation.
     (destination / 'queue.json').write_text(json.dumps(data, indent=2) + '\n')
-    for name in ('startup.sh', 'queue.json'):
-        (destination / name).chmod(0o640)
+    (destination / 'queue.json').chmod(0o640)
     return data
 
 
-def install(config, startup):
+def install(config, startup=None, payload_dir=None):
     if os.geteuid() != 0:
         raise ValueError('Run installer using sudo')
     require_inactive()
     # Validate inputs before changing any installed files.
     with tempfile.TemporaryDirectory() as temporary:
-        copy_configuration(config, startup, temporary)
+        copy_configuration(config, startup, temporary, payload_dir)
     try:
         account = pwd.getpwnam('gfn-spot')
     except KeyError:
@@ -79,14 +95,16 @@ def install(config, startup):
     CODE.chmod(0o755)
     os.chown(STATE, account.pw_uid, group)
     STATE.chmod(0o700)
-    for name in ('spot_queue.py', 'watchdog_service.py'):
+    for name, source in BUNDLE.items():
         path = CODE / name
-        shutil.copyfile(SOURCE / name, path)
+        shutil.copyfile(source, path)
         os.chown(path, 0, 0)
         path.chmod(0o644)
-    copy_configuration(config, startup, STATE)
-    for name in ('startup.sh', 'queue.json'):
-        os.chown(STATE / name, 0, group)
+    installed = copy_configuration(config, startup, STATE, payload_dir)
+    for path in [STATE / 'queue.json'] + [Path(prep['startup_script'])
+                                        for prep in installed['preparations'].values()]:
+        if path.is_file():
+            os.chown(path, 0, group)
     shutil.copyfile(SOURCE / SERVICE, UNIT)
     os.chown(UNIT, 0, 0)
     UNIT.chmod(0o644)
@@ -103,9 +121,10 @@ def install(config, startup):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
-    parser.add_argument('--startup-script', required=True)
+    parser.add_argument('--startup-script', help='Override legacy payload source (copied byte for byte)')
+    parser.add_argument('--payload-dir', help='Read preparation payloads by unique basename from this directory')
     args = parser.parse_args()
-    install(args.config, args.startup_script)
+    install(args.config, args.startup_script, args.payload_dir)
 
 
 if __name__ == '__main__':

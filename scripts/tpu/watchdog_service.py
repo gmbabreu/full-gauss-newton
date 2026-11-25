@@ -77,17 +77,15 @@ def metadata_identity():
 
 def validate_files(config=CONFIG):
     config = Path(config)
-    data = json.loads(config.read_text())
-    if set(data) != {'runtime_version', 'service_account', 'startup_script'}:
-        raise ValueError('Invalid queue configuration keys')
-    if any(not isinstance(v, str) or not v for v in data.values()):
-        raise ValueError('Queue configuration values must be nonempty strings')
-    if '@' not in data['service_account']:
-        raise ValueError('Invalid captured resource service account')
-    startup = Path(data['startup_script'])
-    if not startup.is_absolute() or startup != config.parent / 'startup.sh':
-        raise ValueError('Startup script must be the installed absolute path')
-    for path in (config, startup):
+    data = queue.queue_config.load(config)
+    paths = {config}
+    for key in queue.queue_config.enabled(data):
+        name = data['targets'][key]['preparation']
+        startup = Path(data['preparations'][name]['startup_script'])
+        if startup.parent != config.parent or startup.name not in {'startup.sh', f'startup-{name}.sh'}:
+            raise ValueError('Startup script must be the installed absolute path')
+        paths.add(startup)
+    for path in paths:
         mode = path.lstat().st_mode
         if not stat.S_ISREG(mode) or mode & 0o022:
             raise ValueError(f'Expected regular file without group/other write: {path}')
@@ -97,17 +95,19 @@ def validate_files(config=CONFIG):
     return data
 
 
-def preflight():
+def preflight(configuration):
     actual = metadata_identity()
     if actual != IDENTITY:
         raise ValueError(f'Attached identity mismatch: {actual!r}; expected {IDENTITY}')
     queue.GCLOUD_EXECUTABLE = find_gcloud()
     queue.log('Using gcloud executable: ' + queue.GCLOUD_EXECUTABLE)
-    requests = queue.inventory('queued-resources')
-    nodes = queue.inventory('tpu-vm')
+    inventories = queue.collect_inventory(configuration)
     # Full snapshots allow the operator to compare existing states at handoff.
     queue.log(json.dumps({'identity': actual, 'gcloud_executable': queue.GCLOUD_EXECUTABLE,
-                         'queued_resources': requests, 'nodes': nodes},
+                         'managed_targets': queue.queue_config.enabled(configuration),
+                         'inventories': [dict(project=project, zone=zone,
+                                              queued_resources=requests, nodes=nodes)
+                                         for (project, zone), (requests, nodes) in inventories.items()]},
                          sort_keys=True))
     queue.log('Read-only preflight passed; create/delete permissions are NOT verified')
 
@@ -116,11 +116,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
-    validate_files()
+    configuration = validate_files()
     with isolated_environment():
-        preflight()
+        preflight(configuration)
         if not args.preflight:
-            queue.main(['--config', str(CONFIG), '--targets', '3', '4', '--apply', '--watch'])
+            queue.main(['--config', str(CONFIG), '--apply', '--watch'])
 
 
 if __name__ == '__main__':

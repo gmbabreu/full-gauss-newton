@@ -1,460 +1,165 @@
-# Spot capacity for targets 3 and 4
+# TPU capacity and numeric control
 
-These helpers maintain **capacity**, not an experiment queue or training resume.
-They never provision, stop, delete or update fixed targets 1 and 2. Keep using the
-original checkout for those targets; use a separate Git worktree for this branch
-because launchers require matching controller/worker branch, SHA and helper hashes.
+The authoritative registry is [tpu_targets.py](../tpu_targets.py). Project is
+`fast-second-order` for every target. Names 1–4 and label
+`managed-by=gfn-spot-queue` are unchanged. A configured target is a declared slot,
+not a claim that capacity is allocated or ready for training.
 
-| Target | Node and queued-resource name | Location | Type |
-| --- | --- | --- | --- |
-| 3 | gn-v4-32-spot-1 | fast-second-order / us-central2-b | v4-32 Spot |
-| 4 | gn-v4-32-spot-2 | fast-second-order / us-central2-b | v4-32 Spot |
+| Target | Name | Accelerator | Allocation | Zone | Default watchdog management |
+| --- | --- | --- | --- | --- | --- |
+| 1 | gn-v4-32 | v4-32 | On-demand | us-central2-b | Never |
+| 2 | gn-v4-32-2 | v4-32 | On-demand | us-central2-b | Never |
+| 3 | gn-v4-32-spot-1 | v4-32 | Spot | us-central2-b | Enabled |
+| 4 | gn-v4-32-spot-2 | v4-32 | Spot | us-central2-b | Enabled |
+| 5 | gn-v6e-16-spot-1 | v6e-16 | Spot | us-east1-d | Disabled |
+| 6 | gn-v6e-16-spot-2 | v6e-16 | Spot | europe-west4-a | Disabled |
+| 7 | gn-v5e-16-spot-1 | v5e-16 | Spot | us-central1-a | Disabled |
+| 8 | gn-v5e-16-spot-2 | v5e-16 | Spot | europe-west4-b | Disabled |
 
-Verified user report on 2026-11-23: reference TPU1 uses tpu-ubuntu2204-base,
-Python 3.10.12, JAX/jaxlib 0.6.2, libtpu 0.0.17, Flax 0.10.7, Optax 0.2.8,
-and service account 598447672993-compute@developer.gserviceaccount.com.
-Do not use the old scripts/setup_tpu_vm.sh pins for this recovery.
+The logical v5e-16 targets use the documented Cloud TPU API accelerator token
+`v5litepod-16` for creation and exact ownership checks; previews show both names.
+Preparation `accelerator_type` and quota accounting use the logical `v5e-16`
+name. See [Google's v5e examples](https://docs.cloud.google.com/tpu/docs/v5e-training).
+No runtime version is inferred from those examples.
 
-## One-time preparation on box248
+Each slot counts **16 chips**, including v4-32. Declared 1–2 use the supplied
+32-chip on-demand v4 pool and 3–4 use the 32-chip Spot v4 pool in us-central2-b.
+Each of the other zones has its own supplied 64-chip Spot pool for the generation
+shown. Registry validation counts every declared slot, including disabled ones,
+against its project/zone/accelerator/allocation pool. This checks declared targets
+only: unknown project allocations, current quota use, IP quota and actual capacity
+are not queried or inferred. It does not automatically allocate unused quota.
 
-From a clean, pushed checkout of this branch, capture TPU1's runtime and installed
-training dependency closure. This is read-only on TPU1; it never initializes JAX,
-installs packages or changes its checkout. Requires working gcloud SSH access.
+## Operational status
+
+Operator report, 2026-11-24: the **previous v4-only installed copy** is enabled and
+running on TPU1 (`gn-v4-32`), worker 0, independently under `/opt/gfn-spot`. Its
+isolated attached identity and direct Snap executable worked under the systemd
+sandbox; it deleted failed requests 3–4, recreated them and observed both in
+`WAITING_FOR_RESOURCES`. The us-central2 external IP quota was increased to 16.
+Allocated-worker startup, training readiness and reboot survival remain untested.
+
+**The registry/version-2 update in this branch is not deployed.** Repository
+updates do not alter the installed copy or its existing requests. Preserve the
+working controller until the explicit [update and rollback](DEPLOYMENT.md).
+New-generation runtime, dependency, topology and live API compatibility checks
+remain pending. No service or target is enabled by repository changes.
+
+## Routine commands (operator-run)
+
+All numeric targets support the same commands, regardless of watchdog enablement.
+Use a clean controller checkout with the same helpers/branch/SHA on every worker
+for training; see [the training workflow](../../docs/tpu_workflow.md). Worker
+counts come from `networkEndpoints`, never a generation-specific constant.
 
 ```bash
-python3 scripts/tpu/capture_setup.py --output-dir "$HOME/.config/gfn-spot/setup-20261123"
+bash scripts/tpu.sh 5 status
+bash scripts/tpu.sh 5 ssh 0
+bash scripts/tpu.sh 5 logs 0
+bash scripts/tpu.sh 5 run gn_adam --dry-run "${GN_ARGS[@]}"
+bash scripts/tpu.sh 5 run gn_adam "${GN_ARGS[@]}"
+bash scripts/tpu.sh 5 stop
+bash scripts/tpu.sh 5 pull
+bash scripts/tpu.sh 5 switch main
 ```
 
-The snapshot stores exact package versions and a startup script outside Git.
-No tokens, environment dump, service-account keys or W&B keys are captured.
-The worker uses an isolated venv with access to the base image's system packages
-and installs the captured pins with --no-deps, avoiding resolver-driven upgrades.
-It checks every captured version and imports the training modules on CPU. Existing
-package-metadata conflicts are logged, not silently repaired. This reproduces
-versions, not an immutable image or wheel hashes; package availability, native
-libraries and new runtime-image revisions still need a real-worker check.
+Preview shows the registry's accelerator, allocation, project, zone and name.
+No mesh, flags or packages are chosen for a generation. Supply reviewed topology
+settings explicitly through `GN_ARGS`; presets are starter settings. A missing or
+unreadable allocation produces a describe/access error, not zero workers. A
+disabled target remains available for inspection and manual control if allocated.
+Reservations on every worker, matching revisions/helpers, launch rollback and
+managed-process ownership checks remain mandatory. The registry is now part of
+the helper fingerprint: manually bootstrap that same helper revision on clean,
+idle workers before using `pull`/`switch` across helper revisions.
 
-The attached service account must already have permission to read secret
-`wandb-api-key` and read the warmup checkpoint in `gfn-soo`; output/queue writes
-need the corresponding bucket permissions. IAM is never automatically modified.
-Startup fetches the secret at runtime, checks access as ga2740 and reports FAILED
-if setup/import/access checks fail. No secret value goes into VM metadata.
-The initial bootstrap clones the pinned branch/SHA into /full-gauss-newton on each
-new worker. Rerunning startup refuses an existing checkout, protecting live work.
+For manual control only, `GFN_TPU_NAME`, `GFN_PROJECT` and `GFN_ZONE` override the
+selected registry identity; unset them for normal numeric routing. Type/allocation
+in preview remain the registry's declaration, not a live validation of an override.
+`GFN_SSH_USER`, `GFN_REMOTE_REPO`, `GFN_REMOTE_ENV`, `GFN_STATE_DIR` retain their
+existing meanings. Set overrides before starting the controller and use the same
+ones for status/logs/stop. The watchdog ignores these controller overrides.
 
-## Preview, then maintain target 3
-
-```bash
-python3 scripts/tpu/spot_queue.py \
-  --config "$HOME/.config/gfn-spot/setup-20261123/queue.json" --targets 3
-
-mkdir -p "$HOME/.local/state/gfn-spot"
-nohup python3 -u scripts/tpu/spot_queue.py \
-  --config "$HOME/.config/gfn-spot/setup-20261123/queue.json" \
-  --targets 3 --apply --watch \
-  > "$HOME/.local/state/gfn-spot/watchdog.log" 2>&1 &
-echo $! > "$HOME/.local/state/gfn-spot/watchdog.pid"
-tail -f "$HOME/.local/state/gfn-spot/watchdog.log"
-```
-
-Watchdog state, action and fatal-error messages include a New York timestamp
-(EST in winter, EDT during daylight saving time), for example
-`[2026-11-23 18:05:17 EST] gn-v4-32-spot-1: WAITING_FOR_RESOURCES`.
-Timestamps are recorded when messages are emitted, so they remain accurate when
-viewing historical logs. Update any installed copy of `spot_queue.py` and restart
-that watchdog to load this change; `git pull` alone does not update installed
-copies or running processes. Use `>>` instead of `>` above to retain earlier logs
-when restarting. Existing log entries cannot be timestamped retroactively.
-
-Preview reads cloud inventory but performs no mutation. Watch polls every 300s,
-preserves pending/active/unknown states, and only deletes owned FAILED/SUSPENDED
-requests when no node exists. Delete never uses --force. A later poll recreates an
-absent request. Ownership checks require the exact node, project/zone, Spot tier,
-v4-32 type and managed-by label. There is a local flock against duplicate watchdogs;
-use exactly one controller (see the TPU1 migration below). API/auth/timeout errors stop with a visible log,
-never masquerade as missing capacity. Review failed request details before retrying
-if failures recur. Startup failure is not a capacity failure: an ACTIVE request
-with FAILED setup is left in place for inspection.
-
-**box248 credentials can still expire or require interactive reauthentication.**
-nohup survives terminal disconnect, not host shutdown or authentication expiration.
-An attached service account on workers does not authenticate box248. No claim of
-permanent unattended recovery on box248 is made. The optional TPU1 service below
-uses its existing attached identity; do not add JSON keys.
-
-## TPU1 service deployment (pending operator deployment)
-
-Deployment status as of 2026-11-24: implementation only, **not deployed**. Do not
-mark deployed until the operator confirms installation, IAM review, handoff and
-reboot validation. This service runs on **gn-v4-32, worker 0**, maintains targets
-**3 and 4**, and polls every **300 seconds**. It depends on TPU1 remaining up;
-TPU1 shutdown, replacement or failure also removes monitoring. It is not an
-independent highly available controller.
-
-The root-owned code lives in `/opt/gfn-spot`, independent of the active training
-checkout `/full-gauss-newton`. State, lock, copied payload and fresh SDK config
-directories live under `/var/lib/gfn-spot`; the dedicated `gfn-spot` user has no
-login shell. No training environment is regenerated and no training dependencies
-are installed on TPU1. Never execute the copied `startup.sh` on TPU1.
-
-Each invocation creates a dedicated temporary gcloud configuration, discards
-inherited environment settings (including credential files, access tokens,
-impersonation, proxies and alternate account/config paths), and uses metadata
-credentials. No user credential cache, interactive login or downloaded key is
-used. The metadata email must be exactly
-`598447672993-compute@developer.gserviceaccount.com`. Tokens are obtained and
-refreshed by gcloud from the attached identity; this is not a promise that IAM,
-OAuth scopes or host availability cannot change. The captured resource service
-account in queue.json is preserved independently of controller authentication.
-
-Executable discovery prefers `gcloud` in the service's fixed system PATH and
-falls back to `/snap/google-cloud-cli/current/bin/gcloud` directly. It does not
-invoke `/snap/bin/gcloud`, inherit the operator's PATH or add Snap environment
-overrides. Preflight logs the chosen absolute executable before cloud calls and
-includes `gcloud_executable` in its inventory snapshot; the watchdog uses that
-same executable for subsequent commands. Missing/nonexecutable installations
-block preflight. The systemd restrictions and credential isolation are unchanged.
-The operator reports that this direct Snap path passed sandboxed preflight on
-TPU1; this repository change has not been deployed or checked against live TPUs.
-
-### Install while box248 is still monitoring
-
-Run these **operator-only** commands on box248, from a separate clean checkout of
-the reviewed PR commit, not the training checkout. Use the existing prepared
-snapshot; do not run capture_setup.py or prepare_startup.py again. If the existing
-watchdog uses a different snapshot, set `PREPARED` to that exact directory. Confirm
-its startup bytes match the script referenced by the existing queue.json first.
+On TPU1 worker 0:
 
 ```bash
-PREPARED="$HOME/.config/gfn-spot/setup-20261123"
-python3 -m json.tool "$PREPARED/queue.json"
-sha256sum "$PREPARED/startup.sh"
-tar -czf /tmp/gfn-watchdog-install.tgz -C scripts/tpu \
-  spot_queue.py watchdog_service.py install_watchdog.py gfn-spot-watchdog.service
-tar -czf /tmp/gfn-watchdog-prepared.tgz -C "$PREPARED" queue.json startup.sh
-gcloud compute tpus tpu-vm scp /tmp/gfn-watchdog-install.tgz \
-  /tmp/gfn-watchdog-prepared.tgz ga2740@gn-v4-32:/tmp/ \
-  --project=fast-second-order --zone=us-central2-b --worker=0
-gcloud compute tpus tpu-vm ssh ga2740@gn-v4-32 \
-  --project=fast-second-order --zone=us-central2-b --worker=0
-```
-
-In that worker-0 shell (the gcloud CLI, Python 3 with zoneinfo/tzdata, Bash and
-systemd must already be available; stop and review if prerequisites are missing):
-
-```bash
-command -v gcloud python3 bash systemctl systemd-analyze
-gcloud version
-STAGE=$(mktemp -d /tmp/gfn-watchdog.XXXXXXXX)
-mkdir "$STAGE/code" "$STAGE/prepared"
-tar -xzf /tmp/gfn-watchdog-install.tgz -C "$STAGE/code"
-tar -xzf /tmp/gfn-watchdog-prepared.tgz -C "$STAGE/prepared"
-sha256sum "$STAGE/prepared/startup.sh"  # compare with box248
-sudo /usr/bin/python3 -I "$STAGE/code/install_watchdog.py" \
-  --config "$STAGE/prepared/queue.json" \
-  --startup-script "$STAGE/prepared/startup.sh"
-sudo systemctl is-active gfn-spot-watchdog.service   # expected inactive (exit 3)
-sudo systemctl is-enabled gfn-spot-watchdog.service  # expected disabled (exit 1)
-sudo stat -c '%U:%G %a %n' /opt/gfn-spot /opt/gfn-spot/*.py \
-  /var/lib/gfn-spot /var/lib/gfn-spot/queue.json /var/lib/gfn-spot/startup.sh
-sudo sha256sum /var/lib/gfn-spot/startup.sh
-set -o pipefail
-sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
-  --preflight | tee "$HOME/gfn-preflight-before.log" || { echo 'STOP: preflight failed'; exit 1; }
-```
-
-Expect code root:root 755/644; state gfn-spot:gfn-spot 700; configuration and
-startup root:gfn-spot 640. Installation refuses an already enabled/active service,
-validates startup syntax without executing it, validates readability as the
-service user, reloads systemd, and leaves the unit stopped and disabled. On
-updates, perform the same handoff and stop/disable before reinstalling; retain
-the previous reviewed source and prepared snapshot for rollback.
-
-Preflight uses the same entry point, environment isolation, state and identity as
-the service. It verifies metadata identity and lists **both** queued resources and
-TPU nodes, printing their full snapshots. It never reconciles, creates or deletes
-anything. Run it while box248 remains active. Check snapshots include unchanged
-targets 1–2 and the existing requests; natural cloud transitions may occur while
-box248 is still operating. Any identity/auth/API error blocks handoff.
-
-### Separate IAM verification before activation
-
-Successful list calls prove only read access. They do **not** prove permission to
-create or delete. Have the IAM operator review effective allow/deny policies,
-conditions, OAuth scopes and relevant organization constraints for this attached
-identity, without changing IAM or testing by creating/deleting capacity. Use
-Policy Troubleshooter (or equivalent read-only policy evaluation) for
-`tpu.nodes.create` on project `fast-second-order`, `tpu.nodes.delete` on the two
-target resources, and `iam.serviceAccounts.actAs` on the **captured resource
-service account**. Resolve conditional/unknown results before activation. Record
-the reviewed principal, resources, permissions and results in the deployment
-record. This policy review is separate from the automated list preflight and
-does not promise a future API call will succeed.
-
-The actual watchdog operations are queuedResources.list, nodes.list,
-queuedResources.create and queuedResources.delete via the existing gcloud
-commands, with explicit project/zone and asynchronous mutations. The API
-references specify `tpu.nodes.create` for
-[queuedResources.create](https://docs.cloud.google.com/tpu/docs/reference/rest/v2/projects.locations.queuedResources/create)
-and `tpu.nodes.delete` for
-[queuedResources.delete](https://docs.cloud.google.com/tpu/docs/reference/rest/v2/projects.locations.queuedResources/delete).
-Review [service-account attachment permissions](https://docs.cloud.google.com/iam/docs/service-accounts-actas)
-for the create command's captured `--service-account`. The service never changes
-IAM. Keep the existing runtime and service account; no force deletion is used.
-
-### Handoff: stop box248 first, then activate TPU1
-
-The file lock is local to one user's home on one host. It does **not** coordinate
-controllers on different hosts (or users). There must be no overlap between the
-box248 watchdog and the TPU1 service.
-
-On box248, inspect the recorded PID and all watchdog command lines, then check
-automatic relaunch mechanisms before stopping anything:
-
-```bash
-OLD_PID=$(cat "$HOME/.local/state/gfn-spot/watchdog.pid")
-ps -p "$OLD_PID" -o user,pid,ppid,lstart,args
-pgrep -af '[s]pot_queue.py'
-systemctl --user list-unit-files
-systemctl --user list-timers --all
-sudo systemctl list-unit-files
-sudo systemctl list-timers --all
-crontab -l
-sudo crontab -l
-tmux list-sessions
-```
-
-Also inspect any supervisor/container wrapper or site scheduler used for this
-process, and `/etc/cron.d`, `/etc/crontab` and user login startup files if relevant.
-Save the old exact command, config path, working directory and relaunch settings
-for rollback. Verify `OLD_PID` is this watchdog, not a trainer or reused PID.
-**Before stopping it, record its descendants**, including gcloud launchers,
-Python processes running gcloud, and any subprocesses they launched. A parent
-exiting does not prove its children exited; they may be reparented and continue
-a cloud operation. On box248, save a process tree and a process table containing
-start times and command lines:
-
-```bash
-HANDOFF=$(mktemp -d "$HOME/.local/state/gfn-spot/handoff.XXXXXXXX")
-pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-before.txt"
-ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-before.txt"
-# Pause only the verified watchdog so it cannot launch another cloud command.
-kill -STOP "$OLD_PID"
-pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-paused.txt"
-ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-paused.txt"
-```
-
-The first snapshot precedes the pause; the second captures children launched
-between that snapshot and the pause. Review both and record **all descendant
-process PIDs**, not thread IDs shown in braces by pstree. Check identities against
-the saved start times and commands. Include children of gcloud wrappers, not
-just processes named `gcloud`. Keep tracking any further descendants of those
-commands until they finish. If the tree cannot be inspected or any process's
-ownership/outcome is uncertain, stop the handoff and do not activate TPU1.
-
-Populate this array with the actual recorded descendant PIDs; use an empty array
-only when both snapshots establish there were none:
-
-```bash
-OLD_DESCENDANT_PIDS=()  # fill with the verified PIDs from the saved trees
-OLD_ALL_PIDS=("$OLD_PID" "${OLD_DESCENDANT_PIDS[@]}")
-OLD_PID_LIST=$(IFS=,; echo "${OLD_ALL_PIDS[*]}")
-printf '%s\n' "${OLD_ALL_PIDS[@]}" > "$HANDOFF/pids.txt"
-ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args \
-  | tee "$HANDOFF/identified-processes.txt"
-```
-
-If managed by systemd, inspect and disable only the identified unit (`OLD_UNIT`
-must be its real name). Record descendants above **before** `--now` stops it:
-
-```bash
-# Run only for an identified user service; for a system service use sudo systemctl.
-systemctl --user cat "$OLD_UNIT"
-systemctl --user disable --now "$OLD_UNIT"
-# If a dedicated timer launches it, disable that identified timer too.
-# For cron, use crontab -e and remove only this watchdog's relaunch entry.
-```
-
-For the documented nohup process, after recording descendants and disabling any
-configured relaunch, send TERM to the verified parent and then CONT so the paused
-process can receive the pending termination signal. Do not resume it without
-first requesting termination:
-
-```bash
-kill -TERM "$OLD_PID"
-kill -CONT "$OLD_PID"
-WAIT_ARGS=()
-for pid in "${OLD_ALL_PIDS[@]}"; do WAIT_ARGS+=(--pid="$pid"); done
-timeout 240 tail "${WAIT_ARGS[@]}" -f /dev/null
-ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args
-# Expected: header only, no recorded process remains (ps exits 1).
-pgrep -af '[s]pot_queue.py'  # expected no watchdog; inspect any output
-```
-
-If a manager already stopped it, skip the TERM/CONT commands but perform the
-same descendant wait and verification. A timeout is a blocked handoff, not
-permission to proceed. Inspect remaining recorded processes and their descendants
-using their identities, saved process table and process groups, even if they have
-been reparented. Prefer waiting for cloud commands to finish; if one is stuck,
-resolve it individually after rechecking its PID, start time and command. Never
-use broad process kills or signal an unverified process group. Do not stop
-trainers or cancel queued requests. Reused PIDs require identity inspection;
-they must never be killed based solely on the saved PID.
-
-Activation requires verified exit of **both the old watchdog and every cloud
-command/subprocess it launched**, and disabled automatic relaunch. Parent PID
-exit alone is insufficient. If descendants escaped observation, or completion
-cannot be established, keep TPU1 stopped and disabled until resolved.
-
-### Resolve any in-flight mutation before activation
-
-Inspect the recorded command lines and the old watchdog log around shutdown:
-
-```bash
-tail -n 200 "$HOME/.local/state/gfn-spot/watchdog.log" \
-  | tee "$HANDOFF/watchdog-shutdown.log"
-```
-
-If a create/delete was in flight, or its completion is uncertain, local process
-exit is still insufficient: `--async` API operations can continue server-side.
-After **all** old local processes have exited, obtain fresh read-only inventory
-with the preflight command below and inspect the affected queued request, node
-and corresponding operation status/errors. Repeat read-only checks until its
-outcome is resolved: creation is confirmed, deletion is confirmed with no node,
-or a completed failure is understood. A successfully accepted create may leave
-a pending request; preserve it. Do not delete/recreate a pending request to settle
-the handoff. An ambiguous, still-running or failed-to-read operation blocks
-activation; absence in one snapshot or a log line saying `APPLY` does not prove
-completion. Record the affected resource/operation and the resolved outcome in
-`$HANDOFF` on box248. Do not activate the new controller to discover the outcome.
-
-Back on TPU1 worker 0, rerun read-only preflight, compare resource snapshots, then
-review any in-flight mutation as above. **Stop here** unless all old controller
-and subprocess exits, relaunch disablement, mutation outcomes and permission
-checks are verified. Take another fresh preflight snapshot after resolving any
-mutation, then activate:
-
-```bash
-set -o pipefail
-sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
-  --preflight | tee "$HOME/gfn-preflight-handoff.log" || { echo 'STOP: preflight failed'; exit 1; }
-```
-
-Review this inventory before running the separate activation block. Proceed only
-after recording that the parent and all relevant descendants have exited, no
-relaunch is configured, and every in-flight mutation has a resolved outcome:
-
-```bash
-sudo systemctl enable --now gfn-spot-watchdog.service
 sudo systemctl status --no-pager gfn-spot-watchdog.service
-sudo systemctl is-enabled gfn-spot-watchdog.service
-sudo systemctl show gfn-spot-watchdog.service -p MainPID -p SubState -p NRestarts
 sudo journalctl -u gfn-spot-watchdog.service -n 100 --no-pager
-sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
-  --preflight | tee "$HOME/gfn-preflight-after.log" || { echo 'STOP: inventory check failed'; exit 1; }
 sudo journalctl -u gfn-spot-watchdog.service -f
-```
-
-The initial journal preflight snapshot precedes any reconciliation. Confirm
-existing pending/active/deleting/unknown states remain untouched and targets 1–2
-are unchanged. Owned FAILED/SUSPENDED requests with no node may be deleted;
-recreation only occurs after a later successful inventory shows absence. An
-existing node prevents deletion. API failures stop the process and systemd retries
-after 60 seconds; failures never count as absent capacity. Inspect repeated errors
-and stop the service if operator review is required.
-
-Enabled units start after reboot. Actual reboot survival requires operator
-validation at a maintenance window that permits TPU1 interruption: after a
-separately approved reboot, run the same status commands and
-`sudo journalctl -b -u gfn-spot-watchdog.service --no-pager`, and compare a new
-`--preflight` snapshot. Do not reboot a training host just to validate this PR.
-
-### Rollback without overlapping controllers
-
-Before stopping the TPU1 service, record its MainPID and descendant tree/process
-identities using the same procedure above, substituting the service MainPID for
-`OLD_PID` and using `sudo` for process inspection and signals where needed. Keep this record
-outside the service state directory. Then, on TPU1 worker 0:
-
-```bash
+# Before stopping, record descendants as described in DEPLOYMENT.md.
 sudo systemctl disable --now gfn-spot-watchdog.service
-sudo systemctl is-enabled gfn-spot-watchdog.service  # disabled
-sudo systemctl is-active gfn-spot-watchdog.service   # inactive
-sudo systemctl show gfn-spot-watchdog.service -p MainPID -p ControlGroup -p SubState
-pgrep -af '/opt/gfn-spot/[w]atchdog_service.py'  # expected no process
 ```
 
-Require MainPID=0, inactive state, an empty service control group, and verified
-exit of all recorded descendants (including reparented cloud commands) before
-restarting box248. Apply the same fresh-inventory and in-flight mutation outcome
-checks above; a parent exiting or a local cloud process exiting alone is
-insufficient. If TPU1 is unreachable, do not assume it has stopped: establish
-that it cannot run before restarting another controller. Leave all requests and
-nodes untouched. On box248, restore its saved command/config and authenticate
-there as needed. For the original nohup deployment maintaining both targets:
+## Watchdog configuration and protections
 
-```bash
-# In the original controller checkout, after verifying no watchdog is running:
-pgrep -af '[s]pot_queue.py'
-nohup python3 -u scripts/tpu/spot_queue.py \
-  --config "$HOME/.config/gfn-spot/setup-20261123/queue.json" \
-  --targets 3 4 --apply --watch \
-  >> "$HOME/.local/state/gfn-spot/watchdog.log" 2>&1 &
-echo $! > "$HOME/.local/state/gfn-spot/watchdog.pid"
-ps -p "$(cat "$HOME/.local/state/gfn-spot/watchdog.pid")" -o pid,args
-tail -n 50 "$HOME/.local/state/gfn-spot/watchdog.log"
+Version 2 configuration associates managed Spot targets with explicit prepared
+settings. Legacy three-key configurations normalize to this form, enabling only
+3–4 and preserving their captured runtime, resource service account and payload
+path. The installer copies the exact payload bytes and rewrites its local path.
+This schematic example uses operator-supplied values, not validated runtimes:
+
+```json
+{
+  "version": 2,
+  "preparations": {
+    "v4": {
+      "accelerator_type": "v4-32",
+      "runtime_version": "<existing captured runtime>",
+      "service_account": "<existing captured resource account>",
+      "startup_script": "/var/lib/gfn-spot/startup-v4.sh"
+    }
+  },
+  "targets": {
+    "1": {"managed": false}, "2": {"managed": false},
+    "3": {"managed": true, "preparation": "v4"},
+    "4": {"managed": true, "preparation": "v4"},
+    "5": {"managed": false}, "6": {"managed": false},
+    "7": {"managed": false}, "8": {"managed": false}
+  }
+}
 ```
 
-Use the previously saved target selection if it differs. Restore only the
-identified relaunch mechanism if desired; do not also launch nohup when restoring
-a systemd-managed watchdog. The TPU1 unit must remain disabled throughout.
+Use `queue_config.py --config EXISTING --output NEW` to validate/migrate locally;
+it performs no cloud operations and refuses to overwrite an output file. Generated
+configs and captured payloads belong outside Git. Omitted target settings use
+registry defaults; explicitly disable any target you intend to leave unmanaged.
+An enabled target requires an existing payload and matching preparation
+accelerator. Disabled targets require no preparation and cause no inventory or
+reconciliation of their own. Disabling never cancels their existing resources.
+Defined but unused preparations are structurally validated; their files may be
+absent until enabling. All enabled preparations and the entire config are
+validated even when `spot_queue.py --targets` selects a subset. That option only
+narrows management; it cannot enable disabled targets or manage 1–2.
 
-## Check startup on all four workers
+The watchdog polls every **300 seconds**. It inventories queued resources and
+nodes once per managed project/zone, completing **all** required inventories
+before any reconciliation. Any API/auth/timeout/JSON failure stops the entire
+process without reconciling that poll, including otherwise healthy locations.
+Systemd retains its 60-second failure restart. Errors never mean absent capacity.
+Pending, active, deleting, and unknown states are untouched. Ownership requires
+the exact registry name, location, accelerator, Spot allocation and label.
+Only owned FAILED/SUSPENDED requests with no node can be deleted, never with
+force. Only a later successful inventory showing absence allows recreation.
+Unrelated resources and fixed targets 1–2 are never traversed for deletion.
 
-```bash
-gcloud compute tpus tpu-vm ssh ga2740@gn-v4-32-spot-1 \
-  --project=fast-second-order --zone=us-central2-b --worker=all \
-  --command='cat /tmp/gfn_setup_status; sudo tail -n 30 /var/log/gfn-setup.log'
-bash scripts/tpu.sh 3 status
-```
+The service preserves the unprivileged `gfn-spot` user, root-owned independent
+code, writable state, journald logs and systemd restrictions. Each invocation
+uses fresh gcloud storage and an allowlisted environment, excluding inherited
+credential files/tokens/impersonation/user caches. Metadata identity must equal
+`598447672993-compute@developer.gserviceaccount.com`. Fixed system PATH discovery
+prefers ordinary gcloud installations, then uses
+`/snap/google-cloud-cli/current/bin/gcloud` directly. Preflight reports that exact
+executable and all managed-location inventories. List success does not prove
+create/delete permission. No interactive login or service-account keys are used.
 
-After every worker reports DONE, check distributed topology simultaneously on all
-workers (only on this idle new target):
+The local file lock cannot coordinate different hosts or users. Use one controller;
+record and verify all subprocess exits before handoff. Monitoring depends on TPU1
+remaining available; reboot survival still needs operator validation.
 
-```bash
-gcloud compute tpus tpu-vm ssh ga2740@gn-v4-32-spot-1 \
-  --project=fast-second-order --zone=us-central2-b --worker=all \
-  --command="bash -lc 'source /etc/profile.d/gfn_env.sh && timeout 180 python3 -c \"import jax; jax.distributed.initialize(); print(jax.process_index(), jax.process_count(), jax.device_count(), jax.local_device_count()); assert (jax.process_count(), jax.device_count(), jax.local_device_count()) == (4,16,4); jax.distributed.shutdown()\"'"
-```
+## Deployment, preparation and validation
 
-Expect process indices 0..3, each reporting 4 processes, 16 global devices and 4
-local devices. This is a topology check, not a training test. No training is
-launched by the watchdog. GN parameter warm-start is not exact state/data resume.
-Preempted runs need explicit operator decisions and available checkpoints.
-
-## Expand to both targets / stop
-
-In the controller shell, identify the watchdog before stopping it:
-
-```bash
-ps -p "$(cat "$HOME/.local/state/gfn-spot/watchdog.pid")" -o pid,args
-```
-
-After verifying it is this Python watchdog, stop that process:
-
-```bash
-kill -TERM "$(cat "$HOME/.local/state/gfn-spot/watchdog.pid")"
-```
-
-Stopping the watchdog leaves existing TPU VMs and pending requests running. It
-does not cancel capacity charges. To maintain both, relaunch the same nohup command
-with `--targets 3 4` only after the parent and all its cloud-command descendants
-have exited and any in-flight mutation's outcome is resolved, using the handoff
-procedure above. Do not delete a node while the
-watchdog is running unless recreation is intended. Use target 4's exact name for
-its startup/topology checks.
-
-## Local validation
+- [Installation/update, separate activation, staged enablement and rollback](DEPLOYMENT.md).
+- [Generation readiness, IAM review and process/operation troubleshooting](TROUBLESHOOTING.md).
 
 ```bash
 python3 -m unittest discover -s scripts/tests -v
@@ -464,25 +169,17 @@ systemd-analyze verify scripts/tpu/gfn-spot-watchdog.service
 git diff --check
 ```
 
-Tests mock gcloud and exercise pending/terminal states, orphan/foreign resource
-refusal, authentication failure, nonmutating preview, payload quoting, isolated
-credential environments, metadata identity/header checks, configuration copying,
-permissions, installation without activation, both targets and 300-second polling. Cloud
-provisioning, package downloads, IAM, actual startup and TPU execution require
-operator validation. The scripts do not claim these local tests cover them.
+Local tests are CPU-only with mocked/fake cloud commands. They do not prove
+runtime/generation compatibility, IAM, quotas, live provisioning, startup, training
+readiness or reboot behavior. No training, optimizer, experiment or dependency
+versions are changed by this implementation.
 
-Implementation validation on 2026-11-24: **70 CPU tests passed** in local Ubuntu
-WSL (10.476s), including mocked ordinary/Snap executable discovery, failure and
-preflight-reporting checks; both Bash syntax checks and systemd unit verification exited 0;
-`git diff --check` passed. The initial Windows working-tree run had 62/63 tests
-pass, with the existing shell entrypoint test failing on CRLF line endings;
-setup_vm.sh syntax checking also hit existing CRLF. Final validation used a
-temporary Linux snapshot of Git's stored files plus the changed files, leaving
-unrelated checkout files untouched. The installer was tested with mocked system
-commands, not installed into the local system. No cloud commands, live IAM
-verification, TPU deployment, service activation or reboot test were performed.
-
-API references:
-- https://docs.cloud.google.com/tpu/docs/queued-resources
-- https://docs.cloud.google.com/sdk/gcloud/reference/compute/tpus/queued-resources/create
-- https://docs.cloud.google.com/sdk/gcloud/reference/compute/tpus/queued-resources/delete
+Local implementation validation (2026-11-24): **92 tests passed in 11.141s** in
+an Ubuntu WSL temporary Linux snapshot of Git's stored files plus these changes,
+avoiding the Windows checkout's existing CRLF shell files. Both script syntax
+checks and `systemd-analyze verify` exited 0; all 24 Bash blocks in the operator
+and workflow docs passed `bash -n`; Git diff whitespace checks passed. Installer
+system commands/cloud calls were mocked; staged and installed module imports
+were actually checked with `python -I`. No service was installed/started locally,
+and no live cloud validation, IAM changes, SSH, capacity requests or training
+were performed. Operator reports above describe the pre-existing deployment.

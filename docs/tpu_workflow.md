@@ -30,14 +30,17 @@ No new Python dependencies are needed by the tooling or its tests. Dry-run needs
 only Bash/Python and the checkout: no gcloud, credentials, JAX, trainer imports,
 network, or TPU access.
 
-All site defaults are in the configuration section of `scripts/tpu_control.py`:
+Target identities/types/locations are shared with the watchdog in
+`scripts/tpu_targets.py`; see the single [numeric target table](../scripts/tpu/README.md).
+Manual controller overrides take precedence over the selected registry entry;
+the watchdog ignores those overrides. Other site defaults remain in
+`scripts/tpu_control.py`:
 
 | Setting | Default | Optional environment override |
 | --- | --- | --- |
-| Target `1` | `gn-v4-32` | `GFN_TPU_NAME` overrides the selected name |
-| Target `2` | `gn-v4-32-2` | `GFN_TPU_NAME` |
-| Project | `fast-second-order` | `GFN_PROJECT` |
-| Zone | `us-central2-b` | `GFN_ZONE` |
+| Target name | Selected registry entry | `GFN_TPU_NAME` |
+| Project | Selected registry entry | `GFN_PROJECT` |
+| Zone | Selected registry entry | `GFN_ZONE` |
 | SSH user | `ga2740` | `GFN_SSH_USER` |
 | Worker repository | `/full-gauss-newton` | `GFN_REMOTE_REPO` |
 | Worker environment | `/etc/profile.d/gfn_env.sh` | `GFN_REMOTE_ENV` |
@@ -80,7 +83,7 @@ and synchronize that same branch/SHA on every worker first. After the PRs are
 merged separately, normal `main`/`epoch` checkouts can be used instead.
 
 `pull`/`switch` require identical executable helpers (`tpu.sh`, `tpu_control.py`,
-`tpu_worker.py`, and `run_experiment.py`) on the controller, current workers, and
+`tpu_worker.py`, `run_experiment.py`, and `tpu_targets.py`) on the controller, current workers, and
 **target commit**. Preset contents and inventory may differ: updates can deliver
 committed preset-only changes while workers still have the previous presets.
 All workers must still start idle, clean, and at the same branch/SHA, and converge
@@ -329,18 +332,25 @@ on epoch. None of these restrictions are relaxed by the tooling.
 
 ## Branch delivery and local validation
 
-Capacity watchdog deployment status (2026-11-24): TPU1 worker-0 systemd service
-with isolated attached-service-account authentication is **pending operator
-deployment and confirmation**. See [the installation, IAM review, controller
-handoff and rollback commands](../scripts/tpu/README.md#tpu1-service-deployment-pending-operator-deployment).
-No IAM, TPU resources, training checkout or experiment launching is changed by
-this implementation. Keep box248 as sole controller until the documented handoff;
-the local file lock does not coordinate hosts. TPU1 availability is required for
-the proposed monitoring service. IAM and reboot behavior require operator checks.
-Controller handoff also requires recording descendants before shutdown, verifying
-exit of the old watchdog and every cloud-command subprocess, and resolving any
-in-flight mutation from fresh inventory before activation. Parent exit alone is
-insufficient; see the migration guide. Deployment remains pending confirmation.
+Capacity watchdog operator report (2026-11-24): the independent v4-only systemd
+deployment on TPU1 worker 0 is enabled/running. Isolated attached-account auth and
+direct Snap gcloud passed the sandboxed preflight; failed requests 3–4 were
+deleted/recreated and both observed WAITING_FOR_RESOURCES. The us-central2
+external IP quota is now reported as 16. Allocated-worker startup, training
+readiness and reboot survival remain untested.
+
+The registry/version-2 update on `codex/watchdog-service-account`, continuing
+from `2b308b4`, is **pending operator deployment**. It preserves 1–4 identities,
+migrates captured v4 settings/bytes to managed 3–4 and leaves 5–8 disabled.
+New-generation runtime/topology/data/IAM/quota compatibility remains pending
+per target/location; no trainer, optimizer, experiment or dependency version is
+changed. See [safe installation/update and staged activation](../scripts/tpu/DEPLOYMENT.md).
+Updating Git does not update `/opt/gfn-spot` or its existing cloud requests.
+Before controller replacement, record descendants, verify parent and all cloud
+subprocess exits, and resolve in-flight mutations from fresh inventory. Parent
+exit alone is insufficient. The file lock does not coordinate hosts; monitoring
+depends on TPU1 availability. No deployment, IAM change, cloud mutation or
+training launch was performed by this implementation.
 
 The implementation is committed on `codex/tpu-workflow` from `origin/main`, then
 cherry-picked onto `codex/tpu-workflow-epoch` from `origin/epoch`. Open separate PRs

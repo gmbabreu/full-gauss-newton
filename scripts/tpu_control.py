@@ -13,13 +13,11 @@ import uuid
 
 from run_experiment import ROOT, choices, make_plan, preview
 from tpu_worker import encode, fingerprint
+from tpu_targets import TARGETS
 
 # All site defaults and optional environment overrides live here.
 DEFAULTS = dict(
-    targets={'1': 'gn-v4-32', '2': 'gn-v4-32-2',
-             '3': 'gn-v4-32-spot-1', '4': 'gn-v4-32-spot-2'},
-    project=os.environ.get('GFN_PROJECT', 'fast-second-order'),
-    zone=os.environ.get('GFN_ZONE', 'us-central2-b'),
+    targets={key: target.name for key, target in TARGETS.items()},
     user=os.environ.get('GFN_SSH_USER', 'ga2740'),
     repo=os.environ.get('GFN_REMOTE_REPO', '/full-gauss-newton'),
     environment=os.environ.get('GFN_REMOTE_ENV', '/etc/profile.d/gfn_env.sh'),
@@ -34,8 +32,7 @@ HELP = '''Usage (from root: bash scripts/tpu.sh; from scripts/: bash tpu.sh):
   tpu.sh TARGET switch BRANCH       Fetch/switch/fast-forward on all workers
   tpu.sh TARGET ssh [WORKER]        Interactive shell; default worker 0
   tpu.sh help
-TARGET: 1 = gn-v4-32; 2 = gn-v4-32-2;
-        3 = gn-v4-32-spot-1; 4 = gn-v4-32-spot-2
+TARGET: numeric registry ID 1–8; see scripts/tpu/README.md for names/types/locations.
 Presets (editable starter settings): ''' + ', '.join(choices()) + '''
 gn_sgd selects the inner GN solver. adam selects ordinary AdamW training.
 See docs/tpu_workflow.md for sync, checkpoint and replay restrictions.
@@ -49,6 +46,10 @@ def local_git(*args):
 class Controller:
     def __init__(self, target):
         self.cfg = dict(DEFAULTS)
+        specification = TARGETS[target]
+        self.cfg.update(project=os.environ.get('GFN_PROJECT', specification.project),
+                        zone=os.environ.get('GFN_ZONE', specification.zone),
+                        accelerator=specification.accelerator, allocation=specification.allocation)
         self.cfg['target'] = os.environ.get('GFN_TPU_NAME', DEFAULTS['targets'][target])
         self.token = uuid.uuid4().hex
         self.workers = []
@@ -65,10 +66,12 @@ class Controller:
         result = subprocess.run(self.gcloud('describe', self.cfg['target'], '--format=json'),
                                 capture_output=True, text=True)
         if result.returncode:
-            raise RuntimeError('Cannot discover workers: ' + result.stderr.strip())
+            raise RuntimeError(f'Cannot discover workers for {self.cfg["target"]} in '
+                               f'{self.cfg["project"]}/{self.cfg["zone"]}: target may not be allocated; '
+                               'check allocation and API/auth access. ' + result.stderr.strip())
         endpoints = json.loads(result.stdout).get('networkEndpoints', [])
         if not endpoints:
-            raise RuntimeError('TPU description has no networkEndpoints')
+            raise RuntimeError('TPU is not ready: description has no networkEndpoints')
         self.workers = list(range(len(endpoints)))
 
     def ssh(self, worker, remote=None, *, stream=False):
@@ -236,6 +239,8 @@ def main(argv=None):
         overrides = [arg for arg in overrides if arg != '--dry-run']
         plan = make_plan(preset, overrides)
         print(f'Target: {controller.cfg["target"]} ({controller.cfg["project"]}, {controller.cfg["zone"]})\n'
+              f'Type: {controller.cfg["accelerator"]}; API type: {TARGETS[target].api_accelerator}; '
+              f'allocation: {controller.cfg["allocation"]}\n'
               f'Preset: {preset}; run ID: {plan["run_id"]}\n'
               f'Output: {plan["output_location"]}\nCommand: {preview(plan)}\n'
               'Launch plan: discover workers; reserve ALL; preflight clean/matching branch/SHA, tooling, '

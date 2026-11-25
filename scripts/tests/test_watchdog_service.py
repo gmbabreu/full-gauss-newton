@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -20,6 +21,9 @@ class ServiceTests(unittest.TestCase):
         executable = patch.object(queue, 'GCLOUD_EXECUTABLE', 'gcloud')
         executable.start()
         self.addCleanup(executable.stop)
+        self.configuration = queue.queue_config.normalize(
+            dict(runtime_version='runtime', service_account='resource@example.invalid',
+                 startup_script='/tmp/startup.sh'), check_files=False)
 
     def test_ordinary_gcloud_discovery_uses_fixed_path(self):
         for executable in ('/usr/bin/gcloud', '/usr/local/bin/gcloud'):
@@ -47,7 +51,7 @@ class ServiceTests(unittest.TestCase):
                     patch.object(service, 'metadata_identity', return_value=service.IDENTITY), \
                     patch.object(queue, 'inventory') as inventory:
                 with self.assertRaisesRegex(ValueError, 'No executable gcloud'):
-                    service.preflight()
+                    service.preflight(self.configuration)
                 inventory.assert_not_called()
 
     @patch.object(service, 'metadata_identity', return_value=service.IDENTITY)
@@ -58,7 +62,7 @@ class ServiceTests(unittest.TestCase):
                     patch.object(queue, 'log') as log, \
                     patch.object(queue.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='[]')) as run:
                 with tempfile.TemporaryDirectory() as state, service.isolated_environment(Path(state)) as env:
-                    service.preflight()
+                    service.preflight(self.configuration)
                     self.assertEqual(len(run.call_args_list), 2)
                     for call in run.call_args_list:
                         self.assertEqual(call.args[0][0], executable)
@@ -100,7 +104,7 @@ class ServiceTests(unittest.TestCase):
     @patch.object(queue, 'inventory')
     def test_metadata_mismatch_prevents_any_cloud_call(self, inventory, identity):
         with self.assertRaisesRegex(ValueError, 'identity mismatch'):
-            service.preflight()
+            service.preflight(self.configuration)
         inventory.assert_not_called()
 
     def test_metadata_request_is_direct_and_requires_google_header(self):
@@ -124,7 +128,7 @@ class ServiceTests(unittest.TestCase):
     @patch.object(queue, 'inventory', return_value={})
     @patch.object(queue, 'reconcile')
     def test_preflight_reads_both_inventories_only(self, reconcile, inventory, executable, identity):
-        service.preflight()
+        service.preflight(self.configuration)
         self.assertEqual([x.args[0] for x in inventory.call_args_list], ['queued-resources', 'tpu-vm'])
         reconcile.assert_not_called()
 
@@ -134,7 +138,8 @@ class ServiceTests(unittest.TestCase):
     @patch.object(queue, 'main')
     def test_preflight_failure_never_enters_watchdog(self, main, inventory, executable, identity):
         with tempfile.TemporaryDirectory() as directory, patch.object(service, 'STATE', Path(directory)), \
-                patch.object(service, 'validate_files'), patch.object(sys, 'argv', ['service']):
+                patch.object(service, 'validate_files', return_value=self.configuration), \
+                patch.object(sys, 'argv', ['service']):
             # Explicit context keeps this test independent of the production state path.
             with patch.object(service, 'isolated_environment', return_value=service.isolated_environment(Path(directory))):
                 with self.assertRaisesRegex(RuntimeError, 'permission denied'):
@@ -154,11 +159,13 @@ class ServiceTests(unittest.TestCase):
             destination.mkdir()
             with patch.object(installer.subprocess, 'run') as run:
                 copied = installer.copy_configuration(config, startup, destination)
-            self.assertEqual(copied, dict(original, startup_script=str(destination / 'startup.sh')))
-            self.assertEqual((destination / 'startup.sh').read_bytes(), payload)
+                self.assertEqual(copied['preparations']['v4'],
+                                 dict(original, accelerator_type='v4-32',
+                                      startup_script=str(destination / 'startup-v4.sh')))
+            self.assertEqual((destination / 'startup-v4.sh').read_bytes(), payload)
             self.assertEqual(json.loads(config.read_text()), original)
             service.validate_files(destination / 'queue.json')
-            (destination / 'startup.sh').chmod(0o666)
+            (destination / 'startup-v4.sh').chmod(0o666)
             with self.assertRaisesRegex(ValueError, 'group/other write'):
                 service.validate_files(destination / 'queue.json')
             self.assertEqual(run.call_args.args[0][:2], ['bash', '-n'])
@@ -183,6 +190,14 @@ class ServiceTests(unittest.TestCase):
             self.assertIn(('systemctl', 'disable', installer.SERVICE), commands)
             self.assertFalse(any(x[0] == 'systemctl' and any(v in x for v in ('enable', 'start', 'restart')) for x in commands))
             self.assertEqual((root / 'code/spot_queue.py').read_bytes(), (TPU / 'spot_queue.py').read_bytes())
+            for name, source in installer.BUNDLE.items():
+                self.assertEqual((root / 'code' / name).read_bytes(), source.read_bytes())
+            self.assertEqual(set(installer.BUNDLE),
+                             {'spot_queue.py', 'watchdog_service.py', 'queue_config.py', 'tpu_targets.py'})
+            subprocess.run([sys.executable, '-I', '-c',
+                            'import sys; sys.path.insert(0, sys.argv[1]); '
+                            'import watchdog_service; '
+                            'assert len(watchdog_service.queue.REGISTRY) == 8', str(root / 'code')], check=True)
             unit = (root / 'unit').read_text()
             for setting in ['User=gfn-spot', 'Restart=on-failure', 'RestartSec=60',
                             'StandardOutput=journal', 'WantedBy=multi-user.target',
@@ -190,10 +205,14 @@ class ServiceTests(unittest.TestCase):
                             'PrivateTmp=true', 'ReadWritePaths=/var/lib/gfn-spot']:
                 self.assertIn(setting, unit)
 
-    @patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='active', stderr=''))
+    @patch.object(installer.subprocess, 'run')
     def test_installer_refuses_active_or_enabled_service(self, run):
-        with self.assertRaisesRegex(ValueError, 'stopped and disabled'):
-            installer.require_inactive()
+        for responses in ([SimpleNamespace(returncode=0, stdout='active', stderr='')],
+                          [SimpleNamespace(returncode=3, stdout='inactive', stderr=''),
+                           SimpleNamespace(returncode=0, stdout='enabled', stderr='')]):
+            run.side_effect = responses
+            with self.assertRaisesRegex(ValueError, 'stopped and disabled'):
+                installer.require_inactive()
 
     def test_targets_and_poll_interval(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -218,7 +237,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(sys, 'argv', ['service']):
             with patch.object(service, 'isolated_environment', return_value=service.isolated_environment(Path(directory))):
                 service.main()
-        self.assertEqual(main.call_args.args[0], ['--config', str(service.CONFIG), '--targets', '3', '4', '--apply', '--watch'])
+        self.assertEqual(main.call_args.args[0], ['--config', str(service.CONFIG), '--apply', '--watch'])
 
     @patch.object(service, 'validate_files')
     @patch.object(service, 'preflight')
