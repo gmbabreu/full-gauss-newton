@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capacity watchdog for the two additional v4 Spot targets; never runs training."""
+"""Registry-driven Spot capacity watchdog; never runs training."""
 import argparse
 from datetime import datetime
 import fcntl
@@ -12,10 +12,17 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
-PROJECT = 'fast-second-order'
-ZONE = 'us-central2-b'
-TARGETS = {'3': 'gn-v4-32-spot-1', '4': 'gn-v4-32-spot-2'}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import queue_config
+from tpu_targets import TARGETS as REGISTRY
+from tpu_targets import LEGACY_SPOT_NAMES
+
+# Compatibility names for the original v4 helpers; routing uses REGISTRY below.
+PROJECT = REGISTRY['3'].project
+ZONE = REGISTRY['3'].zone
+TARGETS = {key: target.name for key, target in REGISTRY.items() if target.allocation == 'spot'}
 OWNER = 'gfn-spot-queue'
+GCLOUD_EXECUTABLE = 'gcloud'
 
 
 def log(message, *, file=None):
@@ -24,9 +31,10 @@ def log(message, *, file=None):
         print(f'[{timestamp}] {line}', file=file, flush=True)
 
 
-def gcloud(group, action, *args):
-    return ['gcloud', 'compute', 'tpus', group, action, *args,
-            '--project=' + PROJECT, '--zone=' + ZONE, '--quiet']
+def gcloud(group, action, *args, location=None):
+    project, zone = location or (PROJECT, ZONE)
+    return [GCLOUD_EXECUTABLE, 'compute', 'tpus', group, action, *args,
+            '--project=' + project, '--zone=' + zone, '--quiet']
 
 
 def call(command):
@@ -37,89 +45,121 @@ def call(command):
     return result.stdout
 
 
-def inventory(group):
+def inventory(group, location=None):
     # A failed list is never interpreted as an absent resource.
-    data = json.loads(call(gcloud(group, 'list', '--format=json')))
+    data = json.loads(call(gcloud(group, 'list', '--format=json', location=location)))
     if not isinstance(data, list):
         raise ValueError('Unexpected inventory response')
     return {x['name'].rsplit('/', 1)[-1]: x for x in data}
 
 
-def validate_owned(resource, name):
+def collect_inventory(configuration, selected=None):
+    # Fail the entire poll before ANY reconciliation if any required list fails.
+    inventories = {location: (inventory('queued-resources', location), inventory('tpu-vm', location))
+                   for location in queue_config.locations(configuration, selected)}
+    # Check every renamed managed target before reconciling ANY location.
+    for key in queue_config.enabled(configuration, selected):
+        if key in LEGACY_SPOT_NAMES:
+            target = REGISTRY[key]
+            refuse_legacy_spot_conflicts(*inventories[(target.project, target.zone)])
+    return inventories
+
+
+def refuse_legacy_spot_conflicts(requests, nodes):
+    conflicts = [f'{kind} {name}' for kind, resources in (('queued request', requests), ('node', nodes))
+                 for name in LEGACY_SPOT_NAMES.values() if name in resources]
+    if conflicts:
+        raise ValueError('Targets 3–4 naming conflict in ' + PROJECT + '/' + ZONE + ': '
+                         + '; '.join(conflicts) + '. Refusing reconciliation; resolve legacy '
+                         'resources with the service stopped before managing renamed targets. '
+                         'No legacy deletion or replacement is automatic.')
+
+
+def validate_owned(resource, target):
+    name = target.name
     specs = resource.get('tpu', {}).get('nodeSpec', [])
     if len(specs) != 1:
         raise ValueError(name + ': expected exactly one node specification')
     spec = specs[0]
     node = spec.get('node', {})
     if (spec.get('nodeId') != name or
-            spec.get('parent') not in {f'projects/{PROJECT}/locations/{ZONE}',
-                                       f'projects/598447672993/locations/{ZONE}'} or
-            node.get('acceleratorType') != 'v4-32' or
+            spec.get('parent') not in {f'projects/{target.project}/locations/{target.zone}',
+                                       f'projects/{target.project_number}/locations/{target.zone}'} or
+            resource.get('name') not in {None, name,
+                f'projects/{target.project}/locations/{target.zone}/queuedResources/{name}',
+                f'projects/{target.project_number}/locations/{target.zone}/queuedResources/{name}'} or
+            node.get('acceleratorType') != target.api_accelerator or
             node.get('labels', {}).get('managed-by') != OWNER or
-            'spot' not in resource):
+            'spot' not in resource or 'guaranteed' in resource or target.allocation != 'spot'):
         raise ValueError(name + ': existing request is not owned by this Spot watchdog')
 
 
-def create_command(name, args):
+def create_command(target_id, preparation):
+    target = REGISTRY[target_id]
+    name = target.name
     return gcloud('queued-resources', 'create', name, '--node-id=' + name,
-                  '--accelerator-type=v4-32', '--spot', '--async',
-                  '--runtime-version=' + args.runtime_version,
-                  '--service-account=' + args.service_account,
+                  '--accelerator-type=' + target.api_accelerator, '--spot', '--async',
+                  '--runtime-version=' + preparation['runtime_version'],
+                  '--service-account=' + preparation['service_account'],
                   '--scopes=https://www.googleapis.com/auth/cloud-platform',
-                  '--labels=managed-by=' + OWNER,
-                  '--metadata-from-file=startup-script=' + str(Path(args.startup_script).resolve()))
+                  '--labels=managed-by=' + OWNER + ',gfn-target=' + target_id,
+                  '--metadata-from-file=startup-script=' + str(Path(preparation['startup_script']).resolve()),
+                  location=(target.project, target.zone))
 
 
 def reconcile(target, requests, nodes, args):
-    name = TARGETS[target]
+    if target in {'1', '2'} or REGISTRY[target].allocation != 'spot':
+        raise ValueError('Fixed/on-demand targets cannot be watchdog managed')
+    if not args.configuration['targets'][target]['managed']:
+        return
+    if target in LEGACY_SPOT_NAMES:
+        refuse_legacy_spot_conflicts(requests, nodes)
+    specification = REGISTRY[target]
+    name = specification.name
+    identity = f'Target {target} [{name}]'
     resource = requests.get(name)
     if resource is None:
         if name in nodes:
             raise ValueError(name + ': node exists without our queued request; inspect manually')
-        command = create_command(name, args)
+        preparation = args.configuration['targets'][target]['preparation']
+        command = create_command(target, args.configuration['preparations'][preparation])
     else:
-        validate_owned(resource, name)
+        validate_owned(resource, specification)
         state = resource.get('state', {}).get('state', 'UNKNOWN')
-        log(name + ': ' + state)
+        log(identity + ': ' + state)
         if state not in {'SUSPENDED', 'FAILED'}:
             # Includes pending/active/deleting and unknown future states. Never reset a wait.
             return
         if name in nodes:
             raise ValueError(name + ': terminal request still has a node; refusing deletion')
         # No --force: server must also confirm that there are no nodes to delete.
-        command = gcloud('queued-resources', 'delete', name, '--async')
-    log(('APPLY ' if args.apply else 'PREVIEW ') + shlex.join(command))
+        command = gcloud('queued-resources', 'delete', name, '--async',
+                         location=(specification.project, specification.zone))
+    log(identity + ': ' + ('APPLY ' if args.apply else 'PREVIEW ') + shlex.join(command))
     if args.apply:
         call(command)
     # Recreation follows only after a later successful inventory confirms absence.
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--targets', nargs='+', choices=sorted(TARGETS), default=['3'])
-    p.add_argument('--config', required=True, help='queue.json from capture_setup.py')
+    p.add_argument('--targets', nargs='+', choices=sorted(TARGETS),
+                   help='Optional subset of managed targets; cannot enable a disabled target')
+    p.add_argument('--config', required=True, help='Version 2 queue.json or legacy captured configuration')
     p.add_argument('--apply', action='store_true', help='Allow creates and terminal request cleanup')
     p.add_argument('--watch', action='store_true', help='Poll every 300 seconds')
-    a = p.parse_args()
-    config = json.loads(Path(a.config).expanduser().read_text())
-    if set(config) != {'runtime_version', 'service_account', 'startup_script'}:
-        p.error('Invalid queue configuration keys')
-    for key, value in config.items():
-        if not isinstance(value, str):
-            p.error('Configuration values must be strings')
-        setattr(a, key, value)
-    if not Path(a.startup_script).is_file():
-        p.error('startup-script must be a prepared local file')
-    if not a.runtime_version or '@' not in a.service_account:
-        p.error('Provide the verified runtime and service-account email')
-    # Fixed per-project/zone lock: two controllers cannot maintain overlapping targets here.
+    a = p.parse_args(argv)
+    a.configuration = queue_config.load(a.config)
+    # This lock is local to this user's home on this host, not cross-host coordination.
     state = Path.home() / '.local/state/gfn-spot'
     state.mkdir(parents=True, exist_ok=True)
     with (state / 'watchdog.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         while True:
-            requests, nodes = inventory('queued-resources'), inventory('tpu-vm')
-            for target in dict.fromkeys(a.targets):
+            inventories = collect_inventory(a.configuration, a.targets)
+            for target in queue_config.enabled(a.configuration, a.targets):
+                specification = REGISTRY[target]
+                requests, nodes = inventories[(specification.project, specification.zone)]
                 reconcile(target, requests, nodes, a)
             if not a.watch:
                 break

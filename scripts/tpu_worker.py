@@ -15,7 +15,7 @@ import time
 
 
 HELPER_PATHS = tuple('scripts/' + name for name in
-                     ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'))
+                     ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py', 'tpu_targets.py'))
 
 
 def command(argv, *, check=True):

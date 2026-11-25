@@ -21,7 +21,83 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 import run_experiment as experiment
 import tpu_control as control
+import tpu_targets as registry
 import tpu_worker as worker
+
+
+class RoutingTests(unittest.TestCase):
+    def test_fixed_names_and_numeric_suffixes_for_spot_targets(self):
+        expected = {'1': 'gn-v4-32', '2': 'gn-v4-32-2', '3': 'gn-v4-32-spot-3',
+                    '4': 'gn-v4-32-spot-4', '5': 'gn-v6e-16-spot-5', '6': 'gn-v6e-16-spot-6',
+                    '7': 'gn-v5e-16-spot-7', '8': 'gn-v5e-16-spot-8'}
+        self.assertEqual({key: value.name for key, value in registry.TARGETS.items()}, expected)
+        self.assertEqual(control.DEFAULTS['targets'], expected)
+        for key in ('3', '4', '5', '6', '7', '8'):
+            self.assertTrue(registry.TARGETS[key].name.endswith('-' + key))
+        for key in ('5', '6', '7', '8'):
+            self.assertFalse(registry.TARGETS[key].managed)
+
+    def test_numeric_routing_and_dynamic_worker_counts(self):
+        for key, target in registry.TARGETS.items():
+            with self.subTest(key=key):
+                controller = control.Controller(key)
+                for action in ('describe', 'ssh'):
+                    command = controller.gcloud(action, target.name)
+                    self.assertIn('--project=' + target.project, command)
+                    self.assertIn('--zone=' + target.zone, command)
+                    self.assertIn(target.name, command)
+                self.assertEqual(controller.cfg['accelerator'], target.accelerator)
+                for count in (1, 2, 4, 8):
+                    response = types.SimpleNamespace(returncode=0, stdout=json.dumps({'networkEndpoints': [{}] * count}))
+                    with patch.object(control.subprocess, 'run', return_value=response):
+                        controller.discover()
+                    self.assertEqual(controller.workers, list(range(count)))
+
+    def test_all_numeric_commands_are_available_even_when_watchdog_disabled(self):
+        def discover(controller):
+            controller.workers = [0, 1]
+        for key in registry.TARGETS:
+            with self.subTest(key=key), redirect_stdout(io.StringIO()), \
+                    patch.object(control.Controller, 'discover', discover), \
+                    patch.object(control.Controller, 'rpc', return_value={}) as rpc, \
+                    patch.object(control.Controller, 'ssh', return_value=types.SimpleNamespace(returncode=0)) as ssh, \
+                    patch.object(control.Controller, 'operate') as operate:
+                for args in (['status'], ['ssh', '0'], ['logs', '0'], ['run', 'gn_adam'],
+                             ['stop'], ['pull'], ['switch', 'main']):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(control.main([key, *args]), 0)
+                    self.assertTrue(output.getvalue().startswith(f'Target {key}: {registry.TARGETS[key].name} '))
+                self.assertEqual(operate.call_count, 4)
+                self.assertEqual([c.args[0] for c in operate.call_args_list], ['run', 'stop', 'pull', 'switch'])
+                self.assertEqual(operate.call_args.kwargs['branch'], 'main')
+                self.assertEqual(ssh.call_args.args[0], 0)
+                self.assertEqual(rpc.call_args.args[:2], (0, 'logs'))
+
+    def test_previews_show_type_and_location_without_cloud_or_flag_changes(self):
+        for key, target in registry.TARGETS.items():
+            output = io.StringIO()
+            with redirect_stdout(output), patch.object(control.subprocess, 'run', side_effect=AssertionError('cloud')):
+                control.main([key, 'run', 'gn_adam', '--dry-run', '--mesh_dim=1,2,4', '--inner_loop_iter=17'])
+            for value in (f'Target {key}:', target.name, target.zone, target.accelerator, target.allocation,
+                          '--mesh_dim=1,2,4', '--inner_loop_iter=17'):
+                self.assertIn(value, output.getvalue())
+
+    def test_environment_overrides_win_only_for_manual_controller(self):
+        with patch.dict(os.environ, GFN_PROJECT='other', GFN_ZONE='other-zone', GFN_TPU_NAME='manual'):
+            controller = control.Controller('5')
+            self.assertEqual((controller.cfg['project'], controller.cfg['zone'], controller.cfg['target']),
+                             ('other', 'other-zone', 'manual'))
+            self.assertEqual(registry.TARGETS['5'].zone, 'us-east1-d')
+
+    def test_unallocated_or_unreadable_target_is_useful_error_not_empty_workers(self):
+        controller = control.Controller('5')
+        with patch.object(control.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stderr='NOT_FOUND')):
+            with self.assertRaisesRegex(RuntimeError, 'us-east1-d.*may not be allocated'):
+                controller.discover()
+        with patch.object(control.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout='{}')):
+            with self.assertRaisesRegex(RuntimeError, 'not ready'):
+                controller.discover()
 
 
 class PresetTests(unittest.TestCase):
@@ -558,7 +634,7 @@ class LocalGitUpdateTests(unittest.TestCase):
         git(self.origin, 'init', '-b', 'tooling')
         git(self.origin, 'config', 'user.email', 'test@example.invalid')
         git(self.origin, 'config', 'user.name', 'Local test')
-        for name in ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py'):
+        for name in ('tpu.sh', 'tpu_control.py', 'tpu_worker.py', 'run_experiment.py', 'tpu_targets.py'):
             (self.origin / 'scripts').mkdir(exist_ok=True)
             shutil.copy2(SCRIPTS / name, self.origin / 'scripts' / name)
         shutil.copytree(SCRIPTS / 'presets', self.origin / 'scripts' / 'presets')

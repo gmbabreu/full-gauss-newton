@@ -1,0 +1,29 @@
+[Unit]
+Description=GFN Spot capacity watchdog (targets 3 and 4)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gfn-spot
+Group=gfn-spot
+StateDirectory=gfn-spot
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/gfn-spot
+ExecStart=/usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gfn-spot
+
+[Install]
+WantedBy=multi-user.target
