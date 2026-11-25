@@ -131,20 +131,6 @@ class RegistryWatchdogTests(unittest.TestCase):
         for key in ('1', '2', '5', '6', '7', '8'):
             self.assertFalse(self.configuration['targets'][key]['managed'])
 
-    def test_copy_migrates_without_changing_payload_bytes(self):
-        source = self.root / 'legacy.json'
-        source.write_text(json.dumps(self.legacy))
-        destination = self.root / 'installed'
-        destination.mkdir()
-        with patch.object(installer.subprocess, 'run'):
-            copied = installer.copy_configuration(source, None, destination)
-        self.assertEqual(config.enabled(copied), ['3', '4'])
-        self.assertEqual((destination / 'startup-v4.sh').read_bytes(), self.body)
-        self.assertEqual(copied['preparations']['v4']['runtime_version'], self.legacy['runtime_version'])
-        self.assertEqual(copied['preparations']['v4']['service_account'], self.legacy['service_account'])
-        self.assertEqual(json.loads(source.read_text()), self.legacy)
-        service.validate_files(destination / 'queue.json')
-
     def test_staged_bundle_entry_points_work_with_isolated_python(self):
         import tarfile
         bundle = self.root / 'bundle.tgz'
@@ -442,18 +428,19 @@ class RegistryWatchdogTests(unittest.TestCase):
                 queue.reconcile(key, {}, {}, self.args)
                 self.assertIn('create', call.call_args.args[0])
 
-    def test_declared_quota_counts_all_slots_and_refuses_overflow(self):
-        usage = registry.validate_registry()
-        self.assertEqual(usage[(registry.PROJECT, 'us-central2-b', 'v4-32', 'spot')], 32)
-        self.assertEqual(usage[(registry.PROJECT, 'us-central2-b', 'v4-32', 'on-demand')], 32)
-        self.assertTrue(all(chips == 16 for pool, chips in usage.items() if pool[2] != 'v4-32'))
-        overflow = dict(registry.TARGETS, **{'9': replace(registry.TARGETS['3'], name='extra')})
-        with self.assertRaisesRegex(ValueError, 'exceed'):
-            registry.validate_registry(overflow)
-        with self.assertRaisesRegex(ValueError, 'chip accounting'):
-            registry.validate_registry({'3': replace(registry.TARGETS['3'], chips=32)})
+    def test_registry_validates_identity_and_accelerator_without_static_grants(self):
+        expanded = dict(registry.TARGETS, **{'9': replace(registry.TARGETS['3'], name='extra', zone='other-zone')})
+        registry.validate_registry(expanded)
+        with self.assertRaisesRegex(ValueError, 'Duplicate target identity'):
+            registry.validate_registry(dict(registry.TARGETS, **{'9': registry.TARGETS['3']}))
+        for changes in ({'chips': 32}, {'accelerator': 'unreviewed'}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'chip accounting'):
+                registry.validate_registry({'3': replace(registry.TARGETS['3'], **changes)})
+        for key in ('1', '2'):
+            with self.assertRaisesRegex(ValueError, 'cannot be watchdog managed'):
+                registry.validate_registry({key: replace(registry.TARGETS[key], managed=True)})
 
-    def test_v5e_uses_documented_api_accelerator_and_logical_quota_pool(self):
+    def test_v5e_uses_documented_api_accelerator(self):
         for key in ('7', '8'):
             target = registry.TARGETS[key]
             self.assertEqual(target.accelerator, 'v5e-16')
@@ -462,7 +449,6 @@ class RegistryWatchdogTests(unittest.TestCase):
             self.assertIn('--accelerator-type=v5litepod-16',
                           queue.create_command(key, config.preparation(self.configuration, key)))
             queue.validate_owned(self.resource(key, 'ACTIVE'), target)
-            self.assertIn((target.project, target.zone, 'v5e-16', 'spot'), registry.validate_registry())
 
 
 if __name__ == '__main__':

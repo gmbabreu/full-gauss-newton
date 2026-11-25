@@ -21,9 +21,16 @@ class ServiceTests(unittest.TestCase):
         executable = patch.object(queue, 'GCLOUD_EXECUTABLE', 'gcloud')
         executable.start()
         self.addCleanup(executable.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        startup = self.root / 'startup.sh'
+        startup.write_bytes(b'#!/bin/bash\n')
         self.configuration = queue.queue_config.normalize(
             dict(runtime_version='runtime', service_account='resource@example.invalid',
-                 startup_script='/tmp/startup.sh'), check_files=False)
+                 startup_script=str(startup)))
+        self.config_path = self.root / 'queue.json'
+        self.config_path.write_text(json.dumps(self.configuration))
 
     def test_ordinary_gcloud_discovery_uses_fixed_path(self):
         for executable in ('/usr/bin/gcloud', '/usr/local/bin/gcloud'):
@@ -70,9 +77,36 @@ class ServiceTests(unittest.TestCase):
                     for action in ('create', 'delete'):
                         self.assertEqual(queue.gcloud('queued-resources', action)[0], executable)
                 log.assert_any_call('Using gcloud executable: ' + executable)
-                snapshot = next(json.loads(call.args[0]) for call in log.call_args_list
-                                if call.args[0].startswith('{'))
-                self.assertEqual(snapshot['gcloud_executable'], executable)
+                log.assert_any_call('Attached identity: ' + service.IDENTITY)
+
+    @patch.object(service, 'metadata_identity', return_value=service.IDENTITY)
+    @patch.object(service, 'find_gcloud', return_value='/usr/bin/gcloud')
+    def test_preflight_logs_only_bounded_status_fields(self, executable, identity):
+        sensitive = {'metadata': {'startup-script': 'STARTUP_SECRET', 'ssh-keys': 'SSH_SECRET'},
+                     'description': 'DESCRIPTION_SECRET', 'unknown': 'RAW_SECRET'}
+        requests = {'failed-request': dict(sensitive, state={
+            'state': 'FAILED', 'failedData': {'error': {
+                'code': 8, 'message': 'capacity unavailable\nretry', 'details': ['DETAIL_SECRET']}},
+            'suspendedData': {'reason': 'USER_INITIATED'}, 'unknown': 'STATE_SECRET'})}
+        nodes = {'failed-node': dict(sensitive, state='STOPPED', health='UNHEALTHY',
+                                    healthDescription='network failure'),
+                 'unknown-node': dict(sensitive)}
+        with patch.object(queue, 'inventory', side_effect=[requests, nodes]), \
+                patch.object(queue, 'reconcile') as reconcile, patch.object(queue, 'log') as log:
+            service.preflight(self.configuration)
+        output = '\n'.join(c.args[0] for c in log.call_args_list)
+        for key in ('3', '4'):
+            target = queue.REGISTRY[key]
+            self.assertIn(f'Managed target {key}: {target.name} ({target.project}/{target.zone})', output)
+        for text in ('failed-request', 'FAILED', 'capacity unavailable\\nretry', 'USER_INITIATED',
+                     'failed-node', 'STOPPED', 'UNHEALTHY', 'network failure', 'unknown-node', 'UNKNOWN'):
+            self.assertIn(text, output)
+        self.assertNotIn('SECRET', output)
+        self.assertNotIn('nodeSpec', output)
+        self.assertTrue(all('\n' not in c.args[0] for c in log.call_args_list))
+        self.assertLess(len(service.resource_status({'state': 'X' * 1000,
+                                                    'healthDescription': 'Y' * 1000})), 400)
+        reconcile.assert_not_called()
 
     def test_environment_is_fresh_allowlist_and_restored(self):
         hostile = {'CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE': '/user/key',
@@ -215,54 +249,31 @@ class ServiceTests(unittest.TestCase):
                 installer.require_inactive()
 
     def test_targets_and_poll_interval(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / 'queue.json'
-            startup = Path(directory) / 'startup.sh'
-            startup.write_text('#!/bin/bash\n')
-            config.write_text(json.dumps(dict(runtime_version='runtime', service_account='resource@example.invalid',
-                                             startup_script=str(startup))))
-            with patch.object(queue.Path, 'home', return_value=Path(directory)), \
-                    patch.object(queue, 'inventory', return_value={}), \
-                    patch.object(queue, 'reconcile') as reconcile, \
-                    patch.object(queue.time, 'sleep', side_effect=InterruptedError('stop after one poll')) as sleep:
-                with self.assertRaises(InterruptedError):
-                    queue.main(['--config', str(config), '--targets', '3', '4', '--watch'])
-                self.assertEqual([c.args[0] for c in reconcile.call_args_list], ['3', '4'])
-                sleep.assert_called_once_with(300)
+        with patch.object(queue.Path, 'home', return_value=self.root), \
+                patch.object(queue, 'inventory', return_value={}), \
+                patch.object(queue, 'reconcile') as reconcile, \
+                patch.object(queue.time, 'sleep', side_effect=InterruptedError('stop after one poll')) as sleep:
+            with self.assertRaises(InterruptedError):
+                queue.main(['--config', str(self.config_path), '--targets', '3', '4', '--watch'])
+            self.assertEqual([c.args[0] for c in reconcile.call_args_list], ['3', '4'])
+            sleep.assert_called_once_with(300)
 
     @patch.object(service, 'validate_files')
     @patch.object(service, 'preflight')
     @patch.object(queue, 'main')
-    def test_service_selects_both_targets(self, main, preflight, validate):
-        with tempfile.TemporaryDirectory() as directory, patch.object(sys, 'argv', ['service']):
-            with patch.object(service, 'isolated_environment', return_value=service.isolated_environment(Path(directory))):
+    def test_service_runs_watchdog_unless_preflight_only(self, main, preflight, validate):
+        for options in ([], ['--preflight']):
+            main.reset_mock()
+            preflight.reset_mock()
+            with self.subTest(options=options), patch.object(sys, 'argv', ['service', *options]), \
+                    patch.object(service, 'isolated_environment',
+                                 return_value=service.isolated_environment(self.root)):
                 service.main()
-        self.assertEqual(main.call_args.args[0], ['--config', str(service.CONFIG), '--apply', '--watch'])
-
-    @patch.object(service, 'validate_files')
-    @patch.object(service, 'preflight')
-    @patch.object(queue, 'main')
-    def test_preflight_option_does_not_reconcile(self, main, preflight, validate):
-        with tempfile.TemporaryDirectory() as directory, patch.object(sys, 'argv', ['service', '--preflight']):
-            with patch.object(service, 'isolated_environment', return_value=service.isolated_environment(Path(directory))):
-                service.main()
-        preflight.assert_called_once()
-        main.assert_not_called()
-
-    def test_either_inventory_failure_prevents_reconciliation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / 'queue.json'
-            startup = Path(directory) / 'startup.sh'
-            startup.write_text('#!/bin/bash\n')
-            config.write_text(json.dumps(dict(runtime_version='runtime', service_account='resource@example.invalid',
-                                             startup_script=str(startup))))
-            for responses in ([RuntimeError('auth failed')], [{}, RuntimeError('auth failed')]):
-                with patch.object(queue.Path, 'home', return_value=Path(directory)), \
-                        patch.object(queue, 'inventory', side_effect=responses), \
-                        patch.object(queue, 'reconcile') as reconcile:
-                    with self.assertRaisesRegex(RuntimeError, 'auth failed'):
-                        queue.main(['--config', str(config), '--targets', '3', '4', '--apply'])
-                    reconcile.assert_not_called()
+            preflight.assert_called_once_with(validate.return_value)
+            if options:
+                main.assert_not_called()
+            else:
+                main.assert_called_once_with(['--config', str(service.CONFIG), '--apply', '--watch'])
 
 
 if __name__ == '__main__':

@@ -100,16 +100,34 @@ def preflight(configuration):
     if actual != IDENTITY:
         raise ValueError(f'Attached identity mismatch: {actual!r}; expected {IDENTITY}')
     queue.GCLOUD_EXECUTABLE = find_gcloud()
+    queue.log('Attached identity: ' + actual)
     queue.log('Using gcloud executable: ' + queue.GCLOUD_EXECUTABLE)
     inventories = queue.collect_inventory(configuration)
-    # Full snapshots allow the operator to compare existing states at handoff.
-    queue.log(json.dumps({'identity': actual, 'gcloud_executable': queue.GCLOUD_EXECUTABLE,
-                         'managed_targets': queue.queue_config.enabled(configuration),
-                         'inventories': [dict(project=project, zone=zone,
-                                              queued_resources=requests, nodes=nodes)
-                                         for (project, zone), (requests, nodes) in inventories.items()]},
-                         sort_keys=True))
+    for key in queue.queue_config.enabled(configuration):
+        target = queue.REGISTRY[key]
+        queue.log(f'Managed target {key}: {target.name} ({target.project}/{target.zone})')
+    # Log only selected status fields, never node descriptions or nested payloads.
+    for (project, zone), (requests, nodes) in inventories.items():
+        queue.log(f'Inventory {project}/{zone}: {len(requests)} queued requests, {len(nodes)} nodes')
+        for kind, resources in (('queued request', requests), ('node', nodes)):
+            for name, resource in sorted(resources.items()):
+                queue.log(f'{kind} {name}: ' + resource_status(resource))
     queue.log('Read-only preflight passed; create/delete permissions are NOT verified')
+
+
+def resource_status(resource):
+    """Bounded, single-line status summary from an explicit field allowlist."""
+    state = resource.get('state', 'UNKNOWN')
+    reasons = []
+    if isinstance(state, dict):
+        error = state.get('failedData', {}).get('error', {})
+        reasons.extend((error.get('code'), error.get('message'),
+                        state.get('suspendedData', {}).get('reason')))
+        state = state.get('state', 'UNKNOWN')
+    reasons.extend((resource.get('health'), resource.get('healthDescription')))
+    fields = [f'state={json.dumps(str(state)[:80])}']
+    fields.extend('reason=' + json.dumps(str(reason)[:240]) for reason in reasons if reason is not None)
+    return ' '.join(fields)
 
 
 def main():

@@ -114,7 +114,7 @@ def main():
         with Path(args.output).open('x') as output:
             output.write(json.dumps(config, indent=2) + '\n')
     print('Managed targets: ' + ', '.join(enabled(config)))
-    print('Declared quota accounting passed; unknown project allocations are not included.')
+    print('Configuration validated; check live quota and headroom before activation.')
 
 
 if __name__ == '__main__':

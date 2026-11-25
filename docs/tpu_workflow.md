@@ -332,33 +332,13 @@ on epoch. None of these restrictions are relaxed by the tooling.
 
 ## Branch delivery and local validation
 
-Capacity watchdog operator report (2026-11-24): the independent v4-only systemd
-deployment on TPU1 worker 0 is enabled/running. Isolated attached-account auth and
-direct Snap gcloud passed the sandboxed preflight; failed requests 3–4 were
-deleted/recreated and both observed WAITING_FOR_RESOURCES under the legacy names
-`gn-v4-32-spot-1`/`gn-v4-32-spot-2`. The us-central2
-external IP quota is now reported as 16. Allocated-worker startup, training
-readiness and reboot survival remain untested.
-
-The registry/version-2 update on `codex/watchdog-service-account`, continuing
-from `2b308b4`, is **pending operator deployment**. It preserves 1–2 identities,
-migrates captured v4 settings/bytes to managed 3–4 and leaves 5–8 disabled.
-New-generation runtime/topology/data/IAM/quota compatibility remains pending
-per target/location; no trainer, optimizer, experiment or dependency version is
-changed. See [safe installation/update and staged activation](../scripts/tpu/DEPLOYMENT.md).
-All Spot targets use names ending in their controller IDs. Targets 3–4 now map
-to `gn-v4-32-spot-3`/`gn-v4-32-spot-4`; either legacy request or node blocks
-management of both renamed targets before any poll mutation. Preflight reports
-the conflict for stopped-service operator resolution; no legacy cleanup or
-duplicate replacement is automatic. Targets 1–2 remain unchanged.
-New Spot nodes add the informational `gfn-target=ID` label
-alongside `managed-by`; legacy ownership does not require the new label.
-Updating Git does not update `/opt/gfn-spot` or its existing cloud requests.
-Before controller replacement, record descendants, verify parent and all cloud
-subprocess exits, and resolve in-flight mutations from fresh inventory. Parent
-exit alone is insufficient. The file lock does not coordinate hosts; monitoring
-depends on TPU1 availability. No deployment, IAM change, cloud mutation or
-training launch was performed by this implementation.
+The watchdog update on `codex/watchdog-service-account` is **pending operator
+deployment**. It preserves captured v4 runtime/account/startup bytes, routes
+3–4 to `gn-v4-32-spot-3`/`gn-v4-32-spot-4` with legacy-name conflict guards,
+and leaves 5–8 disabled. The deployed copy still uses legacy names. See the
+[target/configuration reference](../scripts/tpu/README.md) and
+[operator installation, handoff and rollback procedure](../scripts/tpu/DEPLOYMENT.md).
+Updating Git does not change the installed service or cloud resources.
 
 The implementation is committed on `codex/tpu-workflow` from `origin/main`, then
 cherry-picked onto `codex/tpu-workflow-epoch` from `origin/epoch`. Open separate PRs

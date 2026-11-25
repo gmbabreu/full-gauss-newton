@@ -1,17 +1,23 @@
-# Operator installation, update and rollback
+# Watchdog installation, update and rollback
 
-These are **operator commands**, not actions performed by this implementation.
-The currently running independent TPU1 service uses the legacy v4 Spot names.
-The installer leaves cloud resources and the trainer checkout untouched; the
-3–4 name cutover requires the stopped-service resolution below. This update remains pending until you
-perform and confirm it. Never run capture_setup.py, startup.sh, pip or training
-setup on TPU1 during this procedure. No command below modifies
-`/full-gauss-newton` on TPU1.
+These commands are for the operator; deployment of this branch remains pending.
+Use TPU1 (`gn-v4-32`), worker 0. The service uses its attached account
+`598447672993-compute@developer.gserviceaccount.com`, a fresh isolated gcloud
+configuration and an allowlisted environment. Cached user credentials, inherited
+credential/token/impersonation settings, interactive login and downloaded keys
+are excluded. Ordinary gcloud installations on the fixed system PATH take priority
+over direct `/snap/google-cloud-cli/current/bin/gcloud`.
 
-## Stage the reviewed source while the old service remains active
+The independent `/opt/gfn-spot` copy runs as unprivileged `gfn-spot`, with writable
+state/config storage in `/var/lib/gfn-spot`, journal logging, a 60-second failure
+restart and the existing systemd sandbox. Installation leaves it stopped and
+disabled. Do not run setup/capture, install training dependencies or modify
+`/full-gauss-newton` on TPU1. Bash, Python 3.10+ with zoneinfo/tzdata, systemd and
+gcloud must already be available.
 
-On a workstation, from a separate clean checkout of the reviewed commit on
-`codex/watchdog-service-account` (eventually the reviewed merged revision):
+## Prepare the candidate
+
+From a clean separate workstation checkout of the reviewed revision:
 
 ```bash
 git status --short
@@ -26,135 +32,161 @@ gcloud compute tpus tpu-vm ssh ga2740@gn-v4-32 \
   --project=fast-second-order --zone=us-central2-b --worker=0
 ```
 
-In that TPU1 worker-0 shell, retain these shell variables for subsequent steps.
-The archive retains the source layout so the installer finds the shared registry.
-Existing Bash, Python 3.10+/zoneinfo/tzdata, systemd and a supported gcloud
-installation are prerequisites. No packages are installed here.
+In that worker-0 shell, retain these variables for the procedure:
 
 ```bash
 umask 077
-sha256sum /tmp/gfn-watchdog-update.tgz  # compare with workstation
+sha256sum /tmp/gfn-watchdog-update.tgz # compare with workstation
 STAGE=$(mktemp -d /tmp/gfn-watchdog-update.XXXXXXXX)
 mkdir "$STAGE/code"
 tar -xzf /tmp/gfn-watchdog-update.tgz -C "$STAGE/code"
+SOURCE_CONFIG=/var/lib/gfn-spot/queue.json
+# Initial installation: stage the existing prepared queue.json and payloads here
+# instead; preserve their runtime/account and use actual local payload paths.
 sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" \
-  --config /var/lib/gfn-spot/queue.json --output "$STAGE/queue-v2.json"
-# Expect exactly: Managed targets: 3, 4. This command makes no cloud calls.
-sudo cat "$STAGE/queue-v2.json"
+  --config "$SOURCE_CONFIG" --output "$STAGE/queue-v2.json"
 NEXT_CONFIG="$STAGE/queue-v2.json"
+sudo cat "$NEXT_CONFIG"
 ```
 
-Legacy runtime/account values and startup path are copied without inference.
-Configuration migration does not change startup bytes or cloud resources, and 5–8 remain
-disabled. The entire new config is validated locally, including declared quota
-pools. Read/list IAM and scopes for the current location have been operator
-validated; review additional locations separately before enabling them.
+Legacy input enables only 3–4 and leaves 5–8 disabled. For relocated inputs use
+the installer's `--payload-dir DIR` (unique source basenames), or
+`--startup-script SOURCE` for legacy input only. Enabled payloads must exist.
+Perform staging, local validation and read-only inventory checks while the old
+controller remains active; do not install over an active service.
 
-## Stop and verify every old process before installation
+## Review permissions and readiness
 
-First follow [the process recording and exit procedure](TROUBLESHOOTING.md#record-processes-and-verify-exit)
-in this same shell. It records MainPID, all descendants and their identities
-**before** stopping or pausing the parent. Inspect and disable any watchdog
-relaunch outside this unit too; a timer, cron entry, supervisor or box248
-controller must not overlap. For the service, after recording descendants:
+Before activation, verify live accelerator and regional IP quota/headroom,
+including other project allocations; the [supplied quotas](README.md#configuration)
+are not enforced or queried by this code. Check metadata identity, OAuth scopes
+and effective IAM allow/deny policies/conditions in every managed location.
+List access proves only read permission. Separately evaluate the actual
+[queuedResources.create](https://docs.cloud.google.com/tpu/docs/reference/rest/v2/projects.locations.queuedResources/create)
+(`tpu.nodes.create`) and
+[queuedResources.delete](https://docs.cloud.google.com/tpu/docs/reference/rest/v2/projects.locations.queuedResources/delete)
+(`tpu.nodes.delete`) operations and `iam.serviceAccounts.actAs` on the captured
+resource account, using read-only policy evaluation rather than test mutations.
+
+For each newly enabled generation/location, review supported runtime, exact
+dependency closure and secret-free startup payload separately. Verify the resource
+account's data/checkpoint/secret reads and output writes. After allocation,
+confirm setup completion on every discovered worker and separately validate
+environment/topology before manual training. ACTIVE is not training readiness.
+No new-generation runtime, package closure or mesh is assumed by this repository.
+
+## Record processes and verify exit
+
+Before any update, rollback or host handoff, save the old controller's exact
+command, config, working directory and relaunch settings. A local file lock
+does not coordinate hosts or different users. Inventory systemd user/system
+units/timers, cron, supervisor/container wrappers and any old box248 watchdog;
+disable only the mechanisms actually identified as belonging to this controller.
+Never stop training or signal a broad Python/gcloud process group.
+
+On TPU1 worker 0, record the service parent and descendants **before** stopping
+anything. Use the recorded PID file instead only for a separately verified
+nohup controller. Confirm the PID's start time, owner and command before signals:
 
 ```bash
+OLD_PID=$(systemctl show gfn-spot-watchdog.service -p MainPID --value)
+sudo ps -p "$OLD_PID" -o user,pid,ppid,pgid,sid,lstart,args
+HANDOFF=$(mktemp -d "$HOME/gfn-handoff.XXXXXXXX")
+sudo pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-before.txt"
+sudo ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-before.txt"
+# Only after verifying OLD_PID is this controller, freeze it to prevent new polls.
+sudo kill -STOP "$OLD_PID"
+sudo pstree -alp "$OLD_PID" | tee "$HANDOFF/tree-paused.txt"
+sudo ps -eo user,pid,ppid,pgid,sid,lstart,args > "$HANDOFF/processes-paused.txt"
+```
+
+The refreshed tree captures children launched between the first snapshot and
+pause. Record **all descendant processes**, including gcloud's Python entry
+point, wrappers, and their children; do not mistake pstree thread IDs in braces
+for process PIDs. Record start times and commands and continue tracking any
+further descendants. Reparenting after parent exit does not mean a cloud command
+finished. If observation is incomplete or ownership is uncertain, block handoff.
+
+```bash
+OLD_DESCENDANT_PIDS=()  # fill with the verified process PIDs from BOTH saved trees
+OLD_ALL_PIDS=("$OLD_PID" "${OLD_DESCENDANT_PIDS[@]}")
+OLD_PID_LIST=$(IFS=,; echo "${OLD_ALL_PIDS[*]}")
+printf '%s\n' "${OLD_ALL_PIDS[@]}" > "$HANDOFF/pids.txt"
+sudo ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args \
+  | tee "$HANDOFF/identified-processes.txt"
 sudo systemctl disable --now gfn-spot-watchdog.service
-sudo systemctl is-active gfn-spot-watchdog.service   # inactive; expected exit 3
-sudo systemctl is-enabled gfn-spot-watchdog.service  # disabled; expected exit 1
+WAIT_ARGS=()
+for pid in "${OLD_ALL_PIDS[@]}"; do WAIT_ARGS+=(--pid="$pid"); done
+timeout 240 tail "${WAIT_ARGS[@]}" -f /dev/null
+sudo ps -p "$OLD_PID_LIST" -o user,pid,ppid,pgid,sid,lstart,args
+# Expected: header only, no recorded process remains (ps exits 1).
 sudo systemctl show gfn-spot-watchdog.service -p MainPID -p SubState -p ControlGroup
+sudo systemctl status --no-pager gfn-spot-watchdog.service
+pgrep -af '/opt/gfn-spot/[w]atchdog_service.py'
 ```
 
-Require MainPID=0, inactive/disabled state, an empty service cgroup, **and verified
-exit of all recorded descendants**, including reparented gcloud/Python commands.
-Parent exit alone is insufficient. Do not use broad process kills. A timeout,
-unreadable process tree or ambiguous process identity blocks the update.
+Require inactive/disabled state, MainPID=0, no remaining recorded process or
+later descendant, and an empty service cgroup. A parent PID exiting alone is
+insufficient. A timeout is a blocked handoff, not permission to proceed. If a
+recorded PID was reused, inspect its saved identity; never kill it solely because
+the number matches. Prefer letting commands finish; investigate stuck commands
+individually using verified identities, not broad kills. Do not kill trainers.
 
-If a create/delete was in flight, follow [operation resolution](TROUBLESHOOTING.md#resolve-in-flight-mutations).
-Fresh queued-resource/node inventory and operation status must resolve its
-outcome before activation. Do not let a new controller determine an old
-mutation's outcome by reconciling. The local file lock does not coordinate hosts.
+For a verified **nohup** parent, disable its actual configured relaunch first.
+After the same snapshots/pause, replace the systemctl stop above with
+`kill -TERM "$OLD_PID"` followed by `kill -CONT "$OLD_PID"` (sudo if needed).
+TERM must be pending before resuming a paused controller. Perform the same wait
+and descendant checks. For a manager, stop only its identified unit; also disable
+its identified dedicated timer if any. For cron, edit only that watchdog entry.
+If aborting before any termination was requested, explicitly decide whether to
+resume the verified old controller; do not leave it paused unintentionally or
+start another controller while it can resume.
 
-## Back up the stopped installed copy, then install
+## Resolve in-flight mutations
 
-After process exit, preserve old code/unit/config/payloads, not gcloud token
-storage. The archives include only the explicit files below. Keep a new backup
-per update and retain its path. They contain no downloaded service-account keys;
-prepared payloads must remain secret-free.
+Review saved cloud-command arguments and the journal at shutdown:
 
 ```bash
-BACKUP="$HOME/gfn-watchdog-backups/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$BACKUP"
-sudo tar -czpf "$BACKUP/code.tgz" -C /opt/gfn-spot .
-sudo cp -p /etc/systemd/system/gfn-spot-watchdog.service "$BACKUP/unit.service"
-sudo bash -c 'cd /var/lib/gfn-spot && tar -czpf "$1/state.tgz" queue.json startup*.sh' _ "$BACKUP"
-sudo chmod 600 "$BACKUP/code.tgz" "$BACKUP/unit.service" "$BACKUP/state.tgz"
 sudo journalctl -u gfn-spot-watchdog.service -n 200 --no-pager \
-  | tee "$BACKUP/journal-before.txt"
-sudo /usr/bin/python3 -I "$STAGE/code/tpu/install_watchdog.py" --config "$NEXT_CONFIG"
-sudo systemctl is-active gfn-spot-watchdog.service   # inactive
-sudo systemctl is-enabled gfn-spot-watchdog.service  # disabled
-sudo stat -c '%U:%G %a %n' /opt/gfn-spot /opt/gfn-spot/*.py /var/lib/gfn-spot
-sudo bash -c 'stat -c "%U:%G %a %n" /var/lib/gfn-spot/queue.json /var/lib/gfn-spot/startup*.sh'
+  | tee "$HANDOFF/journal-shutdown.txt"
 ```
 
-The installer refuses an active/enabled unit and leaves it stopped/disabled.
-It copies every runtime module (`spot_queue`, `watchdog_service`, `queue_config`,
-`tpu_targets`) into `/opt/gfn-spot`; it never updates a training checkout.
-Code is root:root 755/644, state is gfn-spot:gfn-spot 700, config and copied
-payloads are root:gfn-spot 640. Startup syntax and service-user readability are
-checked without executing startup. The legacy payload becomes
-`/var/lib/gfn-spot/startup-v4.sh`, with exact bytes retained.
-
-For the initial legacy migration, compare old/new payload hashes:
+If create/delete was in flight or its outcome is uncertain, local command exit
+is still insufficient: asynchronous API work may continue server-side. After
+every old local process exits, obtain **fresh** queued-resource and node
+inventories for each affected registry location. Use these read-only commands for each affected location:
 
 ```bash
-sudo bash -c 'tar -xzOf "$1/state.tgz" startup.sh | sha256sum' _ "$BACKUP"
-sudo sha256sum /var/lib/gfn-spot/startup-v4.sh
+# Set to the affected registry location; repeat for each affected location.
+: "${PROJECT:?}" "${ZONE:?}"
+gcloud compute tpus queued-resources list --project="$PROJECT" --zone="$ZONE" --format=json
+gcloud compute tpus tpu-vm list --project="$PROJECT" --zone="$ZONE" --format=json
 ```
 
-On later v2 updates, compare `startup-v4.sh` from the archive instead. Do not
-proceed if runtime/account, ownership labels, resource names or payload bytes for
-3–4 unexpectedly differ, except the explicitly reviewed request/node name changes
-from `gn-v4-32-spot-1`/`gn-v4-32-spot-2` to
-`gn-v4-32-spot-3`/`gn-v4-32-spot-4`. `--startup-script SOURCE` is supported only as a legacy
-source-path override. For off-host v2 configs, `--payload-dir DIR` reads payloads
-by their unique source basenames; ambiguous basenames or missing enabled
-payloads fail validation. Keep generated configs/payloads outside Git.
+Correlate the affected request/node with the original API operation and inspect
+its status/errors (Cloud Console/audit record or the read-only Cloud TPU
+operations API). Record resource/operation identities and resolved outcome in
+`$HANDOFF`. Confirm accepted creation, confirmed deletion with no node, or an
+understood completed failure; a stable accepted pending capacity request is not
+permission to reset its wait. A still-running/ambiguous operation, failed reads,
+one absent snapshot, or an `APPLY` log line is insufficient. Repeat read-only
+checks until resolved, then take a new preflight snapshot before activation.
+Do not create/delete requests merely to settle handoff uncertainty.
 
 ## Resolve the Spot resource name migration with the service stopped
 
-Keep the service **stopped and disabled**, and keep every old controller and
-relaunch mechanism stopped. Complete the process recording/exit and in-flight
-operation checks above before resolving capacity. The new registry routes ID 3
-to `gn-v4-32-spot-3` and ID 4 to `gn-v4-32-spot-4`; numeric commands no longer
-address the old names. Targets 1–2 are unchanged. Existing cloud resources retain
-their old names until explicitly retired by the operator; changing labels or
-descriptions does not complete this migration.
+After the handoff checks, keep all controllers/relaunch mechanisms stopped.
+Numeric 3–4 now route to `gn-v4-32-spot-3`/`gn-v4-32-spot-4`; 1–2 are unchanged.
+Either legacy `gn-v4-32-spot-1` or `gn-v4-32-spot-2` request or node, in any state
+and regardless of labels, blocks both renamed targets in preflight and the
+entire poll before mutations. Inspect old and new names with the inventory
+commands above. The watchdog never deletes/adopts legacy resources or chooses
+which capacity to retain when old and new names coexist.
 
-Take fresh read-only inventories in the affected location, inspecting **both old
-and new names**, existing nodes, ownership, states and operation outcomes:
-
-```bash
-set -o pipefail
-gcloud compute tpus queued-resources list --project=fast-second-order \
-  --zone=us-central2-b --format=json | tee "$BACKUP/requests-name-migration.json" || exit 1
-gcloud compute tpus tpu-vm list --project=fast-second-order \
-  --zone=us-central2-b --format=json | tee "$BACKUP/nodes-name-migration.json" || exit 1
-```
-
-Any `gn-v4-32-spot-1` **or** `gn-v4-32-spot-2` queued request **or** node is a
-conflict for **both** renamed targets. The new service refuses reconciliation
-before any mutation in any location when managing either 3 or 4, and preflight
-reports every conflicting name/kind for operator resolution. FAILED, SUSPENDED,
-pending, ACTIVE, DELETING and unknown states all count as present. It never
-deletes a legacy request or creates replacement capacity to resolve this.
-
-Choose the legacy resources' disposition yourself. Retain any needed workload or
-capacity until its planned retirement; do not stop training or cancel a pending
-wait merely to bypass the guard. If retaining either legacy resource, leave the
-service disabled, or explicitly disable management of **both 3 and 4** in a
-reviewed local configuration before installing/activating independent locations:
+Choose retention or retirement explicitly. Keep needed workloads/capacity until
+their planned retirement. If retaining either legacy resource, leave the service
+disabled or disable **both 3 and 4** in the candidate before managing independent
+locations:
 
 ```bash
 sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" --config "$NEXT_CONFIG" \
@@ -164,41 +196,50 @@ sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" --config "$STAGE/queue-d
 NEXT_CONFIG="$STAGE/queue-disable34.json"
 ```
 
-If choosing this option after installation, reinstall the candidate while the
-service remains stopped/disabled. It does not delete or adopt legacy capacity;
-inspect that capacity using its explicit old names rather than numeric 3–4.
+Retirement is a separate operator decision, not part of installation. Never force
+delete a request with a node. Before managing renamed 3–4, require both legacy
+names absent from both successful fresh inventories and completed operation
+outcomes. Relabeling does not resolve the guard; retiring a pending request loses
+its queue position. Inspect legacy resources by explicit name, not numeric 3–4.
 
-If you choose retirement, handle existing nodes/workloads through your approved
-operator workflow; the update provides no automatic node cleanup. For a legacy
-request whose ownership has been verified and which has **no node**, an operator
-may explicitly retire that one request after reviewing the inventories above:
+## Back up and install the stopped copy
+
+For updates, save the existing code, unit, config and payloads after handoff.
+For first installation, retain the prepared inputs and recorded old host command
+instead of trying to archive nonexistent installed files.
 
 ```bash
-LEGACY_NAME=gn-v4-32-spot-1  # select ONE reviewed legacy request; never loop blindly
-# Run only after verifying ownership, no node and the decision to retire this request:
-gcloud compute tpus queued-resources delete "$LEGACY_NAME" --project=fast-second-order \
-  --zone=us-central2-b --async
+BACKUP="$HOME/gfn-watchdog-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP"
+# Existing installations only:
+sudo tar -czpf "$BACKUP/code.tgz" -C /opt/gfn-spot .
+sudo cp -p /etc/systemd/system/gfn-spot-watchdog.service "$BACKUP/unit.service"
+sudo bash -c 'cd /var/lib/gfn-spot && tar -czpf "$1/state.tgz" queue.json startup*.sh' _ "$BACKUP"
+sudo chmod 600 "$BACKUP/code.tgz" "$BACKUP/unit.service" "$BACKUP/state.tgz"
 ```
 
-Do not add `--force`. Inspect the asynchronous operation's status/errors and
-repeat fresh inventories after completion; local command exit or DELETING is
-insufficient. Review the second legacy request separately. **Before enabling
-3–4, both legacy names must be absent from both successful fresh inventories**,
-and all ambiguous in-flight operations must be resolved. If new-name resources
-already coexist with old-name ones, inspect all of them under this stopped-service
-procedure; the watchdog will not choose which to delete.
+Use the same installation command for initial deployment and updates:
 
-Then rerun service preflight below with the intended 3–4-enabled config. A
-conflict or inventory/auth error means stop and keep the service disabled. After
-clear preflight and explicit activation, absent new-name requests may be created
-normally, using the same captured runtime/account/startup bytes and ownership
-label, plus identifying `gfn-target=3`/`4`. No claim of preserved queue position
-is made when the operator retires an old request and starts a new identity.
+```bash
+sudo /usr/bin/python3 -I "$STAGE/code/tpu/install_watchdog.py" --config "$NEXT_CONFIG"
+sudo systemctl is-active gfn-spot-watchdog.service   # inactive
+sudo systemctl is-enabled gfn-spot-watchdog.service  # disabled
+sudo stat -c '%U:%G %a %n' /opt/gfn-spot /opt/gfn-spot/*.py /var/lib/gfn-spot
+sudo bash -c 'stat -c "%U:%G %a %n" /var/lib/gfn-spot/queue.json /var/lib/gfn-spot/startup*.sh'
+```
 
-## Read-only preflight, review, then separate activation
+The installer refuses an active/enabled unit. Code is root:root 755/644, state
+gfn-spot:gfn-spot 700, config/payloads root:gfn-spot 640. It checks startup syntax
+and service-user readability without executing startup. Compare runtime/account
+and payload hashes with the source/backup; only the installed absolute path
+changes (legacy payload becomes `startup-v4.sh`).
 
-Run preflight after installation, before activation; the same isolated identity,
-gcloud discovery and environment are used by the service:
+## Read-only preflight and separate activation
+
+Preflight uses the service's isolated authentication environment and reads both
+resource kinds in every managed location. Before stopping the old controller,
+the read-only inventory commands above can establish a comparison baseline;
+after installation run the new preflight while the unit remains disabled:
 
 ```bash
 set -o pipefail
@@ -206,84 +247,36 @@ sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
   --preflight | tee "$HOME/gfn-preflight-handoff.log" || { echo 'STOP: preflight failed'; exit 1; }
 ```
 
-For the first update, expect managed targets **3, 4** and only us-central2-b.
-Compare fresh inventory with the stopped controller's final logs/snapshot;
-preserve existing **new-name** pending requests and targets 1–2. The name-migration
-guard must confirm no legacy requests/nodes remain before managing 3–4. If both
-were deliberately disabled, expect only the separately enabled targets/locations.
-Resolve all previously
-in-flight mutations before proceeding; repeat preflight after resolution.
-List access does not prove create/delete/actAs permission. Confirm the attached
-identity, permissions/scopes, resource settings and regional IP headroom using
-[the readiness checklist](TROUBLESHOOTING.md#generation-readiness-and-permissions).
-
-Only after every gate above has passed, run this **separate activation block**:
+Check identity, selected executable, managed IDs/locations and resource states.
+Expect 3–4 only for an unchanged legacy config; compare fresh states with the
+handoff baseline. Resolve errors/conflicts before proceeding. Only after all
+checks pass, activate separately:
 
 ```bash
 sudo systemctl enable --now gfn-spot-watchdog.service
 sudo systemctl status --no-pager gfn-spot-watchdog.service
 sudo systemctl show gfn-spot-watchdog.service -p MainPID -p SubState -p NRestarts
 sudo journalctl -u gfn-spot-watchdog.service -n 100 --no-pager
-sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py \
-  --preflight | tee "$HOME/gfn-preflight-after.log"
+sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py --preflight
 ```
 
-The unit retains its sandbox, unprivileged user, journal logs, 60-second failure
-restart and enabled reboot startup. Verify unchanged existing request/node
-states. Legitimate asynchronous transitions may occur, but pending/active states
-must not be reset by this update. Reboot survival requires a separately approved
-maintenance window; after that reboot inspect `systemctl status` and
-`sudo journalctl -b -u gfn-spot-watchdog.service --no-pager`. Do not reboot a
-training host merely to test this implementation.
+Verify existing pending/active requests were not reset and targets 1–2 remain
+unchanged; account for legitimate asynchronous state transitions. Enabled units
+start after reboot, but reboot survival requires operator validation in a planned
+maintenance window, followed by status and `journalctl -b`. Monitoring depends
+on TPU1 availability.
 
-## Stage 2: validate and enable target 5 only
+## Enable or disable one additional target
 
-First keep 3–4 running through the v2 migration and verify them. Separately
-complete all generation-readiness checks for v6e in us-east1-d. The current v4
-runtime/closure is **not** evidence of v6e compatibility. On worker 0, stage the
-operator-reviewed secret-free payload outside `/full-gauss-newton`, then supply
-the verified values (no values are invented here):
+Targets 5–8 stay disabled until explicitly reviewed. Select one row from the
+[target table](README.md), supply that location's reviewed preparation, and use
+this parameterized example (not a loop):
 
 ```bash
-: "${V6E_RUNTIME:?set verified runtime}" "${V6E_RESOURCE_SA:?set reviewed resource identity}"
-: "${V6E_STARTUP:?absolute path to separately prepared v6e startup payload}"
-sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" \
-  --config /var/lib/gfn-spot/queue.json --output "$STAGE/queue-enable5.json" \
-  --enable 5 --preparation v6e-us --accelerator-type v6e-16 \
-  --runtime-version "$V6E_RUNTIME" --service-account "$V6E_RESOURCE_SA" \
-  --startup-script "$V6E_STARTUP"
-NEXT_CONFIG="$STAGE/queue-enable5.json"
-```
-
-This writes a local candidate only. Expect managed targets **3, 4, 5**; 6–8 stay
-disabled. Repeat the complete record/stop/exit/operation-resolution/backup/install
-sequence above with this `NEXT_CONFIG`, and a new backup. Preflight now must
-successfully list both inventories in us-central2-b **and** us-east1-d. Only then
-use the separate activation block. Activation authorizes capacity requests for
-5 when absent; it does not launch experiments. Validate every allocated worker
-before any manual training command.
-
-## Stage 3: validate 6, 7 and 8 separately
-
-After 5 is validated, review one target/location at a time. For each, create a
-new config with `queue_config.py --enable ID --preparation NAME` and all four
-explicit preparation fields as above. For 6 use a separately reviewed
-`v6e-europe` preparation (`v6e-16`, europe-west4-a); for 7 use `v5e-us`
-(`v5e-16`, us-central1-a); for 8 use `v5e-europe` (`v5e-16`, europe-west4-b).
-Verify supported runtime and headroom in each location even when sharing a
-generation. Repeat safe update, backup, preflight and explicit activation for
-each stage. Do not enable all 6–8 merely because quota is declared.
-
-For each separately reviewed stage, set these variables for **one** target
-only, supply that target's reviewed runtime/account/payload, and generate its
-candidate (do not run this as a loop):
-
-```bash
-# Stage 6: TARGET_ID=6; PREP_NAME=v6e-europe; ACCELERATOR=v6e-16
-# Later stage 7: TARGET_ID=7; PREP_NAME=v5e-us; ACCELERATOR=v5e-16
-# Later stage 8: TARGET_ID=8; PREP_NAME=v5e-europe; ACCELERATOR=v5e-16
-: "${TARGET_ID:?}" "${PREP_NAME:?}" "${ACCELERATOR:?}"
-: "${RUNTIME:?reviewed per location}" "${RESOURCE_SA:?}" "${STARTUP:?absolute prepared path}"
+TARGET_ID=5
+PREP_NAME=v6e-us
+ACCELERATOR=v6e-16
+: "${RUNTIME:?reviewed runtime}" "${RESOURCE_SA:?}" "${STARTUP:?absolute prepared path}"
 NEXT_CONFIG="$STAGE/queue-enable${TARGET_ID}.json"
 sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" \
   --config /var/lib/gfn-spot/queue.json --output "$NEXT_CONFIG" \
@@ -291,32 +284,23 @@ sudo /usr/bin/python3 "$STAGE/code/tpu/queue_config.py" \
   --runtime-version "$RUNTIME" --service-account "$RESOURCE_SA" --startup-script "$STARTUP"
 ```
 
-Then repeat the full stopped-service update and separate activation using this
-candidate. Existing enabled targets and their preparations remain in the input.
+Repeat the same readiness, handoff, backup, installation, preflight and activation
+procedure with this candidate. To disable instead, use `--disable ID --output NEW`.
+Disabling does not remove resources or stop charges. Activation can create absent
+managed capacity but never launches or resumes experiments.
 
-To stop future management while leaving resources untouched, generate a
-candidate with `--disable ID --output NEW`, then perform the same safe update.
-Disabling does not delete a request/node or stop charges. Manual numeric control
-remains available. No automatic experiment resume is provided.
+## Rollback
 
-## Rollback to the saved controller
+Apply the same process/operation handoff checks to the new controller before
+restoring anything. If TPU1 is unreachable, establish that it cannot run before
+starting another controller. Older code has no reverse-name guard: before
+restoring old-name 3–4 management, both new `spot-3`/`spot-4` requests and nodes
+must be absent from fresh inventory. Otherwise leave old management disabled or
+use a compatible config with both 3–4 unmanaged; disposition is operator-controlled.
 
-Record the **new** controller and descendants before stopping, disable/stop it,
-and verify all exits and server-side mutation outcomes as above. If TPU1 is
-unreachable, establish that it cannot run before starting another controller.
-No simultaneous controllers are permitted, including box248. When restoring a
-controller that uses the **old** 3–4 names, also verify that both **new** names
-`gn-v4-32-spot-3` and `gn-v4-32-spot-4` are absent from fresh request and node
-inventories before enabling management of 3–4. Older code lacks the reverse-name
-guard and could create duplicate capacity. If retaining new-name capacity, keep
-3–4 unmanaged using a compatible reviewed config or leave the old service
-disabled. Resolve new-name resource disposition manually; do not delete it
-automatically as part of rollback. Then restore the
-saved files from the selected backup; do not delete any cloud resources:
+After verified handoff, restore the selected stopped backup:
 
 ```bash
-sudo systemctl disable --now gfn-spot-watchdog.service
-# STOP HERE until recorded parent/descendant exits and mutation outcomes are verified.
 sudo tar -xzpf "$BACKUP/code.tgz" -C /opt/gfn-spot
 sudo tar -xzpf "$BACKUP/state.tgz" -C /var/lib/gfn-spot
 sudo install -o root -g root -m 644 "$BACKUP/unit.service" /etc/systemd/system/gfn-spot-watchdog.service
@@ -325,11 +309,31 @@ sudo systemctl daemon-reload
 sudo -u gfn-spot /usr/bin/python3 -I -u /opt/gfn-spot/watchdog_service.py --preflight
 ```
 
-Review the restored config and fresh inventories before separately enabling and
-starting it with the activation block. Extra new runtime modules/payload files
-can remain unused; no recursive cleanup is necessary. Rolling back to the
-v4-only config leaves any already-created 5–8 resources untouched and unmanaged;
-inspect them manually. If restoring box248 instead, keep the TPU1 unit disabled
-and restore only the recorded old command/config/relaunch mechanism after
-verified TPU1 subprocess exit and resolved mutations. Do not launch nohup in
-addition to a restored manager.
+Review restored settings/states before the separate activation block. Rolling
+back to v4-only leaves any 5–8 capacity unmanaged. To restore box248 instead,
+leave TPU1 disabled and restart only the recorded old command/manager/config
+after the same handoff gates; do not add nohup alongside a manager.
+
+## Troubleshooting and local validation
+
+- **Identity/executable failure:** check attached identity and fixed-path gcloud
+  installation. Do not weaken the sandbox or pass user credential overrides.
+- **Inventory failure:** inspect IAM/scopes/API errors; the entire poll fails
+  before reconciliation and systemd retries after 60 seconds. Errors never mean
+  absent capacity.
+- **Naming conflict:** use the stopped-service migration above.
+- **Repeated terminal failures:** inspect operation/runtime/setup errors and
+  ownership. An existing node prevents deletion; force is never used.
+- **Helper mismatch:** bootstrap the reviewed matching helpers, including the
+  registry, on clean idle workers; do not reset active training checkouts.
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+bash -n scripts/tpu/setup_vm.sh
+bash -n scripts/tpu.sh
+systemd-analyze verify scripts/tpu/gfn-spot-watchdog.service
+git diff --check
+```
+
+Local CPU/mock checks do not validate live IAM, quota, provisioning, runtime,
+training readiness or reboot behavior. Those require operator validation.

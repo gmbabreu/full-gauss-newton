@@ -1,4 +1,4 @@
-"""Authoritative TPU identities and declared quota pools (no cloud access)."""
+"""Authoritative TPU identities (no cloud access or quota enforcement)."""
 from dataclasses import dataclass
 
 PROJECT = 'fast-second-order'
@@ -34,21 +34,12 @@ TARGETS = {
 }
 # Historical identities are conflict sentinels, never additional managed targets.
 LEGACY_SPOT_NAMES = {'3': 'gn-v4-32-spot-1', '4': 'gn-v4-32-spot-2'}
-# Project, zone, accelerator, allocation -> supplied TRC chips, not device counts.
-QUOTA_POOLS = {
-    (PROJECT, 'us-central2-b', 'v4-32', 'on-demand'): 32,
-    (PROJECT, 'us-central2-b', 'v4-32', 'spot'): 32,
-    (PROJECT, 'us-east1-d', 'v6e-16', 'spot'): 64,
-    (PROJECT, 'europe-west4-a', 'v6e-16', 'spot'): 64,
-    (PROJECT, 'us-central1-a', 'v5e-16', 'spot'): 64,
-    (PROJECT, 'europe-west4-b', 'v5e-16', 'spot'): 64,
-}
 
 
 def validate_registry(targets=None):
-    """Count every declared slot, including disabled targets; not live usage."""
+    """Validate identities and supported accelerators; operators check live quota."""
     targets = TARGETS if targets is None else targets
-    usage, identities = {}, set()
+    identities = set()
     for key, target in targets.items():
         identity = (target.project, target.zone, target.name)
         if identity in identities:
@@ -58,11 +49,6 @@ def validate_registry(targets=None):
             raise ValueError('Unreviewed chip accounting: ' + key)
         if target.managed and (key in {'1', '2'} or target.allocation != 'spot'):
             raise ValueError('Fixed/on-demand targets cannot be watchdog managed')
-        pool = (target.project, target.zone, target.accelerator, target.allocation)
-        usage[pool] = usage.get(pool, 0) + target.chips
-        if pool not in QUOTA_POOLS or usage[pool] > QUOTA_POOLS[pool]:
-            raise ValueError('Declared targets exceed supplied quota pool: ' + repr(pool))
-    return usage
 
 
 validate_registry()
