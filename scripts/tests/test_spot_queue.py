@@ -307,6 +307,67 @@ class SpotQueueTests(unittest.TestCase):
                 queue.reconcile(key, {}, {}, self.args)
                 self.assertIn('create', call.call_args.args[0])
 
+    def preempted_node(self, key):
+        target = registry.TARGETS[key]
+        parent = f'projects/{target.project_number}/locations/{target.zone}'
+        return dict(name=parent + '/nodes/' + target.name,
+                    queuedResource=parent + '/queuedResources/' + target.name,
+                    acceleratorType=target.api_accelerator, state='PREEMPTED',
+                    labels={'managed-by': queue.OWNER, 'gfn-target': key},
+                    schedulingConfig={'spot': True})
+
+    def test_preempted_recovery_across_successive_inventories(self):
+        for key in ('3', '4'):
+            name = registry.TARGETS[key].name
+            for state in ('FAILED', 'SUSPENDED'):
+                requests = {name: self.resource(key, state)}
+                node = self.preempted_node(key)
+                with self.subTest(key=key, state=state), patch.object(queue, 'call') as call:
+                    queue.reconcile(key, requests, {name: node}, self.args)
+                    command = call.call_args.args[0]
+                    self.assertEqual(command[3:6], ['tpu-vm', 'delete', name])
+                    self.assertIn('--async', command)
+                    self.assertNotIn('--force', command)
+                    call.assert_called_once()
+                    call.reset_mock()
+                    node['state'] = 'DELETING'
+                    queue.reconcile(key, requests, {name: node}, self.args)
+                    call.assert_not_called()
+                    queue.reconcile(key, requests, {}, self.args)
+                    self.assertEqual(call.call_args.args[0][3:6], ['queued-resources', 'delete', name])
+                    call.assert_called_once()
+                    call.reset_mock()
+                    queue.reconcile(key, {}, {}, self.args)
+                    self.assertEqual(call.call_args.args[0][3:6], ['queued-resources', 'create', name])
+                    call.assert_called_once()
+
+    def test_preempted_node_preview_and_refusals(self):
+        requests = {self.name: self.resource('3', 'SUSPENDED')}
+        node = self.preempted_node('3')
+        self.args.apply = False
+        with patch.object(queue, 'call') as call, patch.object(queue, 'log') as log:
+            queue.reconcile('3', requests, {self.name: node}, self.args)
+            call.assert_not_called()
+            self.assertIn('PREVIEW gcloud compute tpus tpu-vm delete', log.call_args.args[0])
+        self.args.apply = True
+        changes = [dict(state=state) for state in ('READY', 'CREATING', 'UNKNOWN')]
+        changes += [dict(name=node['name'].replace('us-central2-b', 'wrong-zone')),
+                    dict(queuedResource=node['queuedResource'] + '-foreign'),
+                    dict(acceleratorType='v4-8'), dict(labels={}),
+                    dict(labels={'managed-by': queue.OWNER, 'gfn-target': '4'}),
+                    dict(schedulingConfig={})]
+        for change in changes:
+            with self.subTest(change=change), patch.object(queue, 'call') as call:
+                with self.assertRaises(ValueError):
+                    queue.reconcile('3', requests, {self.name: dict(node, **change)}, self.args)
+                call.assert_not_called()
+        # An active or pending request never authorizes node cleanup.
+        for state in ('ACTIVE', 'WAITING_FOR_RESOURCES', 'PROVISIONING'):
+            with patch.object(queue, 'call') as call:
+                queue.reconcile('3', {self.name: self.resource('3', state)},
+                                {self.name: node}, self.args)
+                call.assert_not_called()
+
     def test_registry_validates_identity_and_accelerator_without_static_grants(self):
         expanded = dict(registry.TARGETS, **{'9': replace(registry.TARGETS['3'], name='extra', zone='other-zone')})
         registry.validate_registry(expanded)

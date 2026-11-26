@@ -131,10 +131,27 @@ def reconcile(target, requests, nodes, args):
             # Includes pending/active/deleting and unknown future states. Never reset a wait.
             return
         if name in nodes:
-            raise ValueError(name + ': terminal request still has a node; refusing deletion')
-        # No --force: server must also confirm that there are no nodes to delete.
-        command = gcloud('queued-resources', 'delete', name, '--async',
-                         location=(specification.project, specification.zone))
+            node = nodes[name]
+            parents = {f'projects/{project}/locations/{specification.zone}'
+                       for project in (specification.project, specification.project_number)}
+            if (node.get('name') not in {parent + '/nodes/' + name for parent in parents} or
+                    node.get('queuedResource') not in
+                    {parent + '/queuedResources/' + name for parent in parents} or
+                    node.get('acceleratorType') != specification.api_accelerator or
+                    node.get('labels', {}).get('managed-by') != OWNER or
+                    node.get('labels', {}).get('gfn-target') != target or
+                    node.get('schedulingConfig', {}).get('spot') is not True):
+                raise ValueError(name + ': remaining node is not owned by this Spot watchdog')
+            if node.get('state') == 'DELETING':
+                return
+            if node.get('state') != 'PREEMPTED':
+                raise ValueError(name + ': terminal request still has a node; refusing deletion')
+            command = gcloud('tpu-vm', 'delete', name, '--async',
+                             location=(specification.project, specification.zone))
+        else:
+            # No --force: server must also confirm that there are no nodes to delete.
+            command = gcloud('queued-resources', 'delete', name, '--async',
+                             location=(specification.project, specification.zone))
     log(identity + ': ' + ('APPLY ' if args.apply else 'PREVIEW ') + shlex.join(command))
     if args.apply:
         call(command)
