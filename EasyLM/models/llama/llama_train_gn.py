@@ -102,6 +102,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     lr_sched='cosine',
     inner_loop_lr=0.001,
     inner_loop_wd=0.0,
+    gn_damping_mu=0.0,  # Isotropic damping for iterative GN inner solvers.
     end_lr=0.0,
     global_warmup=0.2,
     inner_loop_warmup=0.0,
@@ -1088,6 +1089,11 @@ def main(argv):
                 is_last_step)
             accuracy = 0
             b_norm = global_norm(base)
+
+        if FLAGS.gn_damping_mu != 0.0:
+            grads = jax.tree.map(
+                lambda g, p, p0: g + FLAGS.gn_damping_mu * (p - p0),
+                grads, train_state.params, params0)
 
         try:
             perplexity = jnp.exp(loss)
